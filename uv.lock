@@ -326,12 +326,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi", extra = ["all"] },
     { name = "psycopg2" },
+    { name = "pydantic-settings" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", extras = ["all"], specifier = ">=0.139.0" },
     { name = "psycopg2", specifier = ">=2.9.12" },
+    { name = "pydantic-settings", specifier = ">=2.14.2" },
 ]
 
 [[package]]
