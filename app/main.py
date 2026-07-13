@@ -59,19 +59,22 @@ def read_root():
 
 @app.get("/posts")
 def get_posts():
-    return {"data": my_posts}
+    cursor.execute(""" SELECT * FROM posts """)
+    posts = cursor.fetchall()
+    print(posts)
+    return {"data": posts}
 
 @app.post("/posts", status_code = status.HTTP_201_CREATED)
 def create_posts(post: Post): # Taking the body of the post, storing it in a dictionary and assigning it to the variable 'payload'
-    post_dict = post.model_dump()  # .model_dump() converts Pydantic model instance into a Python dictionary
-    post_dict['id'] = randrange(0, 1000000)
-    my_posts.append(post_dict)
-    return {"data": post_dict}
+    cursor.execute(""" INSERT INTO posts (title, content, published) VALUES (%s, %s, %s) RETURNING * """, (post.title, post.content, post.published))
+    new_post = cursor.fetchone()
+    conn.commit()
+    return {"data": new_post}
 
 @app.get("/posts/{id}") # Everytime we have a path parameter like '{id}', it will always return a string 
 def get_post(id: int, response: Response):
-    print(type(id))
-    post = find_post(int(id))
+    cursor.execute(""" SELECT * FROM posts WHERE id = %s """, (str(id),))
+    post = cursor.fetchone()
     if not post:
         raise HTTPException(status_code = status.HTTP_404_NOT_FOUND, 
                             detail = f"Post with id: {id} was not found")
@@ -81,12 +84,12 @@ def get_post(id: int, response: Response):
 
 @app.delete("/posts/{id}", status_code = status.HTTP_204_NO_CONTENT)
 def delete_post(id: int):
-    # Find the index of the required post in the array
-    index = find_index_post(id)
+    cursor.execute(""" DELETE FROM posts WHERE id = %s  RETURNING * """, (str(id),))
+    deleted_post = cursor.fetchone()
+    conn.commit()
 
-    if index == None:
+    if deleted_post == None:
         raise HTTPException(status_code = status.HTTP_404_NOT_FOUND, detail = f"Post with id: {id} does not exist")
-    my_posts.pop(index)
 
     # FastAPI enforces this rule that if we are deleting something we should not be sending any data back 
     # So we use 'Response(status_code=status.HTTP_204_NO_CONTENT' to send back some information 
@@ -94,13 +97,14 @@ def delete_post(id: int):
 
 @app.put("/posts/{id}")
 def update_post(id: int, post:Post):
-    index = find_index_post(id)
+    cursor.execute(
+        """ UPDATE posts SET title = %s, content = %s, published = %s WHERE id = %s RETURNING * """,
+        (post.title, post.content, post.published, str(id)),
+    )
+    updated_post = cursor.fetchone()
+    conn.commit()
 
-    if index == None:
+    if updated_post == None:
         raise HTTPException(status_code = status.HTTP_404_NOT_FOUND, detail = f"Post with id: {id} does not exist")
-    my_posts.pop(index)
 
-    post_dict = post.model_dump() # .model_dump() converts Pydantic model instance into a Python dictionary
-    post_dict["id"] = id
-    my_posts[index] = post_dict
-    return {"data": post_dict}
+    return {"data": updated_post}
