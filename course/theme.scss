@@ -1,0 +1,27 @@
+/*-- scss:defaults --*/
+// Shared by the light (cosmo) and dark (darkly) themes; only layout and type live here,
+// so each theme keeps its own colours.
+$font-family-sans-serif: "Source Sans 3", "Segoe UI", system-ui, -apple-system, sans-serif;
+$font-family-monospace: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+$web-font-path: "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap";
+
+/*-- scss:rules --*/
+// Readable line length for long lessons.
+main.content {
+  max-width: 780px;
+}
+
+.sidebar-item-section > .sidebar-item-container .sidebar-item-text {
+  font-weight: 600;
+}
+
+// Lesson metadata line under the title ("Part 0 · Lesson 1").
+.lesson-meta {
+  font-size: 0.9rem;
+  opacity: 0.75;
+  margin-bottom: 1.5rem;
+}
+
+table {
+  font-size: 0.95rem;
+}

@@ -1,0 +1,58 @@
+---
+title: "Zero to Production in FastAPI"
+subtitle: "From never having written code to running a production AI backend on AWS."
+toc: false
+---
+
+This course takes you from zero, with no programming, terminal or Git experience assumed, to designing, building, deploying and operating a real backend system. You learn by building one project that grows with every lesson.
+
+[Start with lesson 0.1 →](part-0-start-here/01-what-is-a-backend.qmd){.btn .btn-primary}
+
+## What you will build
+
+**Atlas** answers questions about a real open-source codebase, [PyTorch-Ignite](https://github.com/pytorch/ignite), and cites the exact file and line behind every claim.
+
+**Atlas Agents** watches that project for new "good first issue" tickets and prepares an **Issue Brief** for each one: a plain summary, the relevant code, the project's conventions, the commands to run the tests, and a reproduction script it has verified actually fails. You then write the fix yourself. Atlas never posts to GitHub and never writes your code.
+
+```{mermaid}
+flowchart LR
+  You -->|ask a question| Atlas
+  Atlas -->|answer with file:line citations| You
+  GitHub[New good first issue] --> Agents[Atlas Agents]
+  Agents -->|Issue Brief + verified reproduction| You
+  You -->|you write the fix| PR[Your pull request]
+```
+
+## Course map
+
+| Part | Topic | By the end you have |
+|---|---|---|
+| [0](part-0-start-here/index.qmd) | Start here | A working terminal, Git and a GitHub fork |
+| [1](part-1-python/index.qmd) | Programming with Python | A command-line search tool with tests |
+| [2](part-2-computers-and-internet/index.qmd) | Computers and the internet | Issues fetched from GitHub's API |
+| [3](part-3-databases/index.qmd) | Databases | Data and search in Postgres |
+| [4](part-4-fastapi/index.qmd) | Building APIs with FastAPI | Atlas API v1 with sign-in and a web interface |
+| [5](part-5-background-work/index.qmd) | Background work | Automatic syncing and indexing |
+| [6](part-6-atlas-rag/index.qmd) | AI engineering: Atlas | Cited answers with measured quality |
+| [7](part-7-production-aws/index.qmd) | Production on AWS | Atlas live, monitored and secure |
+| [8](part-8-atlas-agents/index.qmd) | AI engineering: Atlas Agents | Verified Issue Briefs |
+| [9](part-9-scale-and-career/index.qmd) | Scale and career | An unguided capstone and a portfolio |
+
+96 lessons in total. Lessons are published as they are written; each part's page shows which are ready.
+
+## How every lesson works
+
+1. **Analogy** for intuition.
+2. **Theory**, explained precisely.
+3. **Diagrams** where a picture says it better.
+4. **Project code** for this step, with comments that explain *why*.
+5. **Common mistakes**.
+6. **Quiz**, with explanations.
+7. **Exercise**, guided, with a hidden solution.
+8. **Stretch** challenge, with a hidden solution.
+
+Each part ends with a **review and practice** lesson: tasks without step-by-step help, because following along is not the same as building alone.
+
+## The code
+
+Everything lives in the [course repository](https://github.com/ashu-tagore/Learning_FastAPI). You write your own code in `workspace/`; the reference implementation is in `atlas/`, tagged at the end of each part so you can compare.

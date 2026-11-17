@@ -23,14 +23,14 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 
 ## Commands
 
-Filled in as milestones land. Planned:
-
 ```bash
-cd atlas && uv sync && uv run pytest          # reference tests
-cd atlas && uv run ruff check . && uv run mypy src
-quarto preview course                          # course site locally
-docker compose up                              # full local stack (from Part 3)
+cd atlas && uv sync && uv run pytest                       # reference tests
+cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
+python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
+quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)
 ```
+
+Never edit `course/part-*/index.qmd` or `course/_sidebar.yml` by hand: they are generated from `docs/context/04-curriculum.md`.
 
 ## Git
 

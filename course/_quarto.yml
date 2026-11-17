@@ -1,0 +1,49 @@
+project:
+  type: website
+  output-dir: _site
+
+metadata-files:
+  - _sidebar.yml
+
+website:
+  title: "Zero to Production in FastAPI"
+  description: "From never having written code to running a production AI backend on AWS."
+  repo-url: https://github.com/ashu-tagore/Learning_FastAPI
+  repo-subdir: course
+  repo-actions: [edit, issue]
+  page-navigation: true
+  search:
+    location: navbar
+    type: overlay
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: part-0-start-here/01-what-is-a-backend.qmd
+        text: Start the course
+    right:
+      - icon: github
+        href: https://github.com/ashu-tagore/Learning_FastAPI
+        aria-label: Course repository on GitHub
+  # The sidebar lives in _sidebar.yml, generated from the curriculum doc by
+  # _tools/generate_part_pages.py, so lessons appear as soon as their files exist.
+  page-footer:
+    left: "Zero to Production in FastAPI"
+    right: "Built with [Quarto](https://quarto.org)"
+
+format:
+  html:
+    theme:
+      light: [cosmo, theme.scss]
+      dark: [darkly, theme.scss]
+    toc: true
+    toc-title: "On this page"
+    toc-location: right
+    code-copy: true
+    code-overflow: scroll
+    highlight-style: github
+    link-external-newwindow: true
+    smooth-scroll: true
+    # Lessons never execute code at render time: outputs shown are pasted from real runs.
+    execute:
+      enabled: false

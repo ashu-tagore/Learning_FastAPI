@@ -21,3 +21,11 @@ wheels/
 .vscode/
 .idea/
 .DS_Store
+
+# Learners write their own code here; it never goes into the course repo
+workspace/
+
+# Quarto build output
+course/_site/
+course/.quarto/
+/.quarto/
