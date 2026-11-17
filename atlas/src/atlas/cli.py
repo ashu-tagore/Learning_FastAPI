@@ -2,16 +2,26 @@
 
 atlas search "query" --path ~/code/ignite
 atlas stats --path ~/code/ignite
+atlas issues --repo pytorch/ignite
+atlas commits --repo pytorch/ignite
 """
 
 import argparse
+import asyncio
 import json
+import os
 import re
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from atlas import issue_cache
+from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
+from atlas.issue_cache import CachedIssues
 from atlas.search import DEFAULT_EXTENSIONS, search
 from atlas.stats import collect_stats
+
+DEFAULT_REPO = "pytorch/ignite"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,10 +47,46 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser.add_argument("--top", type=int, default=5, help="how many largest files to show")
     stats_parser.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS))
 
+    issues_parser = commands.add_parser("issues", help="list open issues from GitHub")
+    issues_parser.add_argument("--repo", default=DEFAULT_REPO, help="owner/name on GitHub")
+    issues_parser.add_argument(
+        "--label",
+        action="append",
+        help="issue label; repeat for several (default: good first issue)",
+    )
+    issues_parser.add_argument("--refresh", action="store_true", help="ignore the cached copy")
+    issues_parser.add_argument(
+        "--max-age", type=int, default=60, help="minutes a cached copy stays valid"
+    )
+    issues_parser.add_argument("--cache", type=Path, default=None, help="cache file location")
+    issues_parser.add_argument("--json", action="store_true", help="print results as JSON")
+
+    commits_parser = commands.add_parser("commits", help="list recent commits from GitHub")
+    commits_parser.add_argument("--repo", default=DEFAULT_REPO, help="owner/name on GitHub")
+    commits_parser.add_argument("--limit", type=int, default=10, help="how many (1 to 100)")
+
     return parser
 
 
+def folder_error(path: Path) -> int | None:
+    """Print an error and return exit code 1 if path is not a folder."""
+    if path.is_dir():
+        return None
+    print(f"atlas: not a folder: {path}", file=sys.stderr)
+    return 1
+
+
+def github_token() -> str | None:
+    # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
+    # Part 4 moves this into a proper settings object.
+    return os.environ.get("GITHUB_TOKEN")
+
+
 def run_search(args: argparse.Namespace) -> int:
+    error_code = folder_error(args.path)
+    if error_code is not None:
+        return error_code
+
     try:
         matches = search(
             args.path,
@@ -72,6 +118,10 @@ def run_search(args: argparse.Namespace) -> int:
 
 
 def run_stats(args: argparse.Namespace) -> int:
+    error_code = folder_error(args.path)
+    if error_code is not None:
+        return error_code
+
     stats = collect_stats(args.path, tuple(args.ext), top=args.top)
 
     print(f"{'type':<6} {'files':>6} {'lines':>8}")
@@ -84,17 +134,78 @@ def run_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_issues(args: argparse.Namespace) -> int:
+    labels = tuple(args.label or ["good first issue"])
+    cache_path = args.cache or issue_cache.default_cache_path(args.repo)
+    now = datetime.now(UTC)
+
+    cached = None if args.refresh else issue_cache.load(cache_path)
+    max_age = timedelta(minutes=args.max_age)
+    use_cache = cached is not None and cached.is_usable(args.repo, labels, now, max_age)
+
+    if cached is not None and use_cache:
+        issues = cached.issues
+        minutes_old = int((now - cached.fetched_at).total_seconds() // 60)
+        source = f"cached copy from {minutes_old} min ago"
+    else:
+        try:
+            issues = asyncio.run(fetch_issues(args.repo, list(labels), token=github_token()))
+        except GitHubError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
+        issue_cache.save(cache_path, CachedIssues(args.repo, labels, now, issues))
+        source = "GitHub"
+
+    if args.json:
+        records = [
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "url": issue.url,
+                "labels": list(issue.labels),
+                "created_at": issue.created_at.isoformat(),
+            }
+            for issue in issues
+        ]
+        print(json.dumps(records, indent=2))
+    else:
+        for issue in issues:
+            age_days = (now - issue.created_at).days
+            print(f"#{issue.number:<6} {age_days:>4}d  {issue.title}  [{', '.join(issue.labels)}]")
+
+    noun = "issue" if len(issues) == 1 else "issues"
+    print(f"{len(issues)} open {noun} from {source}", file=sys.stderr)
+    return 0
+
+
+def run_commits(args: argparse.Namespace) -> int:
+    limit_is_valid = 1 <= args.limit <= 100
+    if not limit_is_valid:
+        print("atlas: --limit must be between 1 and 100", file=sys.stderr)
+        return 1
+
+    try:
+        commits = asyncio.run(fetch_recent_commits(args.repo, args.limit, token=github_token()))
+    except GitHubError as error:
+        print(f"atlas: {error}", file=sys.stderr)
+        return 1
+
+    for commit in commits:
+        day = commit.committed_at.strftime("%Y-%m-%d")
+        print(f"{commit.sha}  {day}  {commit.author:<20}  {commit.summary}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    folder_exists = args.path.is_dir()
-    if not folder_exists:
-        print(f"atlas: not a folder: {args.path}", file=sys.stderr)
-        return 1
-
     if args.command == "search":
         return run_search(args)
-    return run_stats(args)
+    if args.command == "stats":
+        return run_stats(args)
+    if args.command == "issues":
+        return run_issues(args)
+    return run_commits(args)
 
 
 if __name__ == "__main__":

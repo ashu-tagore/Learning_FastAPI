@@ -8,10 +8,10 @@ title: "Part 2: Computers and the internet"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 2.1 | How the operating system runs your code: processes, memory, file handles, signals *(coming soon)* |  |
-| 2.2 | Networks: IP addresses, ports, TCP, DNS *(coming soon)* |  |
-| 2.3 | HTTP in depth, curl, TLS and HTTPS *(coming soon)* |  |
-| 2.4 | Linux servers and SSH: users, permissions, services, logs *(coming soon)* |  |
-| 2.5 | Web APIs and JSON: the GitHub REST API with `httpx`, tokens, pagination, rate limits *(coming soon)* | GitHub client |
-| 2.6 | Concurrency: processes, threads, `async`/`await` *(coming soon)* | Concurrent fetching |
-| 2.7 | Review and practice *(coming soon)* | Unguided: fetch and summarise recent commits |
+| 2.1 | [How the operating system runs your code: processes, memory, file handles, signals](01-how-the-os-runs-code.qmd) |  |
+| 2.2 | [Networks: IP addresses, ports, TCP, DNS](02-networks.qmd) |  |
+| 2.3 | [HTTP in depth, curl, TLS and HTTPS](03-http-in-depth.qmd) |  |
+| 2.4 | [Linux servers and SSH: users, permissions, services, logs](04-linux-servers-and-ssh.qmd) |  |
+| 2.5 | [Web APIs and JSON: the GitHub REST API with `httpx`, tokens, pagination, rate limits](05-web-apis-and-github.qmd) | GitHub client |
+| 2.6 | [Concurrency: processes, threads, `async`/`await`](06-concurrency.qmd) | Concurrent fetching |
+| 2.7 | [Review and practice](07-review-and-practice.qmd) | Unguided: fetch and summarise recent commits |

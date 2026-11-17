@@ -1,0 +1,254 @@
+---
+title: "2.3 HTTP in depth, curl, TLS and HTTPS"
+description: "Read and write raw HTTP, understand methods, status codes and headers, use curl confidently, and know what HTTPS protects."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 3 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: a restaurant order slip"}
+You never walk into the kitchen. You hand the waiter an **order slip** (a **request**): a verb ("bring", "cancel"), the dish (a **path**), notes like "no onions" (**headers**), and sometimes a filled-in form (the **body**). The kitchen sends back a short status ("here you go", "we're out of that") and maybe a plate (the response **body**). The waiter forgets you between orders: each slip must carry everything needed. HTTP is that slip, written in plain text. HTTPS is the same slip in a sealed, tamper-proof envelope.
+:::
+
+## HTTP is text over a TCP connection
+
+**HTTP** (HyperText Transfer Protocol) is the protocol of the web: an agreed format for the bytes a client and server exchange over TCP (lesson 2.2). It's plain text, so you can write a request by hand. Start Python's built-in web server in a folder containing a file `hello.txt`:
+
+```bash
+python3 -m http.server 8070 --bind 127.0.0.1
+```
+
+Then send it a request using only a socket:
+
+```python
+import socket
+
+request = (
+    "GET /hello.txt HTTP/1.1\r\n"
+    "Host: 127.0.0.1:8070\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+)
+with socket.create_connection(("127.0.0.1", 8070)) as connection:
+    connection.sendall(request.encode("ascii"))
+    response = b""
+    while chunk := connection.recv(4096):
+        response += chunk
+print(response.decode("utf-8"))
+```
+```text
+HTTP/1.0 200 OK
+Server: SimpleHTTP/0.6 Python/3.13.18
+Date: Tue, 17 Nov 2026 16:57:24 GMT
+Content-type: text/plain
+Content-Length: 18
+Last-Modified: Tue, 17 Nov 2026 16:57:23 GMT
+
+hello from a file
+```
+
+(`while chunk := ...` reads and checks in one step: "keep reading while there's data". `\r\n` is the line ending HTTP requires.)
+
+That's all HTTP is. Every library and framework you'll use, including httpx and FastAPI, writes and reads exactly this.
+
+## Anatomy of a request
+
+```text
+GET /repos/pytorch/ignite/issues?state=open HTTP/1.1     <- request line
+Host: api.github.com                                       <- headers
+Accept: application/vnd.github+json
+User-Agent: atlas-course
+                                                           <- blank line
+(body: empty for GET)
+```
+
+- The **request line**: method, path (with an optional **query string** after `?`, made of `key=value` pairs joined by `&`), and protocol version.
+- **Headers**: metadata as `Name: value` lines. `Host` says which website you want (one server can host many).
+- A blank line, then the optional **body**.
+
+## Anatomy of a response
+
+```text
+HTTP/1.1 200 OK                                <- status line
+Content-Type: application/json; charset=utf-8  <- headers
+Content-Length: 1234
+
+[{"number": 3932, ...}]                         <- body
+```
+
+`Content-Length` tells the client exactly how many bytes of body to read: that's how HTTP marks where a message ends on a TCP stream (lesson 2.2's last common mistake).
+
+## Methods
+
+| Method | Means | Safe | Idempotent |
+|---|---|---|---|
+| `GET` | read a resource | yes | yes |
+| `POST` | create something / trigger an action | no | no |
+| `PUT` | replace a resource entirely | no | yes |
+| `PATCH` | change some fields | no | usually |
+| `DELETE` | remove a resource | no | yes |
+
+**Safe** means it changes nothing on the server. **Idempotent** means doing it twice leaves the server in the same state as doing it once: deleting issue 7 twice still leaves it deleted. That matters for retries (Part 5): you can safely retry a `GET` or `PUT` after a timeout, but retrying a `POST` might create a duplicate. Atlas only ever sends `GET` to GitHub: it never changes anything there.
+
+## Status codes
+
+| Family | Meaning | Common codes |
+|---|---|---|
+| 2xx | success | `200 OK`, `201 Created`, `204 No Content` |
+| 3xx | look elsewhere | `301 Moved Permanently`, `304 Not Modified` (Part 5) |
+| 4xx | the client made a mistake | `400 Bad Request`, `401 Unauthorized` (who are you?), `403 Forbidden` (not allowed), `404 Not Found`, `422 Unprocessable Content`, `429 Too Many Requests` |
+| 5xx | the server failed | `500 Internal Server Error`, `502 Bad Gateway`, `503 Service Unavailable` |
+
+The rule of thumb: if the client can fix it by changing the request, it's a 4xx. A 5xx is always the server's bug or outage.
+
+## Headers you'll use constantly
+
+| Header | Direction | Purpose |
+|---|---|---|
+| `Content-Type` | both | format of the body: `application/json`, `text/html` |
+| `Accept` | request | formats the client wants back |
+| `Authorization` | request | credentials, e.g. `Bearer <token>` (lessons 2.5 and 4.7) |
+| `User-Agent` | request | which program is calling; GitHub rejects requests without one |
+| `ETag` | response | a fingerprint of the response, for caching (lesson 5.3) |
+| `Cache-Control` | response | how long the response may be reused |
+| `Link` | response | links to related pages, used by GitHub for pagination (lesson 2.5) |
+| `X-RateLimit-*` | response | GitHub's request quota (lesson 2.5) |
+
+Header names are case-insensitive: `content-type` and `Content-Type` are the same header.
+
+## curl: HTTP from the terminal
+
+`curl` sends HTTP requests from the command line. `-i` includes the status line and headers in the output, `-s` hides the progress bar:
+
+```text
+$ curl -s -i http://127.0.0.1:8070/missing.txt
+HTTP/1.0 404 File not found
+Server: SimpleHTTP/0.6 Python/3.13.18
+...
+```
+
+Against GitHub's API, using this course's own repository (it's public, so you can run the same command):
+
+```text
+$ curl -s -i https://api.github.com/repos/ashu-tagore/Learning_FastAPI
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Etag: "8c72e0118c2d484a6c3a9332422098124be5270882249393e81535aa51c2e451"
+X-Ratelimit-Limit: 15000
+X-Ratelimit-Remaining: 14984
+...
+{
+  "full_name": "ashu-tagore/Learning_FastAPI",
+  "default_branch": "main",
+  "language": "Python",
+  "visibility": "public",
+  ...
+```
+
+That output was captured from a network that adds credentials to GitHub requests, which is why the limit is 15,000. Run it yourself without a token and you'll see `x-ratelimit-limit: 60`. You'll probably also see `HTTP/2 200` on the first line: most modern servers, including GitHub, speak HTTP/2, the same requests and responses in a faster binary encoding. Header names may be printed in lower case; they're case-insensitive anyway.
+
+Other curl options you'll use:
+
+| Option | Does |
+|---|---|
+| `-X POST` | choose the method |
+| `-H "Name: value"` | add a header |
+| `-d '{"a": 1}'` | send a body |
+| `-v` | show everything, including the connection and TLS details |
+| `-L` | follow redirects |
+
+The server logs every request it handles, which is the first place to look when debugging:
+
+```text
+127.0.0.1 - - [17/Nov/2026 16:57:24] "GET /hello.txt HTTP/1.1" 200 -
+127.0.0.1 - - [17/Nov/2026 16:57:24] "GET /missing.txt HTTP/1.1" 404 -
+```
+
+## HTTP is stateless
+
+Each request stands alone: the server doesn't remember previous requests from you. Anything the server needs, like who you are, must be in every request (in a header such as `Authorization`, or a cookie). That makes servers simple to scale: any of ten identical servers can handle any request. You'll rely on this in Part 7.
+
+## HTTPS and TLS
+
+Plain HTTP travels as readable text. Anyone on the network path (the café Wi-Fi, a compromised router) could read your token or change the response. **HTTPS** is HTTP inside a **TLS** (Transport Layer Security) connection, which provides three guarantees:
+
+1. **Encryption**: eavesdroppers see only scrambled bytes.
+2. **Integrity**: any tampering is detected.
+3. **Authentication**: you are really talking to `api.github.com`, not an impostor.
+
+Authentication works through **certificates**. The server presents a certificate saying "I am api.github.com", digitally signed by a **certificate authority** (CA) that your operating system trusts. Your client checks the signature chain back to a trusted CA, and that the name matches. If anything is off, the connection fails with an error like `certificate verify failed`.
+
+```{mermaid}
+sequenceDiagram
+  participant C as Client
+  participant S as api.github.com:443
+  C->>S: TCP handshake (lesson 2.2)
+  C->>S: TLS hello: versions and ciphers I support
+  S-->>C: certificate for api.github.com, signed by a CA
+  C->>C: verify signature chain and name
+  C->>S: agree on encryption keys
+  Note over C,S: encrypted from here on
+  C->>S: GET /repos/... (encrypted HTTP)
+  S-->>C: 200 OK (encrypted)
+```
+
+Rules that follow:
+
+- **Never disable certificate checks** (`verify=False`, `curl -k`) to "make an error go away". That removes the authentication guarantee completely. Fix the cause instead.
+- **Send tokens and passwords only over HTTPS.**
+- In production, your API will sit behind HTTPS too (lesson 7.5).
+
+## Common mistakes
+
+- **Using `GET` to change data.** Browsers, crawlers and caches send GETs freely; something will trigger your action by accident.
+- **Ignoring the status code** and parsing the body anyway. A 404 page isn't the data you wanted.
+- **Forgetting `Content-Type: application/json`** when sending JSON: many servers then refuse or misread the body.
+- **`curl -k` or `verify=False`** as a fix for certificate errors.
+- **Retrying non-idempotent requests blindly**: a retried `POST` can create duplicates.
+
+## Check yourself
+
+**1.** A request returns `429`. Whose fault is it, and what should the client do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The client's (4xx): it sent too many requests. It should slow down and retry later, typically after the time the server indicates in its headers. Lesson 2.5 handles exactly this for GitHub.
+:::
+
+**2.** Why is `DELETE` idempotent but `POST` usually not?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Deleting the same resource twice ends in the same state (it's gone). Posting the same creation request twice usually creates two resources.
+:::
+
+**3.** What does HTTPS protect against that HTTP doesn't?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Eavesdropping (encryption), tampering (integrity) and impersonation (the certificate proves the server's identity).
+:::
+
+## Exercise
+
+Using `curl -s -i` against `https://api.github.com/repos/ashu-tagore/Learning_FastAPI` and `https://api.github.com/repos/ashu-tagore/does-not-exist`:
+
+1. Write down both status codes.
+2. Find `x-ratelimit-remaining` in each response. Did the failing request also use up quota?
+3. Request the first URL with the header `Accept: application/vnd.github+json`. Does the response change?
+
+::: {.callout-tip collapse="true" title="Answer"}
+1. `200` and `404`.
+2. Yes: the remaining count goes down for both. Every request counts against the quota, successful or not.
+3. No visible change: that is already the default format. Sending it is still good practice, because it states which response format your code expects; GitHub's docs recommend it.
+:::
+
+## Stretch
+
+Using the raw-socket client from this lesson, send a request **without** the `Host` header to Python's local server, then with `HTTP/1.0` instead of `HTTP/1.1` on the request line. What happens in each case, and why does the protocol version matter?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Python's simple server is lenient and answers both. A strict HTTP/1.1 server answers `400 Bad Request` when `Host` is missing, because HTTP/1.1 requires it so one IP address can host many websites. HTTP/1.0 predates that rule. Real-world lesson: being lenient in what you accept doesn't mean other servers will be.
+:::
+
+## What changed in the project
+
+No code changes yet. Next lesson, Atlas starts speaking HTTP to GitHub with the `httpx` library.

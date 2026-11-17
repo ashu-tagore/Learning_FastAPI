@@ -1,0 +1,381 @@
+---
+title: "2.6 Concurrency: processes, threads and async"
+description: "Do many things at once: understand CPU-bound versus I/O-bound work, processes, threads and async/await, fetch several labels concurrently, cache results to disk, and ship the atlas issues command."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 6 · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: one cook, many pots"}
+A cook making three dishes doesn't stand watching the first pot boil before starting the second. They put water on, start chopping, check the oven, and come back when something needs them. Most of cooking is **waiting**, and a good cook fills the waiting with other work. That's **concurrency**. Hiring three cooks who each work at the same time is **parallelism**. Both finish sooner; they solve different problems.
+:::
+
+## Two kinds of slow
+
+| Kind | Time spent | Examples | What helps |
+|---|---|---|---|
+| **I/O-bound** | waiting for something outside the CPU | network requests, database queries, reading files | doing other work while waiting: **threads** or **async** |
+| **CPU-bound** | calculating | resizing images, parsing huge files, training models | more CPU cores working at once: **processes** |
+
+Backends are overwhelmingly I/O-bound. A web request spends most of its life waiting: for the database, for GitHub, for an AI model. Atlas fetching issues is pure waiting.
+
+## Processes, threads and async
+
+```{mermaid}
+flowchart TB
+  subgraph Processes["Several processes"]
+    P1[Process 1<br/>own memory] --- C1[CPU core 1]
+    P2[Process 2<br/>own memory] --- C2[CPU core 2]
+  end
+  subgraph Threads["One process, several threads"]
+    T1[Thread 1] --- M[shared memory]
+    T2[Thread 2] --- M
+  end
+  subgraph Async["One thread, an event loop"]
+    L[event loop] --> A1[task a: waiting on network]
+    L --> A2[task b: running]
+    L --> A3[task c: waiting on network]
+  end
+```
+
+- **Processes** (lesson 2.1) each have their own memory and can run truly in parallel on different CPU cores. Best for CPU-bound work. Sharing data between them is awkward because their memory is separate.
+- **Threads** live inside one process and share its memory. The OS switches between them. Sharing memory is convenient and dangerous: two threads changing the same data at the same moment can corrupt it. In Python, the **GIL** (Global Interpreter Lock) has historically let only one thread run Python code at a time, so threads help with waiting but not with calculating. (Newer "free-threaded" Python builds remove this limit, but they're not yet the default.)
+- **async** runs many tasks in **one thread**. Each task voluntarily pauses at `await` while it waits, and an **event loop** switches to another task that's ready. No two tasks ever run Python code at exactly the same instant, which avoids most of the dangers of threads. Best for lots of waiting, such as many network requests. FastAPI is built on it (Part 4).
+
+## async and await
+
+```python
+import asyncio
+import time
+
+
+async def fake_request(name: str) -> str:
+    await asyncio.sleep(1)  # stands in for waiting on the network
+    return f"{name} done"
+
+
+async def one_after_another() -> None:
+    for name in ["a", "b", "c"]:
+        await fake_request(name)
+
+
+async def all_at_once() -> None:
+    results = await asyncio.gather(fake_request("a"), fake_request("b"), fake_request("c"))
+    print(results)
+
+
+for runner in [one_after_another, all_at_once]:
+    start = time.perf_counter()
+    asyncio.run(runner())
+    print(f"{runner.__name__}: {time.perf_counter() - start:.2f} s")
+```
+```text
+one_after_another: 3.00 s
+['a done', 'b done', 'c done']
+all_at_once: 1.00 s
+```
+
+- `async def` defines a **coroutine function**. Calling it doesn't run it; it creates a coroutine object, a task waiting to be run (like a generator, lesson 1.6).
+- `await x` means "run `x`, and while it waits, let other tasks run". You can only `await` inside an `async def`.
+- `asyncio.gather(...)` runs several coroutines concurrently and returns their results in the same order you passed them.
+- `asyncio.run(main())` starts the event loop, runs `main` to completion, and stops the loop. It's the bridge from normal code into async code.
+
+The three 1-second waits overlap, so the total is 1 second instead of 3. With real HTTP requests to GitHub:
+
+```python
+import asyncio
+import time
+
+import httpx
+
+PATHS = [
+    "/repos/ashu-tagore/Learning_FastAPI",
+    "/repos/ashu-tagore/Learning_FastAPI/commits?per_page=1",
+    "/repos/ashu-tagore/Learning_FastAPI/pulls?state=closed&per_page=1",
+    "/repos/ashu-tagore/Learning_FastAPI/contents/README.md",
+]
+HEADERS = {"User-Agent": "atlas-course"}
+
+
+def sequential() -> None:
+    with httpx.Client(base_url="https://api.github.com", headers=HEADERS) as client:
+        for path in PATHS:
+            client.get(path)
+
+
+async def concurrent() -> None:
+    async with httpx.AsyncClient(base_url="https://api.github.com", headers=HEADERS) as client:
+        responses = await asyncio.gather(*(client.get(path) for path in PATHS))
+    print([response.status_code for response in responses])
+
+
+start = time.perf_counter()
+sequential()
+print(f"sequential: {time.perf_counter() - start:.2f} s")
+start = time.perf_counter()
+asyncio.run(concurrent())
+print(f"concurrent: {time.perf_counter() - start:.2f} s")
+```
+```text
+sequential: 1.55 s
+[200, 200, 200, 200]
+concurrent: 0.72 s
+```
+
+`httpx.AsyncClient` is the async twin of `httpx.Client`: same methods, but you `await` them, and it's used with `async with`. The `*` in `gather(*(...))` unpacks a sequence into separate arguments.
+
+### The one rule of async
+
+**Never block inside `async def`.** A blocking call (`time.sleep`, the synchronous `httpx.Client`, a slow calculation) freezes the event loop, and every other task waits with it. Inside async code, use async libraries and `await`. This rule comes back with force in lesson 4.13, where blocking inside a FastAPI route can stall every user of your API.
+
+## In the project: concurrent labels
+
+GitHub's `labels=a,b` filter means "issues with label a **and** label b". To get issues with *either* label, Atlas must make one request (series) per label. Those requests are independent, which makes them a natural fit for `gather`.
+
+Convert `github.py` to async. `fetch_label` is your lesson 2.5 `fetch_issues` loop, now taking a shared client and using `await`:
+
+```python
+import asyncio
+
+
+async def fetch_label(
+    client: httpx.AsyncClient, repo: str, label: str, max_pages: int
+) -> list[Issue]:
+    """All open issues in repo carrying one label, following pagination."""
+    url = f"/repos/{repo}/issues"
+    params: dict[str, str | int] | None = {"state": "open", "labels": label, "per_page": 100}
+    issues: list[Issue] = []
+
+    for _ in range(max_pages):
+        response = await client.get(url, params=params)
+        check_response(response)
+
+        for item in response.json():
+            # The issues endpoint also returns pull requests; they carry this key.
+            is_pull_request = "pull_request" in item
+            if is_pull_request:
+                continue
+            issues.append(parse_issue(item))
+
+        next_page = response.links.get("next")
+        if next_page is None:
+            break
+        # The "next" link already contains every query parameter.
+        url = next_page["url"]
+        params = None
+
+    return issues
+
+
+async def fetch_issues(
+    repo: str,
+    labels: list[str],
+    *,
+    token: str | None = None,
+    max_pages: int = 10,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[Issue]:
+    """Open issues having any of the labels, newest first.
+
+    GitHub's `labels=a,b` filter means "has a AND b", so each label is fetched
+    separately. The requests are independent, which is why they run concurrently.
+    `transport` lets tests replace the network with a fake GitHub.
+    """
+    async with httpx.AsyncClient(
+        base_url=GITHUB_API, headers=build_headers(token), timeout=10.0, transport=transport
+    ) as client:
+        results_per_label = await asyncio.gather(
+            *(fetch_label(client, repo, label, max_pages) for label in labels)
+        )
+
+    # An issue with two requested labels comes back twice; keep one copy.
+    unique: dict[int, Issue] = {}
+    for issues in results_per_label:
+        for issue in issues:
+            unique[issue.number] = issue
+    return sorted(unique.values(), key=lambda issue: issue.number, reverse=True)
+```
+
+Deduplicating by issue number with a dict (lesson 1.5) handles issues carrying both labels. Higher issue numbers are newer, so sorting by number descending lists newest first.
+
+## Caching to disk
+
+Every run of `atlas issues` would cost GitHub requests, and anonymous users get only 60 an hour. Issues don't change by the minute, so Atlas keeps a **cache**: a saved copy on disk with the time it was fetched, reused until it's too old. Because it's on disk, not in memory (lesson 2.1), it survives between runs.
+
+Create `src/atlas/issue_cache.py` with a `CachedIssues` dataclass (repo, labels, `fetched_at`, issues), `save(path, cached)` and `load(path)` functions that write and read JSON (lesson 1.9), and one decision method:
+
+```python
+    def is_usable(
+        self, repo: str, labels: tuple[str, ...], now: datetime, max_age: timedelta
+    ) -> bool:
+        """True if this copy answers the same question and is recent enough."""
+        same_question = self.repo == repo and set(self.labels) == set(labels)
+        recent_enough = now - self.fetched_at <= max_age
+        return same_question and recent_enough
+```
+
+`load` returns `None` when the file is missing *or* corrupt (for example, half-written when a previous run was killed): in both cases the right response is simply to fetch again. The full module is `atlas/src/atlas/issue_cache.py` in the reference code; write your own first, then compare.
+
+The cache lives at `~/.cache/atlas/issues-pytorch-ignite.json`. `~/.cache` is the conventional place for files a program can always recreate.
+
+```{mermaid}
+flowchart TD
+  S[atlas issues] --> R{--refresh?}
+  R -->|yes| F[fetch from GitHub<br/>labels concurrently]
+  R -->|no| L[load cache file]
+  L --> U{usable?<br/>same repo and labels,<br/>younger than --max-age}
+  U -->|yes| P[print issues]
+  U -->|no, missing or corrupt| F
+  F --> W[save cache with fetched_at]
+  W --> P
+```
+
+## The `atlas issues` command
+
+Add an `issues` subcommand to `cli.py` with `--repo` (default `pytorch/ignite`), `--label` (repeatable: `action="append"`), `--refresh`, `--max-age` (minutes, default 60), `--cache` and `--json`. The core of `run_issues`:
+
+```python
+def run_issues(args: argparse.Namespace) -> int:
+    labels = tuple(args.label or ["good first issue"])
+    cache_path = args.cache or issue_cache.default_cache_path(args.repo)
+    now = datetime.now(UTC)
+
+    cached = None if args.refresh else issue_cache.load(cache_path)
+    max_age = timedelta(minutes=args.max_age)
+    use_cache = cached is not None and cached.is_usable(args.repo, labels, now, max_age)
+
+    if cached is not None and use_cache:
+        issues = cached.issues
+        minutes_old = int((now - cached.fetched_at).total_seconds() // 60)
+        source = f"cached copy from {minutes_old} min ago"
+    else:
+        try:
+            issues = asyncio.run(fetch_issues(args.repo, list(labels), token=github_token()))
+        except GitHubError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
+        issue_cache.save(cache_path, CachedIssues(args.repo, labels, now, issues))
+        source = "GitHub"
+    ...
+```
+
+`asyncio.run` is the bridge: the command line is ordinary code, and it starts the event loop just for the fetch. The full function, including the printing, is in the reference `cli.py`.
+
+Here is the command running against the course's **fake GitHub** (sample data used by the tests, so the output is reproducible and doesn't depend on Ignite's issues today):
+
+```text
+$ atlas issues
+#12       15d  Fix docstring typo  [good first issue]
+#7        15d  Add example to Engine  [good first issue, help wanted]
+2 open issues from GitHub
+$ atlas issues
+#12       15d  Fix docstring typo  [good first issue]
+#7        15d  Add example to Engine  [good first issue, help wanted]
+2 open issues from cached copy from 0 min ago
+$ atlas issues --label "good first issue" --label "help wanted"
+#20       15d  Support new metric  [help wanted]
+#12       15d  Fix docstring typo  [good first issue]
+#7        15d  Add example to Engine  [good first issue, help wanted]
+3 open issues from GitHub
+```
+
+Run it yourself without the fake and you'll get PyTorch-Ignite's real open good first issues. The second run doesn't touch the network at all. Asking for a different label set ignores the cache, because it answers a different question.
+
+## Testing without the network
+
+Tests must not call the real GitHub: it's slow, rate-limited, and its data changes. httpx lets you swap the network layer for a function, with `httpx.MockTransport`. The function receives each real `httpx.Request` and returns a `httpx.Response`, exactly as GitHub would:
+
+```python
+import httpx
+
+
+def fake_github(request: httpx.Request) -> httpx.Response:
+    label = request.url.params.get("labels")
+    if request.url.path == "/repos/pytorch/ignite/issues" and label == "help wanted":
+        return httpx.Response(200, json=[issue_json(20, "Support new metric", ["help wanted"])])
+    return httpx.Response(404, json={"message": "Not Found"})
+
+
+TRANSPORT = httpx.MockTransport(fake_github)
+```
+
+That's why `fetch_issues` accepts a `transport`. The course's `tests/fake_github.py` answers every request Atlas makes, including a second page with a `Link` header, a pull request that must be skipped, and a rate-limit error. Async functions are tested by running them with `asyncio.run`:
+
+```python
+def test_several_labels_are_merged_without_duplicates_newest_first() -> None:
+    labels = ["good first issue", "help wanted"]
+    issues = asyncio.run(fetch_issues("pytorch/ignite", labels, transport=TRANSPORT))
+
+    assert [issue.number for issue in issues] == [20, 12, 7]
+```
+
+For the command-line tests, pytest's `monkeypatch` fixture temporarily replaces `atlas.cli.fetch_issues` with a fake, so you can check the caching logic (first run fetches, second run reads the cache) without any HTTP at all. The reference project now has 33 tests, running in under a second.
+
+## Common mistakes
+
+- **Blocking calls inside `async def`** (`time.sleep`, synchronous httpx): everything else stalls.
+- **Forgetting `await`**: you get a coroutine object instead of a result, and a warning that it was "never awaited".
+- **Firing thousands of requests at once.** `gather` over 10,000 URLs will hit rate limits and exhaust connections. Limit concurrency; the reference code makes one request series per label, a handful at most.
+- **Caching without a time limit.** Stale data forever. Always record when it was fetched.
+- **Using threads or async for CPU-bound work** in Python. They don't speed up calculation; processes do.
+
+## Check yourself
+
+**1.** Atlas needs to resize 10,000 images. Threads, async or processes?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Processes. Resizing is CPU-bound; separate processes can use several CPU cores truly in parallel. Threads and async only help with waiting.
+:::
+
+**2.** What does `await` actually do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It runs the awaited operation and, while that operation is waiting (for the network, a timer), hands control back to the event loop so other tasks can run. When the result is ready, the task continues from that point.
+:::
+
+**3.** Why does Atlas fetch each label separately instead of `labels=good first issue,help wanted`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+GitHub treats a comma-separated label list as AND: issues with all those labels. Atlas wants issues with any of them, so it requests each label and merges the results, removing duplicates.
+:::
+
+## Exercise
+
+Add a `--max-pages` option to `atlas issues` (default 10) and pass it through to `fetch_issues`. Then write a test using the fake GitHub showing that with `max_pages=1`, only the first page's issue (#12) is returned for `good first issue`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_max_pages_limits_how_far_pagination_goes() -> None:
+    issues = asyncio.run(
+        fetch_issues("pytorch/ignite", ["good first issue"], max_pages=1, transport=TRANSPORT)
+    )
+
+    assert [issue.number for issue in issues] == [12]
+```
+
+In `cli.py`: `issues_parser.add_argument("--max-pages", type=int, default=10)`, then `fetch_issues(args.repo, list(labels), token=github_token(), max_pages=args.max_pages)`.
+:::
+
+## Stretch
+
+Limit concurrency explicitly. Wrap the request in `fetch_label` with an `asyncio.Semaphore(2)` shared by all labels, so at most two requests are in flight at once even if a user passes ten `--label` options. Prove it with the timing demo above: five `fake_request` calls, a semaphore of 2, roughly 3 seconds.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+async def limited_request(semaphore: asyncio.Semaphore, name: str) -> str:
+    async with semaphore:
+        return await fake_request(name)
+
+
+async def main() -> None:
+    semaphore = asyncio.Semaphore(2)
+    await asyncio.gather(*(limited_request(semaphore, name) for name in "abcde"))
+```
+
+Five tasks, two at a time: 2 + 2 + 1, so about 3 seconds. A semaphore is a counter of available slots: `async with` takes one and gives it back when done. Real API clients use exactly this to stay polite to servers.
+:::
+
+## What changed in the project
+
+`github.py` is async and fetches several labels concurrently; `issue_cache.py` saves results to disk with a freshness check; `atlas issues` lists PyTorch-Ignite's open good first issues. Commit: `feat: Added atlas issues with concurrent fetching and caching`.
