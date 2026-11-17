@@ -1,0 +1,355 @@
+---
+title: "3.3 SQL II: joins, aggregates, subqueries, CTEs, window functions"
+description: "Combine tables with joins, summarise groups with GROUP BY, and answer harder questions with subqueries, CTEs and window functions."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 3 · About 80 minutes
+:::
+
+::: {.callout-note title="Analogy: cross-referencing two registers"}
+A school keeps a register of classes and a separate register of students, with each student's class written next to their name. To answer "which teacher has the most students?", you look up each student's class in the class register, then count per teacher. A **join** is that cross-referencing; **GROUP BY** is the counting per teacher. Keeping two registers instead of repeating the teacher's name on every student's line means a teacher's name change happens in exactly one place.
+:::
+
+## Splitting data across tables
+
+The outputs in this lesson start from the practice data exactly as lesson 3.2 left it (with issue 101 closed), without your exercise changes. If you did the exercise, some counts will differ; that's fine.
+
+In lesson 3.2 every issue repeated its repository's name as text. Real schemas store each fact once. Here repositories get their own table, and issues point to them by id:
+
+```sql
+CREATE TABLE repos (
+    id        integer PRIMARY KEY,
+    full_name text    NOT NULL UNIQUE
+);
+INSERT INTO repos VALUES (1, 'pytorch/ignite'), (2, 'pytorch/vision'), (3, 'example/my-atlas');
+
+ALTER TABLE issues ADD COLUMN repo_id integer REFERENCES repos (id);
+UPDATE issues SET repo_id = repos.id FROM repos WHERE repos.full_name = issues.repo;
+ALTER TABLE issues ALTER COLUMN repo_id SET NOT NULL;
+ALTER TABLE issues DROP COLUMN repo;
+```
+
+- `ALTER TABLE` changes an existing table: here adding a column, filling it from the `repos` table, making it required, then dropping the old text column. Lesson 4.11 automates these changes with migrations.
+- `REFERENCES repos (id)` makes `repo_id` a **foreign key**: every value must exist as an `id` in `repos`. The database now refuses orphans:
+
+```sql
+INSERT INTO issues (number, repo_id, title, created_at) VALUES (200, 99, 'Orphan', now());
+```
+```text
+ERROR:  insert or update on table "issues" violates foreign key constraint "issues_repo_id_fkey"
+DETAIL:  Key (repo_id)=(99) is not present in table "repos".
+```
+
+Labels are a **many-to-many** relationship: one issue has several labels, one label is on several issues. That needs a third table holding the pairs:
+
+```sql
+CREATE TABLE labels (id integer PRIMARY KEY, name text NOT NULL UNIQUE);
+INSERT INTO labels VALUES (1, 'good first issue'), (2, 'docs'), (3, 'help wanted');
+
+CREATE TABLE issue_labels (
+    issue_number integer REFERENCES issues (number),
+    label_id     integer REFERENCES labels (id),
+    PRIMARY KEY (issue_number, label_id)
+);
+INSERT INTO issue_labels VALUES (101, 1), (101, 2), (102, 1), (102, 3), (104, 2), (105, 3);
+```
+
+```{mermaid}
+erDiagram
+  repos ||--o{ issues : has
+  issues ||--o{ issue_labels : tagged_with
+  labels ||--o{ issue_labels : used_in
+  repos {
+    integer id PK
+    text full_name
+  }
+  issues {
+    integer number PK
+    integer repo_id FK
+    text title
+    integer comments
+  }
+  labels {
+    integer id PK
+    text name
+  }
+  issue_labels {
+    integer issue_number PK
+    integer label_id PK
+  }
+```
+
+The primary key of `issue_labels` is the *pair* of columns: the same label can't be attached to the same issue twice.
+
+## JOIN
+
+```sql
+SELECT issues.number, repos.full_name, issues.title
+FROM issues
+JOIN repos ON repos.id = issues.repo_id
+ORDER BY issues.number;
+```
+```text
+ number |   full_name    |             title
+--------+----------------+-------------------------------
+    101 | pytorch/ignite | Fix typo in Engine docstring
+    102 | pytorch/ignite | Add example for EarlyStopping
+    103 | pytorch/ignite | Support new metric: MAPE
+    104 | pytorch/vision | Clarify transforms docs
+    105 | pytorch/ignite | Flaky test in test_checkpoint
+(5 rows)
+```
+
+`JOIN ... ON` pairs each issue with the repo row whose `id` equals its `repo_id`. Write `table.column` whenever a name could be ambiguous.
+
+### Inner versus left joins
+
+A plain `JOIN` (an **inner join**) keeps only rows with a match on both sides. A **left join** keeps every row from the left table, filling the right side with `NULL` when nothing matches. The difference shows when counting:
+
+```sql
+SELECT repos.full_name, count(issues.number) AS issue_count
+FROM repos
+LEFT JOIN issues ON issues.repo_id = repos.id
+GROUP BY repos.full_name
+ORDER BY issue_count DESC, repos.full_name;
+```
+```text
+    full_name     | issue_count
+------------------+-------------
+ pytorch/ignite   |           4
+ pytorch/vision   |           1
+ example/my-atlas |           0
+(3 rows)
+```
+
+With an inner join, `example/my-atlas` disappears entirely, because it has no issues to match:
+
+```text
+   full_name    | issue_count
+----------------+-------------
+ pytorch/ignite |           4
+ pytorch/vision |           1
+(2 rows)
+```
+
+When you want "every X, with its Ys, even if there are none", you want a left join. `count(issues.number)` counts non-NULL values, which is why the empty repo gets 0, not 1.
+
+## GROUP BY and HAVING
+
+`GROUP BY` collapses rows into one row per group, and aggregates run per group. `HAVING` filters groups, after grouping (`WHERE` filters rows, before):
+
+```sql
+SELECT repos.full_name, count(*) AS issues, round(avg(comments), 1) AS avg_comments
+FROM issues JOIN repos ON repos.id = issues.repo_id
+GROUP BY repos.full_name
+HAVING count(*) > 1;
+```
+```text
+   full_name    | issues | avg_comments
+----------------+--------+--------------
+ pytorch/ignite |      4 |          3.8
+(1 row)
+```
+
+Every column in `SELECT` must either be in `GROUP BY` or inside an aggregate: "which title?" has no answer for a group of four issues.
+
+## Many-to-many in practice
+
+Two joins walk across the link table. `string_agg` glues a group's values into one string:
+
+```sql
+SELECT issues.number, issues.title,
+       string_agg(labels.name, ', ' ORDER BY labels.name) AS labels
+FROM issues
+JOIN issue_labels ON issue_labels.issue_number = issues.number
+JOIN labels ON labels.id = issue_labels.label_id
+GROUP BY issues.number, issues.title
+ORDER BY issues.number;
+```
+```text
+ number |             title             |            labels
+--------+-------------------------------+-------------------------------
+    101 | Fix typo in Engine docstring  | docs, good first issue
+    102 | Add example for EarlyStopping | good first issue, help wanted
+    104 | Clarify transforms docs       | docs
+    105 | Flaky test in test_checkpoint | help wanted
+(4 rows)
+```
+
+## Subqueries
+
+A **subquery** is a query inside another. "Issues with more comments than average":
+
+```sql
+SELECT number, title, comments
+FROM issues
+WHERE comments > (SELECT avg(comments) FROM issues)
+ORDER BY comments DESC;
+```
+```text
+ number |             title             | comments
+--------+-------------------------------+----------
+    105 | Flaky test in test_checkpoint |        8
+    102 | Add example for EarlyStopping |        5
+(2 rows)
+```
+
+## CTEs: naming a step
+
+A **CTE** (Common Table Expression), written with `WITH`, gives a subquery a name, so a complex query reads top to bottom like a series of named steps, the same idea as naming a condition in Python:
+
+```sql
+WITH ignite_open AS (
+    SELECT issues.*
+    FROM issues JOIN repos ON repos.id = issues.repo_id
+    WHERE repos.full_name = 'pytorch/ignite' AND state = 'open'
+)
+SELECT count(*) AS open_issues, sum(comments) AS total_comments FROM ignite_open;
+```
+```text
+ open_issues | total_comments
+-------------+----------------
+           3 |             13
+```
+
+(Issue 101 was closed in lesson 3.2, so 3 of Ignite's 4 issues are open.)
+
+## Window functions
+
+`GROUP BY` collapses rows. A **window function** computes across related rows **without** collapsing them: each row keeps its identity and gains a value computed over its "window". `PARTITION BY` sets the window, `ORDER BY` orders inside it:
+
+```sql
+SELECT repos.full_name, issues.number, issues.created_at::date AS created,
+       row_number() OVER (PARTITION BY issues.repo_id ORDER BY issues.created_at DESC) AS newest_rank
+FROM issues JOIN repos ON repos.id = issues.repo_id
+ORDER BY repos.full_name, newest_rank;
+```
+```text
+   full_name    | number |  created   | newest_rank
+----------------+--------+------------+-------------
+ pytorch/ignite |    101 | 2026-11-02 |           1
+ pytorch/ignite |    102 | 2026-10-20 |           2
+ pytorch/ignite |    103 | 2026-06-01 |           3
+ pytorch/ignite |    105 | 2025-12-24 |           4
+ pytorch/vision |    104 | 2026-11-10 |           1
+(5 rows)
+```
+
+(`::date` converts the timestamp to a plain date for display.) Filter on that rank, and you get the classic "latest item per group", which is awkward with `GROUP BY` alone:
+
+```sql
+SELECT full_name, number, created FROM (
+    SELECT repos.full_name, issues.number, issues.created_at::date AS created,
+           row_number() OVER (PARTITION BY issues.repo_id ORDER BY issues.created_at DESC) AS newest_rank
+    FROM issues JOIN repos ON repos.id = issues.repo_id
+) AS ranked
+WHERE newest_rank = 1;
+```
+```text
+   full_name    | number |  created
+----------------+--------+------------
+ pytorch/ignite |    101 | 2026-11-02
+ pytorch/vision |    104 | 2026-11-10
+(2 rows)
+```
+
+Other window functions: `rank()` (ties share a rank), `lag()` and `lead()` (the previous or next row's value), and `sum(...) OVER (...)` for running totals.
+
+## Common mistakes
+
+- **Inner join when you meant left join**: rows with no match silently vanish from reports.
+- **`count(*)` with a left join**: counts the NULL-filled row as 1. Count a column from the right-hand table.
+- **Selecting a column that's neither grouped nor aggregated**: `ERROR: column ... must appear in the GROUP BY clause`.
+- **Using `WHERE` for a condition on an aggregate**: aggregates belong in `HAVING`.
+- **Joining without an `ON` condition** (or with the wrong one): every row pairs with every row, multiplying your results.
+
+## Check yourself
+
+**1.** List every label with how many issues carry it, including labels on no issues.
+
+::: {.callout-tip collapse="true" title="Answer"}
+```sql
+SELECT labels.name, count(issue_labels.issue_number) AS issues
+FROM labels
+LEFT JOIN issue_labels ON issue_labels.label_id = labels.id
+GROUP BY labels.name
+ORDER BY issues DESC;
+```
+Left join from `labels`, and count a column from the joined table.
+:::
+
+**2.** What's the difference between `WHERE` and `HAVING`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`WHERE` filters individual rows before grouping. `HAVING` filters groups after grouping, so it can use aggregates like `count(*) > 1`.
+:::
+
+**3.** When would you use a window function instead of `GROUP BY`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+When you need a value computed over a group *and* still want every individual row: ranks within a group, running totals, comparing each row to the previous one, or "latest per group".
+:::
+
+## Exercise
+
+Using the practice tables:
+
+1. For each repository, show its number of open issues and the title of its most-commented open issue.
+2. Show every issue labelled `good first issue`, with its repository name.
+3. Using a CTE, find repositories whose average comments per issue is above the overall average.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+-- 1
+SELECT full_name, open_issues, title AS most_commented
+FROM (
+    SELECT repos.full_name, issues.title,
+           count(*) OVER (PARTITION BY repos.id) AS open_issues,
+           row_number() OVER (PARTITION BY repos.id ORDER BY issues.comments DESC) AS place
+    FROM issues JOIN repos ON repos.id = issues.repo_id
+    WHERE issues.state = 'open'
+) AS ranked
+WHERE place = 1;
+
+-- 2
+SELECT issues.number, repos.full_name, issues.title
+FROM issues
+JOIN repos ON repos.id = issues.repo_id
+JOIN issue_labels ON issue_labels.issue_number = issues.number
+JOIN labels ON labels.id = issue_labels.label_id
+WHERE labels.name = 'good first issue';
+
+-- 3
+WITH per_repo AS (
+    SELECT repo_id, avg(comments) AS avg_comments FROM issues GROUP BY repo_id
+)
+SELECT repos.full_name, round(per_repo.avg_comments, 1)
+FROM per_repo JOIN repos ON repos.id = per_repo.repo_id
+WHERE per_repo.avg_comments > (SELECT avg(comments) FROM issues);
+```
+
+`count(*) OVER (PARTITION BY ...)` is an aggregate used as a window function: the group's count, repeated on every row of the group.
+:::
+
+## Stretch
+
+Using `lag()`, list Ignite's issues in creation order with the number of days since the previous issue was opened.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+SELECT issues.number,
+       issues.created_at::date AS created,
+       issues.created_at::date
+         - lag(issues.created_at::date) OVER (ORDER BY issues.created_at) AS days_since_previous
+FROM issues JOIN repos ON repos.id = issues.repo_id
+WHERE repos.full_name = 'pytorch/ignite'
+ORDER BY issues.created_at;
+```
+
+Subtracting two dates in Postgres gives a number of days. The first row has no previous issue, so its value is `NULL`.
+:::
+
+## What changed in the project
+
+Nothing in `my-atlas` yet. You can now read and write the queries that lessons 3.4 to 3.8 build Atlas on.

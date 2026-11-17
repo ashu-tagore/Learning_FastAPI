@@ -1,0 +1,215 @@
+---
+title: "3.1 Why databases, Docker basics, running Postgres"
+description: "Understand what a database gives you that files don't, learn just enough Docker to run services, and start PostgreSQL for Atlas."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 1 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: a library and its librarian"}
+So far Atlas keeps data in files, like a person keeping notes in a pile of notebooks. That works until several people need the notes at once, someone needs "every note about checkpoints written last month", or two people edit the same page simultaneously. A **database** is a library with a librarian: data lives in organised shelves (**tables**), you ask questions in a precise language (**SQL**), the librarian finds answers fast using catalogues (**indexes**), keeps people from overwriting each other's work (**transactions**), and refuses to shelve anything that breaks the rules (**constraints**).
+:::
+
+## What files can't do
+
+Atlas's issue cache (lesson 2.6) is a JSON file. Imagine it grows to millions of issues, shared by a web server handling many users:
+
+| Need | With files | With a database |
+|---|---|---|
+| Find issues labelled `docs` opened last month | read and parse the whole file every time | ask for exactly those rows; an index finds them in milliseconds |
+| Two processes updating at once | one silently overwrites the other | transactions keep both changes correct (lesson 3.7) |
+| A crash halfway through a save | a half-written, corrupt file | the change happens completely or not at all |
+| "Every issue must belong to a repository" | hope the code never forgets | a constraint makes it impossible to store otherwise |
+| Many programs, many machines reading | copy files around | they all connect to one server over the network |
+
+A **relational database** stores data in **tables** (rows and columns, like a spreadsheet with strict rules) and relates tables to each other through shared values. **PostgreSQL** (Postgres) is the most widely used open-source relational database, and this course's only database: in Part 6 it also becomes Atlas's vector search engine.
+
+## The client-server model, again
+
+Postgres is a **server**: a long-running process (lesson 2.1) listening on port 5432 (lesson 2.2). Your programs are **clients** that connect over TCP and send SQL. The `psql` command-line tool is one client; Atlas's Python code will be another.
+
+```{mermaid}
+flowchart LR
+  P[psql] -->|SQL over TCP :5432| S[(Postgres server<br/>process + data files)]
+  A[atlas CLI] -->|SQL over TCP :5432| S
+  W[web API, Part 4] -->|SQL over TCP :5432| S
+```
+
+## Docker in ten minutes
+
+Installing a database server by hand differs on every operating system and leaves leftovers behind. **Docker** packages software with everything it needs into an **image**, and runs it as an isolated **container**:
+
+- An **image** is a frozen, downloadable package: an operating system's essentials plus one program and its settings. `postgres:17` is the official Postgres 17 image.
+- A **container** is a running instance of an image: a process with its own private filesystem and network, started and stopped with one command.
+- A **volume** is storage that outlives containers. A container's own filesystem is thrown away when it's removed; a database's data must live in a volume.
+
+You'll learn to *build* images in lesson 7.1. For now you only run them.
+
+### Install Docker
+
+- **Windows:** install **Docker Desktop**, and in its settings enable integration with your WSL Ubuntu distribution.
+- **macOS:** install **Docker Desktop**.
+- **Linux:** install **Docker Engine** from Docker's documentation for your distribution, then add yourself to the `docker` group so you don't need `sudo` for every command.
+
+Check it works: `docker run hello-world` should print a greeting.
+
+## Docker Compose: services as a file
+
+Rather than typing long `docker run` commands, describe your services in a `compose.yml` file in `my-atlas`:
+
+```yaml
+# Local development services. Start with: docker compose up -d
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: atlas
+      # A throwaway password for a database that only listens on your own machine.
+      # Real deployments read secrets from a secret store (Part 7), never from this file.
+      POSTGRES_PASSWORD: atlas-dev-password
+      POSTGRES_DB: atlas
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - atlas-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  atlas-db:
+```
+
+- `environment` sets environment variables inside the container (lesson 0.2); the official image reads these to create a user, password and database on first start.
+- `ports` connects port 5432 on your machine to port 5432 in the container. The `127.0.0.1:` prefix means only your own machine can connect (lesson 2.2): a database with a known password should never be reachable from your network.
+- `volumes` stores the data in a named volume, `atlas-db`, so it survives restarts and container removal.
+- `healthcheck` lets Docker report when the database is ready to accept connections.
+
+## Start Postgres
+
+```text
+$ docker compose up -d
+ Container atlas-db-1 Created
+ Container atlas-db-1 Starting
+ Container atlas-db-1 Started
+$ docker compose ps
+NAME         IMAGE         COMMAND                  SERVICE   CREATED         STATUS                   PORTS
+atlas-db-1   postgres:17   "docker-entrypoint.s…"   db        7 seconds ago   Up 5 seconds (healthy)   127.0.0.1:5432->5432/tcp
+```
+
+`-d` ("detached") runs it in the background. The first run downloads the image, which takes a minute.
+
+Open `psql` inside the container and ask the server what it is:
+
+```text
+$ docker compose exec db psql -U atlas -d atlas
+atlas=# select version();
+                                                       version
+-------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 17.12 (Debian 17.12-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+```
+
+`atlas=#` is psql's prompt: you're connected to database `atlas`. Useful psql commands (they start with a backslash and are psql's own, not SQL):
+
+| Command | Does |
+|---|---|
+| `\l` | list databases |
+| `\dt` | list tables |
+| `\d tablename` | describe a table |
+| `\x` | toggle expanded display for wide rows |
+| `\q` | quit |
+
+Everyday Docker Compose commands:
+
+| Command | Does |
+|---|---|
+| `docker compose up -d` | start the services in the background |
+| `docker compose ps` | show their status |
+| `docker compose logs db` | show the database's logs |
+| `docker compose stop` | stop them; data stays in the volume |
+| `docker compose down` | stop and remove the containers; the volume, and your data, stays |
+| `docker compose down -v` | also delete the volumes: **all data gone** |
+
+## A practice database
+
+Lessons 3.2 to 3.7 practise SQL on a separate database so your experiments never touch Atlas's real tables:
+
+```text
+atlas=# create database practice;
+CREATE DATABASE
+atlas=# \c practice
+You are now connected to database "practice" as user "atlas".
+```
+
+The practice data in those lessons (issue titles, comment counts) is made up to illustrate each idea.
+
+## Common mistakes
+
+- **Exposing the database to your network** with `"5432:5432"` (no `127.0.0.1:`). With a known password, anyone on the same Wi-Fi could connect.
+- **`docker compose down -v` by accident.** The `-v` deletes your data. Read before you press Enter.
+- **No volume.** Without one, the data lives in the container and is lost when it's removed.
+- **"Connection refused"** right after starting: the database takes a few seconds to initialise. Wait for `(healthy)` in `docker compose ps`.
+- **A Postgres already installed on your machine** using port 5432. Stop it, or map the container to another port (`"127.0.0.1:5433:5432"`) and use 5433 in connection settings.
+
+## Check yourself
+
+**1.** What's the difference between an image and a container?
+
+::: {.callout-tip collapse="true" title="Answer"}
+An image is a frozen package of software and its environment. A container is a running instance of an image, with its own process, filesystem and network. Many containers can run from one image.
+:::
+
+**2.** You run `docker compose down` and then `docker compose up -d`. Is the data still there?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Yes. `down` removes containers, not named volumes, and the data lives in the `atlas-db` volume. Only `down -v` deletes it.
+:::
+
+**3.** Why does a database guarantee "all or nothing" saves, and why do files not?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Databases wrap changes in transactions and keep a log so that a crash mid-change can be undone or completed on restart. Writing a file is many separate disk writes; a crash in the middle leaves whatever was written so far. You'll see transactions in lesson 3.7.
+:::
+
+## Exercise
+
+1. Add the `compose.yml` above to `my-atlas` and start Postgres.
+2. Open psql, create the `practice` database, connect to it, and run `select now(), current_user;`.
+3. Stop the containers with `docker compose stop`, start them again, and confirm the `practice` database still exists with `\l`.
+4. Commit `compose.yml`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+docker compose up -d
+docker compose exec db psql -U atlas -d atlas
+```
+```sql
+create database practice;
+\c practice
+select now(), current_user;
+\q
+```
+```bash
+docker compose stop
+docker compose up -d
+docker compose exec db psql -U atlas -d atlas -c '\l'
+git add compose.yml
+git commit -m "chore: Added Postgres for local development"
+```
+
+`now()` is the server's current time with its time zone; `current_user` is `atlas`.
+:::
+
+## Stretch
+
+Find out where your data physically lives: run `docker volume ls` and `docker volume inspect` on the volume (its name starts with your folder name, like `my-atlas_atlas-db`). Then look at the database's logs with `docker compose logs db` and find the line saying it's ready to accept connections.
+
+::: {.callout-tip collapse="true" title="Answer"}
+`docker volume inspect` shows a `Mountpoint`: a folder Docker manages (inside Docker Desktop's virtual machine on Windows and macOS). Never edit files there by hand. The log line reads `database system is ready to accept connections`; it appears twice on the very first start, because the image starts a temporary server to create your user and database before the real one.
+:::
+
+## What changed in the project
+
+`my-atlas` has a `compose.yml` running Postgres 17 locally. Commit: `chore: Added Postgres for local development`.

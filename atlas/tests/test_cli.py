@@ -102,3 +102,22 @@ def test_issues_reports_github_errors(
 def test_commits_rejects_out_of_range_limit(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["commits", "--limit", "500"]) == 1
     assert "between 1 and 100" in capsys.readouterr().err
+
+
+def test_database_commands_explain_missing_url(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    assert main(["find", "Engine"]) == 1
+    assert "set DATABASE_URL" in capsys.readouterr().err
+
+
+def test_unreachable_database_is_reported_not_crashed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Port 1 has nothing listening, so the connection is refused immediately.
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://atlas:x@127.0.0.1:1/atlas")
+
+    assert main(["find", "Engine"]) == 1
+    assert "cannot reach the database" in capsys.readouterr().err

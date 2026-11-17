@@ -1,0 +1,157 @@
+---
+title: "3.10 Schema design exercise"
+description: "Design a schema from a written product spec, on your own, then compare your decisions with a worked solution."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 10 · Unguided exercise · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: an architect's first solo house"}
+An architecture student copies a hundred floor plans before designing one alone. The first solo plan is where the lessons stick: every room placement is a decision they must justify. This lesson is your first solo plan. There's no single right schema; there are well-justified ones and poorly justified ones.
+:::
+
+Work through this without looking at the solution. Write your answer as SQL `CREATE TABLE` statements in a file, and run them in a fresh database (`create database design_exercise;`) to make sure they're valid.
+
+## The spec: Atlas study plans
+
+Atlas is adding a feature to help learners prepare to contribute to a project.
+
+> Users can create **study plans** for a repository Atlas has indexed. A plan has a title, an optional description, and a target date.
+>
+> A plan contains an **ordered** list of **steps**. Each step is either a **document** to read (one of the repository's indexed files), an **issue** to study, or a free-text **task** ("run the test suite"). A step has a status: not started, in progress or done, and records when it was completed.
+>
+> Users can **share** a plan with other users as viewers or editors. The owner can always edit.
+>
+> Users can **tag** plans with their own tags ("metrics", "beginner").
+>
+> Questions the product must answer quickly:
+>
+> 1. A user's plans, most recently updated first.
+> 2. A plan's steps in order, with their status.
+> 3. "What fraction of this plan is done?"
+> 4. All plans shared with a given user.
+> 5. All of a user's plans with a given tag.
+>
+> Deleting a plan deletes its steps and shares. If an issue closes and is removed from Atlas's `issues` table (lesson 3.8), steps referring to it must **not** disappear.
+
+Assume a `users (id, email)` table exists (Part 4 creates it). Atlas's existing tables are in lesson 3.4.
+
+## Your deliverables
+
+1. `CREATE TABLE` statements with keys, foreign keys and constraints.
+2. The indexes that the five questions need.
+3. One sentence for each decision you found hard.
+4. The SQL for questions 2 and 3.
+
+## A checklist to review your own design
+
+- Does every table have a primary key, and are the real-world uniqueness rules expressed as `UNIQUE` constraints?
+- How is step **order** stored, and what happens when a step is moved?
+- How do you store "a step is a document **or** an issue **or** a task" so the database rejects impossible combinations?
+- What happens to a step pointing at an issue when that issue row is deleted?
+- Is any fact stored in two places?
+- Is every timestamp `timestamptz`, and is every allowed-values column constrained?
+
+::: {.callout-tip collapse="true" title="Hint: the step kinds"}
+Consider three nullable columns (`document_id`, `issue_number`, `task_text`) plus a `kind` column, and a `CHECK` that exactly the right one is filled for each kind. Then ask what `ON DELETE` should do for each reference, given the spec's last sentence.
+:::
+
+::: {.callout-tip collapse="true" title="Hint: ordering"}
+An integer `position` per step, unique within a plan, is the simplest approach. Moving a step means renumbering others. (Some systems use gaps of 1000, or fractional positions, to avoid renumbering; simplicity wins at this size.)
+:::
+
+## A worked solution
+
+Open this only after you have your own.
+
+::: {.callout-note collapse="true" title="One well-justified design"}
+```sql
+CREATE TABLE study_plans (
+    id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id    integer     NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    repo_id     integer     NOT NULL REFERENCES repos (id) ON DELETE CASCADE,
+    title       text        NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+    description text,
+    target_date date,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX study_plans_owner_updated_idx ON study_plans (owner_id, updated_at DESC);
+
+CREATE TABLE plan_steps (
+    id            bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    plan_id       bigint      NOT NULL REFERENCES study_plans (id) ON DELETE CASCADE,
+    position      integer     NOT NULL CHECK (position >= 1),
+    kind          text        NOT NULL CHECK (kind IN ('document', 'issue', 'task')),
+    document_id   integer     REFERENCES documents (id) ON DELETE SET NULL,
+    issue_number  integer,
+    task_text     text,
+    status        text        NOT NULL DEFAULT 'not started'
+                              CHECK (status IN ('not started', 'in progress', 'done')),
+    completed_at  timestamptz,
+    UNIQUE (plan_id, position) DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+        (kind = 'document' AND task_text IS NULL AND issue_number IS NULL)
+        OR (kind = 'issue' AND issue_number IS NOT NULL AND document_id IS NULL AND task_text IS NULL)
+        OR (kind = 'task' AND task_text IS NOT NULL AND document_id IS NULL AND issue_number IS NULL)
+    ),
+    CHECK ((status = 'done') = (completed_at IS NOT NULL))
+);
+
+CREATE TABLE plan_shares (
+    plan_id  bigint  NOT NULL REFERENCES study_plans (id) ON DELETE CASCADE,
+    user_id  integer NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    role     text    NOT NULL CHECK (role IN ('viewer', 'editor')),
+    PRIMARY KEY (plan_id, user_id)
+);
+CREATE INDEX plan_shares_user_idx ON plan_shares (user_id);
+
+CREATE TABLE user_tags (
+    id       bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id  integer NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    name     text    NOT NULL,
+    UNIQUE (user_id, name)
+);
+
+CREATE TABLE plan_tags (
+    plan_id  bigint NOT NULL REFERENCES study_plans (id) ON DELETE CASCADE,
+    tag_id   bigint NOT NULL REFERENCES user_tags (id) ON DELETE CASCADE,
+    PRIMARY KEY (plan_id, tag_id)
+);
+CREATE INDEX plan_tags_tag_idx ON plan_tags (tag_id);
+```
+
+Questions 2 and 3:
+
+```sql
+-- 2: a plan's steps in order
+SELECT position, kind, status, coalesce(task_text, '') AS task
+FROM plan_steps WHERE plan_id = $1 ORDER BY position;
+
+-- 3: fraction done
+SELECT round(avg((status = 'done')::int), 2) AS fraction_done
+FROM plan_steps WHERE plan_id = $1;
+```
+
+The decisions worth defending:
+
+- **Issues are referenced by number, not `issues.id`**, because the spec says steps survive the issue row being deleted. The repository is known through the plan, so `(plan.repo_id, issue_number)` identifies the issue without a foreign key that would cascade or block.
+- **Documents use `ON DELETE SET NULL`**: re-indexing deletes and recreates documents (lesson 3.8), so a step keeps existing, but loses its link. A stronger design would store the document's path too and re-link after indexing; that's a trade-off worth noting, not hiding.
+- **`DEFERRABLE INITIALLY DEFERRED`** on `UNIQUE (plan_id, position)` lets a transaction swap two positions without a temporary conflict: the uniqueness check happens at commit.
+- **The big `CHECK`** makes impossible combinations (an issue step with task text) unstorable, whatever the code does.
+- **`(status = 'done') = (completed_at IS NOT NULL)`** keeps the two columns from contradicting each other.
+- **Tags belong to users** (`user_tags`), because the spec says users tag plans "with their own tags"; one user's "beginner" isn't another's.
+- **No stored "fraction done"**: it's computed by question 3. Storing it would duplicate a fact (lesson 3.4's third rule) for no measured speed gain.
+- **`(owner_id, updated_at DESC)`** serves question 1 directly (lesson 3.6); `plan_shares (user_id)` serves question 4, because the primary key starts with `plan_id`; `plan_tags (tag_id)` serves question 5.
+
+`$1` in the queries is a placeholder for a value, Postgres's own notation for the `%s` you used from Python.
+:::
+
+## Self-review
+
+Compare your design with the solution, decision by decision. For each difference, decide: is yours worse, equally good, or better? Write the reason down. Differences you can defend are a sign you've understood; differences you can't defend show what to revisit (usually lessons 3.4 and 3.6).
+
+## What changed in the project
+
+No code changes. Study plans aren't part of Atlas; this was design practice.

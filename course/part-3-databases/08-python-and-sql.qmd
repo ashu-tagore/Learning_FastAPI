@@ -1,0 +1,389 @@
+---
+title: "3.8 Python and SQL: drivers, SQLAlchemy and sessions"
+description: "Talk to Postgres from Python safely, map tables to classes with SQLAlchemy 2.0, manage sessions and transactions, and give Atlas index, find and issue storage commands."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 8 · About 100 minutes
+:::
+
+::: {.callout-note title="Analogy: an interpreter and a shopping trolley"}
+A **driver** is an interpreter between Python and Postgres: it carries SQL across and brings rows back. An **ORM** (Object-Relational Mapper) goes further: it lets you work with Python objects (a `Document`, a `Chunk`) and translates to and from tables for you. A **session** is a shopping trolley: you put changes in it (`add` this, modify that), and nothing is paid for until checkout (**commit**), when everything goes through together, or you abandon the trolley (**rollback**) and nothing happens.
+:::
+
+## The driver: psycopg
+
+**psycopg** is the standard Postgres driver for Python. You used it in lesson 3.7:
+
+```python
+import psycopg
+
+URL = "postgresql://atlas:atlas-dev-password@localhost:5432/practice"
+
+with psycopg.connect(URL) as conn:
+    rows = conn.execute(
+        "SELECT number, title FROM issues WHERE comments >= %s ORDER BY number", (5,)
+    ).fetchall()
+    print(rows)
+```
+```text
+[(102, 'Add example for EarlyStopping'), (105, 'Flaky test in test_checkpoint')]
+```
+
+The **connection URL** packs everything needed to connect: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE`.
+
+### Parameters, not string formatting
+
+The `%s` is a **placeholder**: the value travels to the database separately from the SQL text. Never build SQL with f-strings. Here's why:
+
+```python
+user_input = "x' OR '1'='1"
+unsafe_sql = f"SELECT count(*) FROM issues WHERE title = '{user_input}'"
+print(unsafe_sql)
+print("unsafe:", conn.execute(unsafe_sql).fetchone()[0])
+print("safe:  ", conn.execute("SELECT count(*) FROM issues WHERE title = %s", (user_input,)).fetchone()[0])
+```
+```text
+SELECT count(*) FROM issues WHERE title = 'x' OR '1'='1'
+unsafe: 5
+safe:   0
+```
+
+The "title" a user typed rewrote the query itself: `OR '1'='1'` is always true, so it matched every row. This is **SQL injection**, one of the oldest and most damaging security holes on the web (lesson 7.10): the same trick can read other users' data or delete tables. With a placeholder, the input is only ever treated as a value, and no title equals that strange string.
+
+## SQLAlchemy: the ORM
+
+Raw SQL is fine for small scripts. Atlas uses **SQLAlchemy 2.0**, Python's most widely used database toolkit, because it:
+
+- maps tables to typed Python classes, so mypy checks your database code
+- builds queries in Python that it turns into correct, parameterised SQL
+- manages connections, sessions and transactions
+- is what FastAPI projects commonly use (Part 4)
+
+Add both libraries to `my-atlas`:
+
+```bash
+uv add sqlalchemy "psycopg[binary]"
+```
+
+### Models: tables as classes
+
+Lesson 3.4's schema, as Python. Create `src/atlas/models.py` (the full file is in the reference code; here are the key parts):
+
+```python
+from datetime import datetime
+
+from sqlalchemy import CheckConstraint, Computed, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Repo(Base):
+    __tablename__ = "repos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    full_name: Mapped[str] = mapped_column(String(200), unique=True)  # "pytorch/ignite"
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    documents: Mapped[list["Document"]] = relationship(back_populates="repo")
+
+
+class Chunk(Base):
+    """A run of consecutive lines from one document: the unit search returns."""
+
+    __tablename__ = "chunks"
+    __table_args__ = (
+        CheckConstraint("start_line <= end_line", name="chunks_line_range_valid"),
+        # A GIN index makes "which chunks contain these words?" fast (lesson 3.6).
+        Index("ix_chunks_tsv", "tsv", postgresql_using="gin"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    start_line: Mapped[int]
+    end_line: Mapped[int]
+    text: Mapped[str] = mapped_column(Text)
+    # Postgres computes and stores the searchable form whenever text changes.
+    # Punctuation becomes spaces first: the English parser would otherwise read
+    # code like `self.fire_event` as a web address instead of the words "fire" and "event".
+    tsv: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed(
+            "to_tsvector('english', regexp_replace(text, '[^[:alnum:]]+', ' ', 'g'))",
+            persisted=True,
+        ),
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="chunks")
+```
+
+How to read it:
+
+- Each class inherits from `Base` (one level, lesson 1.8), which registers it as a table.
+- `Mapped[int]` declares a column and its Python type. `Mapped[datetime | None]` means the column may be `NULL`; anything not `| None` becomes `NOT NULL` automatically.
+- `mapped_column(...)` adds details: primary key, unique, a SQL type like `String(200)`, a foreign key.
+- `relationship(...)` isn't a column: it lets you write `repo.documents` and `chunk.document` in Python, and SQLAlchemy runs the join. `back_populates` links the two directions.
+- `__table_args__` holds table-level rules: constraints and indexes.
+
+From these classes SQLAlchemy generates exactly the SQL from lessons 3.4 and 3.6. `Base.metadata.create_all(engine)` creates every table that doesn't exist yet. It can't *change* existing tables; lesson 4.11 adds migrations for that.
+
+```{mermaid}
+flowchart LR
+  M["models.py<br/>Repo, Document, Chunk,<br/>Issue, Label"] -->|create_all| S[(tables in Postgres)]
+  C[your code] -->|"session.add(Document(...))"| SE[Session]
+  SE -->|"INSERT ... (on flush/commit)"| S
+  C -->|"session.execute(select(...))"| SE
+  SE -->|"SELECT ..."| S
+  S -->|rows| SE -->|objects / tuples| C
+```
+
+### Engine and session
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+engine = create_engine("postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas")
+```
+
+- The **engine** knows how to connect and keeps a **pool** of open connections to reuse (opening one costs a TCP and authentication handshake, lesson 2.2). Create one per program, at startup. The `+psycopg` in the URL tells SQLAlchemy which driver to use.
+- A **session** is one unit of work. Watch what happens when you add an object, with `echo=True` on the engine to print the SQL:
+
+```python
+with Session(engine) as session:
+    repo = Repo(full_name="example/demo")
+    session.add(repo)
+    print("before flush, id =", repo.id)
+    session.flush()
+    print("after flush, id =", repo.id)
+    session.rollback()
+```
+```text
+before flush, id = None
+INFO sqlalchemy.engine.Engine BEGIN (implicit)
+INFO sqlalchemy.engine.Engine INSERT INTO repos (full_name, indexed_at) VALUES (%(full_name)s::VARCHAR, %(indexed_at)s::TIMESTAMP WITH TIME ZONE) RETURNING repos.id
+INFO sqlalchemy.engine.Engine [generated in 0.00017s] {'full_name': 'example/demo', 'indexed_at': None}
+after flush, id = 2
+INFO sqlalchemy.engine.Engine ROLLBACK
+```
+
+(A few connection-setup lines are left out.) Three things to notice:
+
+- `session.add` only puts the object in the trolley; no SQL runs.
+- `session.flush()` sends pending changes to the database **inside the open transaction**: the `INSERT` runs, and Postgres's `RETURNING repos.id` (lesson 3.2's stretch) gives the object its id. Nothing is permanent yet.
+- `rollback()` undid it all. `commit()` would have made it permanent.
+
+The values travel as parameters (`%(full_name)s`), never pasted into the SQL: the ORM protects you from injection automatically.
+
+The pattern Atlas uses for a whole operation is `with session, session.begin():`, which opens a session, starts a transaction, commits if the block finishes and rolls back if it raises.
+
+### Queries with select()
+
+```python
+from sqlalchemy import func, select
+
+with Session(engine) as session:
+    repo = session.scalar(select(Repo).where(Repo.full_name == "pytorch/ignite"))
+    statement = (
+        select(Document.kind, func.count(), func.sum(Document.line_count))
+        .where(Document.repo_id == repo.id)
+        .group_by(Document.kind)
+        .order_by(Document.kind)
+    )
+    print(statement)
+    for kind, files, lines in session.execute(statement):
+        print(kind, files, lines)
+```
+```text
+SELECT documents.kind, count(*) AS count_1, sum(documents.line_count) AS sum_1
+FROM documents
+WHERE documents.repo_id = :repo_id_1 GROUP BY documents.kind ORDER BY documents.kind
+code 362 85932
+doc 41 3988
+```
+
+`select(...)` builds the same SQL you'd write by hand (lesson 3.3), and `print(statement)` shows it. `session.scalar(...)` returns one object or `None`; `session.scalars(...)` returns objects; `session.execute(...)` returns rows (tuples). Python's `==` inside `where` doesn't compare immediately: SQLAlchemy turns it into SQL.
+
+## In the project: `storage.py`
+
+All of Atlas's database work lives in one module with a small interface. Each function takes a session and **never commits**: the caller decides where the transaction begins and ends, so several operations can succeed or fail together. The full module is `atlas/src/atlas/storage.py`; the important parts:
+
+### Indexing a codebase
+
+```python
+def split_into_chunks(lines: list[str], size: int) -> Iterator[tuple[int, int, str]]:
+    """Yield (start_line, end_line, text) for consecutive blocks of `size` lines."""
+    for start in range(0, len(lines), size):
+        block = lines[start : start + size]
+        yield start + 1, start + len(block), "\n".join(block)
+
+
+def index_folder(session, repo_full_name, root, *, extensions=DEFAULT_EXTENSIONS, chunk_lines=40):
+    """Replace the stored copy of a codebase with the files under root."""
+    repo = get_or_create_repo(session, repo_full_name)
+
+    # Delete-then-insert inside the caller's transaction: other sessions keep seeing
+    # the old index until the commit, then the whole new one at once.
+    session.execute(delete(Document).where(Document.repo_id == repo.id))
+
+    for path in iter_source_files(root, extensions):
+        ...  # read the file, skip non-UTF-8 and files containing NUL characters
+        document = Document(
+            repo=repo,
+            path=str(path.relative_to(root)),
+            kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
+            content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            line_count=len(lines),
+        )
+        document.chunks = [
+            Chunk(start_line=start, end_line=end, text=block)
+            for start, end, block in split_into_chunks(lines, chunk_lines)
+        ]
+        session.add(document)
+    ...
+```
+
+`iter_source_files` is lesson 1.9's function, reused. Deleting documents also deletes their chunks, through `ON DELETE CASCADE` (lesson 3.4). `content_hash` is a **SHA-256 fingerprint** of the file's text: identical content gives an identical hash, so Part 5 can skip unchanged files. Setting `document.chunks = [...]` and adding the document adds its chunks too: the relationship cascades the `add`.
+
+### Searching
+
+```python
+def find_chunks(session, repo_full_name, query, limit=10):
+    """Full-text search: chunks matching the query's words, best match first."""
+    ts_query = func.websearch_to_tsquery("english", query)
+    rank = func.ts_rank(Chunk.tsv, ts_query)
+    snippet = func.ts_headline(
+        "english", Chunk.text, ts_query,
+        "StartSel=[, StopSel=], MaxWords=14, MinWords=5, MaxFragments=1",
+    )
+    statement = (
+        select(Document.path, Chunk.start_line, Chunk.end_line, rank, snippet)
+        .join(Chunk.document)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name, Chunk.tsv.bool_op("@@")(ts_query))
+        .order_by(rank.desc(), Document.path, Chunk.start_line)
+        .limit(limit)
+    )
+    ...
+```
+
+`func.something(...)` calls any SQL function. `bool_op("@@")` writes Postgres's "matches" operator. `ts_headline` builds a snippet with matching words in `[brackets]`.
+
+### Storing issues
+
+`save_issues(session, repo_full_name, issues)` makes the stored open issues match a freshly fetched list: it inserts new ones, updates changed ones, deletes ones no longer open, and creates labels as needed, sharing them between issues (lesson 3.4's many-to-many).
+
+## The commands
+
+`cli.py` gains four commands. `DATABASE_URL` comes from an environment variable for now, like `GITHUB_TOKEN` (lesson 2.5); Part 4 moves both into a settings object.
+
+```bash
+export DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas
+```
+
+```text
+$ atlas init-db
+database tables are ready
+$ atlas index --path ~/code/ignite --repo pytorch/ignite
+indexed 403 files into 2437 chunks (0 skipped) as pytorch/ignite
+$ atlas find "fire event" --limit 3
+ignite/engine/engine.py:161-200  0.705  [events] that can be [fired]. Registering an [event] will let the user trigger these
+ignite/engine/engine.py:441-480  0.666  first, *([event]_args + others), **kwargs) def [fire]_[event](self, [event]_name: Any) -> None: """Execute
+tests/ignite/engine/test_engine.py:1-40  0.645  init__(*args, **kwargs) self.called_[events] = [] def _[fire]_[event](self, [event]_name, *[event]_args, **[event]
+3 chunks
+$ atlas find '"good first issue"'
+CONTRIBUTING.md:41-80  0.402  tackle one of the [[good] [first] [issues]](https://github.com/pytorch/ignite/labels/good%20first%20issue).
+1 chunk
+```
+
+Compare with `atlas search` from Part 1: `find` understands word forms ("fired" matched "fire"), ranks results, and the whole index of Ignite took about a second and a half to build. The index runs in one transaction: `run_index` is literally `with session, session.begin(): storage.index_folder(...)`.
+
+Issues fetched with `atlas issues --save` are stored too (shown with the course's sample data, lesson 2.6):
+
+```text
+$ atlas issues --label "good first issue" --label "help wanted" --save
+stored 3 issues in the database
+#20       15d  Support new metric  [help wanted]
+#12       15d  Fix docstring typo  [good first issue]
+#7        15d  Add example to Engine  [good first issue, help wanted]
+3 open issues from GitHub
+```
+
+Without `DATABASE_URL`, the commands explain what's missing instead of crashing:
+
+```text
+$ atlas find Engine
+atlas: set DATABASE_URL, for example postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas
+```
+
+## Common mistakes
+
+- **f-strings in SQL.** Always placeholders, or the ORM.
+- **Forgetting to commit**: everything is rolled back when the session closes.
+- **One global session shared by everything**: sessions aren't safe to share between threads or concurrent requests. One per unit of work (Part 4 creates one per web request).
+- **Creating an engine per query**: you lose the connection pool. One engine per program.
+- **Expecting `create_all` to update tables** after you change a model. It only creates missing tables; drop and recreate in development, or use migrations (lesson 4.11).
+- **The N+1 problem**: looping over 100 documents and touching `document.chunks` on each runs 101 queries. Lesson 4.10 shows how to load related rows in one go.
+
+## Check yourself
+
+**1.** What's the difference between `flush()` and `commit()`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`flush()` sends pending changes to the database inside the current transaction (so generated ids appear and constraints are checked), but nothing is permanent and other sessions can't see it. `commit()` flushes and then ends the transaction, making everything permanent and visible.
+:::
+
+**2.** Why don't `storage.py`'s functions commit?
+
+::: {.callout-tip collapse="true" title="Answer"}
+So the caller controls the transaction: several operations can be grouped into one all-or-nothing unit. If each function committed, a failure in the second operation would leave the first one's changes behind.
+:::
+
+**3.** Why is `"... WHERE title = %s", (value,)` safe while an f-string isn't?
+
+::: {.callout-tip collapse="true" title="Answer"}
+With a placeholder, the value is sent separately from the SQL text, so the database always treats it as data. With an f-string, the value becomes part of the SQL text, so specially crafted input can change the query's meaning (SQL injection).
+:::
+
+## Exercise
+
+Add a `--kind` option to `atlas find` (`code` or `doc`, default both) so you can search only documentation. Pass it to `find_chunks` and add a `.where(Document.kind == kind)` only when it's given. Test it: `atlas find "checkpoint" --kind doc` should return only `.md` and `.rst` files.
+
+::: {.callout-tip collapse="true" title="Solution"}
+In `find_chunks`, add a parameter `kind: str | None = None` and, after building `statement`:
+
+```python
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+```
+
+In `cli.py`: `find_parser.add_argument("--kind", choices=["code", "doc"], default=None)`, then pass `kind=args.kind`. `choices` makes argparse reject anything else with a clear message. Calling `.where()` again adds an `AND` condition. This option isn't in the reference code; it's your extension.
+:::
+
+## Stretch
+
+Write `largest_documents(session, repo_full_name, limit)` returning `(path, line_count)` pairs, biggest first, using `select()`, and compare its results with `atlas stats` from lesson 1.12. Do they agree?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def largest_documents(session: Session, repo_full_name: str, limit: int) -> list[tuple[str, int]]:
+    statement = (
+        select(Document.path, Document.line_count)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name)
+        .order_by(Document.line_count.desc(), Document.path)
+        .limit(limit)
+    )
+    return [(path, lines) for path, lines in session.execute(statement)]
+```
+
+They agree on the files (`test_checkpoint.py` with 1,925 lines first, on the commit used in this course). Ties might be ordered differently: Python sorts paths with capitals first, while this Postgres orders text ignoring case.
+:::
+
+## What changed in the project
+
+`my-atlas` has `models.py` (six tables), `storage.py` (indexing, ranked search, issue storage) and the commands `init-db`, `index`, `find` and `issues --save`. Commit: `feat: Stored and searched the codebase in Postgres`.

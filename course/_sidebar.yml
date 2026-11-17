@@ -40,7 +40,18 @@ website:
       - section: "Part 3: Databases"
         href: part-3-databases/index.qmd
         contents:
-          []
+          - part-3-databases/01-why-databases.qmd
+          - part-3-databases/02-sql-basics.qmd
+          - part-3-databases/03-sql-joins-and-aggregates.qmd
+          - part-3-databases/04-data-modelling.qmd
+          - part-3-databases/05-data-patterns.qmd
+          - part-3-databases/06-indexes-and-query-plans.qmd
+          - part-3-databases/07-transactions-and-concurrency.qmd
+          - part-3-databases/08-python-and-sql.qmd
+          - part-3-databases/09-choosing-a-data-store.qmd
+          - part-3-databases/10-schema-design-exercise.qmd
+          - part-3-databases/11-testing-database-code.qmd
+          - part-3-databases/12-review-and-practice.qmd
       - section: "Part 4: Building APIs with FastAPI"
         href: part-4-fastapi/index.qmd
         contents:

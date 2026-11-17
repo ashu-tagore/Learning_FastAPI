@@ -1,0 +1,228 @@
+"""Everything Atlas stores in Postgres: indexing a codebase, searching it, and issues.
+
+Functions take a Session and never commit: the caller decides where a transaction
+starts and ends, so several operations can succeed or fail together.
+"""
+
+import hashlib
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from sqlalchemy import case, delete, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+
+from atlas import github
+from atlas.models import Base, Chunk, Document, Issue, Label, Repo, issue_labels
+from atlas.search import DEFAULT_EXTENSIONS, iter_source_files
+
+DOC_EXTENSIONS = {".md", ".rst"}
+
+
+@dataclass(frozen=True)
+class IndexSummary:
+    documents: int
+    chunks: int
+    skipped: int
+
+
+@dataclass(frozen=True)
+class Hit:
+    path: str
+    start_line: int
+    end_line: int
+    rank: float
+    snippet: str
+
+
+def create_schema(engine: Engine) -> None:
+    """Create any missing tables. Lesson 4.11 replaces this with migrations."""
+    Base.metadata.create_all(engine)
+
+
+def get_or_create_repo(session: Session, full_name: str) -> Repo:
+    repo = session.scalar(select(Repo).where(Repo.full_name == full_name))
+    if repo is None:
+        repo = Repo(full_name=full_name)
+        session.add(repo)
+        # Flush sends the INSERT now (inside the open transaction) so repo.id is known.
+        session.flush()
+    return repo
+
+
+def split_into_chunks(lines: list[str], size: int) -> Iterator[tuple[int, int, str]]:
+    """Yield (start_line, end_line, text) for consecutive blocks of `size` lines.
+
+    Fixed-size blocks are deliberately naive; lesson 6.5 splits by structure instead.
+    """
+    for start in range(0, len(lines), size):
+        block = lines[start : start + size]
+        yield start + 1, start + len(block), "\n".join(block)
+
+
+def index_folder(
+    session: Session,
+    repo_full_name: str,
+    root: Path,
+    *,
+    extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
+    chunk_lines: int = 40,
+) -> IndexSummary:
+    """Replace the stored copy of a codebase with the files under root."""
+    repo = get_or_create_repo(session, repo_full_name)
+
+    # Delete-then-insert inside the caller's transaction: other sessions keep seeing
+    # the old index until the commit, then the whole new one at once.
+    session.execute(delete(Document).where(Document.repo_id == repo.id))
+
+    document_count = 0
+    chunk_count = 0
+    skipped = 0
+    for path in iter_source_files(root, extensions):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            skipped += 1
+            continue
+
+        # Postgres text columns cannot hold the NUL character.
+        if "\x00" in text:
+            skipped += 1
+            continue
+
+        lines = text.splitlines()
+        document = Document(
+            repo=repo,
+            path=str(path.relative_to(root)),
+            kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
+            content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            line_count=len(lines),
+        )
+        document.chunks = [
+            Chunk(start_line=start, end_line=end, text=block)
+            for start, end, block in split_into_chunks(lines, chunk_lines)
+        ]
+        session.add(document)
+        document_count += 1
+        chunk_count += len(document.chunks)
+
+    repo.indexed_at = datetime.now(UTC)
+    session.flush()
+    return IndexSummary(documents=document_count, chunks=chunk_count, skipped=skipped)
+
+
+def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 10) -> list[Hit]:
+    """Full-text search: chunks matching the query's words, best match first."""
+    # websearch_to_tsquery understands what people type into search boxes:
+    # quoted phrases, "or", and -excluded words.
+    ts_query = func.websearch_to_tsquery("english", query)
+    rank = func.ts_rank(Chunk.tsv, ts_query)
+    snippet = func.ts_headline(
+        "english",
+        Chunk.text,
+        ts_query,
+        "StartSel=[, StopSel=], MaxWords=14, MinWords=5, MaxFragments=1",
+    )
+    statement = (
+        select(Document.path, Chunk.start_line, Chunk.end_line, rank, snippet)
+        .join(Chunk.document)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name, Chunk.tsv.bool_op("@@")(ts_query))
+        # Path and line break ties so results come out the same on every run.
+        .order_by(rank.desc(), Document.path, Chunk.start_line)
+        .limit(limit)
+    )
+    return [
+        # The snippet can span lines; one line reads better in a terminal.
+        Hit(
+            path=path,
+            start_line=start,
+            end_line=end,
+            rank=float(score),
+            snippet=" ".join(text.split()),
+        )
+        for path, start, end, score, text in session.execute(statement)
+    ]
+
+
+def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:
+    """Make the stored open issues match the fetched list; return how many are stored."""
+    repo = get_or_create_repo(session, repo_full_name)
+    labels_by_name = {
+        label.name: label
+        for label in session.scalars(select(Label).where(Label.repo_id == repo.id))
+    }
+    stored_by_number = {
+        issue.number: issue
+        for issue in session.scalars(select(Issue).where(Issue.repo_id == repo.id))
+    }
+
+    fetched_numbers = {issue.number for issue in issues}
+    for number, stored in stored_by_number.items():
+        is_no_longer_open = number not in fetched_numbers
+        if is_no_longer_open:
+            session.delete(stored)
+
+    for fetched in issues:
+        row = stored_by_number.get(fetched.number)
+        if row is None:
+            row = Issue(repo_id=repo.id, number=fetched.number)
+            session.add(row)
+
+        row.title = fetched.title
+        row.url = fetched.url
+        row.author = fetched.author
+        row.comments = fetched.comments
+        row.created_at = fetched.created_at
+        row.labels = [
+            _get_or_create_label(session, repo, labels_by_name, name) for name in fetched.labels
+        ]
+
+    session.flush()
+    return len(issues)
+
+
+def _get_or_create_label(
+    session: Session, repo: Repo, labels_by_name: dict[str, Label], name: str
+) -> Label:
+    label = labels_by_name.get(name)
+    if label is None:
+        label = Label(repo_id=repo.id, name=name)
+        session.add(label)
+        labels_by_name[name] = label
+    return label
+
+
+def label_counts(session: Session, repo_full_name: str) -> list[tuple[str, int]]:
+    """How many stored open issues carry each label, most common first."""
+    issue_count = func.count(issue_labels.c.issue_id)
+    statement = (
+        select(Label.name, issue_count)
+        .join(issue_labels, issue_labels.c.label_id == Label.id)
+        .join(Repo, Repo.id == Label.repo_id)
+        .where(Repo.full_name == repo_full_name)
+        .group_by(Label.name)
+        .order_by(issue_count.desc(), Label.name)
+    )
+    return [(name, count) for name, count in session.execute(statement)]
+
+
+def age_buckets(session: Session, repo_full_name: str, now: datetime) -> list[tuple[str, int]]:
+    """Stored open issues grouped by how long they have been open."""
+    age_in_days = func.extract("epoch", now - Issue.created_at) / 86400
+    bucket = case(
+        (age_in_days < 30, "under 30 days"),
+        (age_in_days < 180, "30 to 180 days"),
+        else_="over 180 days",
+    )
+    statement = (
+        select(bucket, func.count())
+        .join(Repo, Repo.id == Issue.repo_id)
+        .where(Repo.full_name == repo_full_name)
+        .group_by(bucket)
+    )
+    counts: dict[str, int] = {name: count for name, count in session.execute(statement)}
+    order = ["under 30 days", "30 to 180 days", "over 180 days"]
+    return [(name, counts.get(name, 0)) for name in order]

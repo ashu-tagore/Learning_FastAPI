@@ -4,6 +4,10 @@ atlas search "query" --path ~/code/ignite
 atlas stats --path ~/code/ignite
 atlas issues --repo pytorch/ignite
 atlas commits --repo pytorch/ignite
+atlas init-db
+atlas index --path ~/code/ignite --repo pytorch/ignite
+atlas find "event handlers" --repo pytorch/ignite
+atlas issue-stats --repo pytorch/ignite
 """
 
 import argparse
@@ -15,7 +19,11 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from atlas import issue_cache
+from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
+
+from atlas import issue_cache, storage
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
 from atlas.search import DEFAULT_EXTENSIONS, search
@@ -60,12 +68,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     issues_parser.add_argument("--cache", type=Path, default=None, help="cache file location")
     issues_parser.add_argument("--json", action="store_true", help="print results as JSON")
+    issues_parser.add_argument("--save", action="store_true", help="also store them in Postgres")
 
     commits_parser = commands.add_parser("commits", help="list recent commits from GitHub")
     commits_parser.add_argument("--repo", default=DEFAULT_REPO, help="owner/name on GitHub")
     commits_parser.add_argument("--limit", type=int, default=10, help="how many (1 to 100)")
 
+    commands.add_parser("init-db", help="create the database tables")
+
+    index_parser = commands.add_parser("index", help="store a codebase in Postgres")
+    index_parser.add_argument("--path", type=Path, default=Path("."), help="folder to index")
+    index_parser.add_argument("--repo", default=DEFAULT_REPO, help="name to store it under")
+    index_parser.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS))
+
+    find_parser = commands.add_parser("find", help="ranked full-text search in Postgres")
+    find_parser.add_argument("query", help="words to look for")
+    find_parser.add_argument("--repo", default=DEFAULT_REPO)
+    find_parser.add_argument("--limit", type=int, default=10)
+
+    stats_db_parser = commands.add_parser("issue-stats", help="summarise stored issues")
+    stats_db_parser.add_argument("--repo", default=DEFAULT_REPO)
+
     return parser
+
+
+def database_url() -> str | None:
+    # Required for the database commands. Part 4 moves this into a settings object.
+    return os.environ.get("DATABASE_URL")
+
+
+def open_database() -> Session | None:
+    """A session on the configured database, or None after explaining what's missing."""
+    url = database_url()
+    if url is None:
+        print(
+            "atlas: set DATABASE_URL, for example "
+            "postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas",
+            file=sys.stderr,
+        )
+        return None
+    return Session(create_engine(url))
 
 
 def folder_error(path: Path) -> int | None:
@@ -156,6 +198,14 @@ def run_issues(args: argparse.Namespace) -> int:
         issue_cache.save(cache_path, CachedIssues(args.repo, labels, now, issues))
         source = "GitHub"
 
+    if args.save:
+        session = open_database()
+        if session is None:
+            return 1
+        with session, session.begin():
+            stored = storage.save_issues(session, args.repo, issues)
+        print(f"stored {stored} issues in the database", file=sys.stderr)
+
     if args.json:
         records = [
             {
@@ -196,16 +246,94 @@ def run_commits(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_init_db() -> int:
+    url = database_url()
+    if url is None:
+        return 1 if open_database() is None else 0
+    storage.create_schema(create_engine(url))
+    print("database tables are ready", file=sys.stderr)
+    return 0
+
+
+def run_index(args: argparse.Namespace) -> int:
+    error_code = folder_error(args.path)
+    if error_code is not None:
+        return error_code
+    session = open_database()
+    if session is None:
+        return 1
+
+    # One transaction: searches see either the old index or the complete new one.
+    with session, session.begin():
+        summary = storage.index_folder(session, args.repo, args.path, extensions=tuple(args.ext))
+    print(
+        f"indexed {summary.documents} files into {summary.chunks} chunks "
+        f"({summary.skipped} skipped) as {args.repo}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def run_find(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+
+    with session:
+        hits = storage.find_chunks(session, args.repo, args.query, limit=args.limit)
+
+    for hit in hits:
+        print(f"{hit.path}:{hit.start_line}-{hit.end_line}  {hit.rank:.3f}  {hit.snippet}")
+    noun = "chunk" if len(hits) == 1 else "chunks"
+    print(f"{len(hits)} {noun}", file=sys.stderr)
+    return 0
+
+
+def run_issue_stats(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+
+    with session:
+        by_label = storage.label_counts(session, args.repo)
+        by_age = storage.age_buckets(session, args.repo, datetime.now(UTC))
+
+    print("By label:")
+    for name, count in by_label:
+        print(f"{count:>5}  {name}")
+    print("\nBy age:")
+    for bucket, count in by_age:
+        print(f"{count:>5}  {bucket}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    try:
+        return dispatch(args)
+    except OperationalError as error:
+        # The usual cause: the database isn't running or the URL is wrong.
+        print(f"atlas: cannot reach the database: {error.orig}", file=sys.stderr)
+        return 1
+
+
+def dispatch(args: argparse.Namespace) -> int:
     if args.command == "search":
         return run_search(args)
     if args.command == "stats":
         return run_stats(args)
     if args.command == "issues":
         return run_issues(args)
-    return run_commits(args)
+    if args.command == "commits":
+        return run_commits(args)
+    if args.command == "init-db":
+        return run_init_db()
+    if args.command == "index":
+        return run_index(args)
+    if args.command == "find":
+        return run_find(args)
+    return run_issue_stats(args)
 
 
 if __name__ == "__main__":

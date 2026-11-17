@@ -1,0 +1,293 @@
+---
+title: "3.4 Data modelling: designing Atlas's schema"
+description: "Turn a product into tables: entities, keys, relationships, normalisation and constraints, ending with the schema Atlas uses for the rest of the course."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 4 · About 70 minutes
+:::
+
+::: {.callout-note title="Analogy: designing a filing system before you file"}
+Before a new office starts filing paperwork, someone decides: which cabinets exist (one per kind of thing), what each folder must contain, how folders refer to each other ("see client file 42"), and which rules are never broken ("every invoice belongs to exactly one client"). Fixing a bad filing system after a million papers are filed is painful. A **schema** is that design for a database, and it's one of the most expensive things to change later.
+:::
+
+## From product to tables
+
+Data modelling starts from the product, not the database. Atlas's features (Parts 1 and 2, and [02-product.md](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/02-product.md) in the course repository) involve these **entities**, the "things" the product talks about:
+
+| Entity | One of them is | Needed for |
+|---|---|---|
+| Repository | `pytorch/ignite` | everything is per repository |
+| Document | one source file at the time of indexing | knowing what was indexed and when it changed |
+| Chunk | a run of lines from a document | search results point to a line range, not a whole 1,900-line file |
+| Issue | one open GitHub issue | listing and statistics |
+| Label | `good first issue` within a repository | filtering issues |
+
+Each entity becomes a table. Then ask, for every pair: how are they related?
+
+- A repo **has many** documents; a document belongs to **one** repo. (one-to-many)
+- A document has many chunks; a chunk belongs to one document. (one-to-many)
+- A repo has many issues and many labels. (one-to-many)
+- An issue has many labels; a label is on many issues. (many-to-many: needs a link table, lesson 3.3)
+
+```{mermaid}
+erDiagram
+  repos ||--o{ documents : contains
+  documents ||--o{ chunks : "split into"
+  repos ||--o{ issues : has
+  repos ||--o{ labels : defines
+  issues ||--o{ issue_labels : ""
+  labels ||--o{ issue_labels : ""
+  repos {
+    serial id PK
+    varchar full_name UK
+    timestamptz indexed_at
+  }
+  documents {
+    serial id PK
+    integer repo_id FK
+    varchar path
+    varchar kind
+    varchar content_hash
+    integer line_count
+  }
+  chunks {
+    serial id PK
+    integer document_id FK
+    integer start_line
+    integer end_line
+    text text
+    tsvector tsv
+  }
+  issues {
+    serial id PK
+    integer repo_id FK
+    integer number
+    varchar title
+    timestamptz created_at
+  }
+  labels {
+    serial id PK
+    integer repo_id FK
+    varchar name
+  }
+  issue_labels {
+    integer issue_id PK
+    integer label_id PK
+  }
+```
+
+## Keys
+
+A **primary key** identifies a row. There are two styles:
+
+- A **natural key** is a real-world value: the issue number, the repository name.
+- A **surrogate key** is a meaningless number the database generates: `id`.
+
+Lesson 3.2 used the issue number as the primary key, and it broke immediately:
+
+```sql
+INSERT INTO issues (number, repo_id, title, created_at) VALUES (101, 2, 'Vision has an issue 101 too', now());
+```
+```text
+ERROR:  duplicate key value violates unique constraint "issues_pkey"
+DETAIL:  Key (number)=(101) already exists.
+```
+
+Issue numbers are unique only *within* a repository. Natural values often have surprises like this, and they can change (repositories get renamed). So Atlas uses a surrogate `id` on every table, plus **unique constraints** that state the real-world rules precisely:
+
+- `UNIQUE (repo_id, number)` on issues: an issue number appears once per repository.
+- `UNIQUE (repo_id, path)` on documents: one row per file per repository.
+- `UNIQUE (full_name)` on repos.
+
+The surrogate key keeps references simple and stable; the unique constraints keep the data honest.
+
+## Normalisation: each fact in one place
+
+**Normalisation** is the discipline of storing each fact once. The three classic rules, in plain words:
+
+1. **One value per cell.** No `labels = 'bug,docs,help wanted'` text column: you couldn't index it, count by label, or rename a label safely. A list of things becomes rows in another table.
+2. **Every column describes the whole key.** In `issue_labels`, whose key is (issue, label), a column like `issue_title` would describe only part of the key; it belongs in `issues`.
+3. **No column describes another non-key column.** If `issues` stored both `repo_id` and `repo_full_name`, the name would describe the repo, not the issue; rename the repo and some rows would be wrong. Store `repo_id` only and join to get the name.
+
+The payoff: a change (a renamed label) happens in exactly one row, and the database can't contain two contradictory versions of a fact.
+
+Sometimes you deliberately keep a copy of data for speed or history: that's **denormalisation**, and it should always be a conscious decision with a reason. Atlas's `documents.line_count` is one: it could be computed from the chunks, but storing it makes statistics instant.
+
+## Constraints: rules the database enforces
+
+| Constraint | Atlas example | Prevents |
+|---|---|---|
+| `NOT NULL` | every column that must have a value | half-filled rows |
+| `UNIQUE` | `(repo_id, path)` | duplicate documents on re-index |
+| `FOREIGN KEY` | `chunks.document_id → documents.id` | chunks pointing to nothing |
+| `CHECK` | `kind IN ('code', 'doc')`, `start_line <= end_line` | impossible values |
+| `ON DELETE CASCADE` | deleting a repo deletes its documents, chunks, issues and labels | orphans left behind |
+
+Choose what happens to children when a parent is deleted: `CASCADE` (delete them too, right when children are meaningless without the parent, as here), `RESTRICT` (refuse to delete the parent while children exist), or `SET NULL` (keep them, unlinked).
+
+## Choosing types
+
+- **`integer`** for counts and ids (up to about 2.1 billion; `bigint` beyond that).
+- **`text`** for text with no natural limit; **`varchar(n)`** where a maximum is a real rule (a GitHub repository name is short, a file path has a sensible upper bound).
+- **`timestamptz`** for every moment in time. Never a time without a time zone (lesson 1.7).
+- **`boolean`** for yes/no. Never `'Y'`/`'N'` strings.
+- Money (not needed in Atlas) is `numeric`, never a float (lesson 1.2).
+
+## Why chunks?
+
+Atlas could store each file as one row and search whole files. But a result like "`test_checkpoint.py` matches" isn't useful when the file has 1,925 lines; "lines 1641 to 1680" is. And in Part 6, an AI model can only read a limited amount of text at once, so the unit of retrieval must be small. Chunks are both. For now a chunk is simply 40 consecutive lines; lesson 6.5 makes them smarter, splitting at function and section boundaries.
+
+## The schema as SQL
+
+Here is Atlas's schema written out as SQL. (In lesson 3.8 you'll write it as Python classes instead, and the library generates exactly this SQL from them.)
+
+```sql
+CREATE TABLE repos (
+    id SERIAL NOT NULL,
+    full_name VARCHAR(200) NOT NULL,
+    indexed_at TIMESTAMP WITH TIME ZONE,
+    PRIMARY KEY (id),
+    UNIQUE (full_name)
+);
+
+CREATE TABLE documents (
+    id SERIAL NOT NULL,
+    repo_id INTEGER NOT NULL,
+    path VARCHAR(500) NOT NULL,
+    kind VARCHAR(10) NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    line_count INTEGER NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (repo_id, path),
+    CONSTRAINT documents_kind_valid CHECK (kind IN ('code', 'doc')),
+    FOREIGN KEY(repo_id) REFERENCES repos (id) ON DELETE CASCADE
+);
+
+CREATE TABLE chunks (
+    id SERIAL NOT NULL,
+    document_id INTEGER NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT chunks_line_range_valid CHECK (start_line <= end_line),
+    FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE
+);
+
+CREATE TABLE issues (
+    id SERIAL NOT NULL,
+    repo_id INTEGER NOT NULL,
+    number INTEGER NOT NULL,
+    title VARCHAR(500) NOT NULL,
+    url VARCHAR(500) NOT NULL,
+    author VARCHAR(100) NOT NULL,
+    comments INTEGER NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (repo_id, number),
+    FOREIGN KEY(repo_id) REFERENCES repos (id) ON DELETE CASCADE
+);
+
+CREATE TABLE labels (
+    id SERIAL NOT NULL,
+    repo_id INTEGER NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (repo_id, name),
+    FOREIGN KEY(repo_id) REFERENCES repos (id) ON DELETE CASCADE
+);
+
+CREATE TABLE issue_labels (
+    issue_id INTEGER NOT NULL,
+    label_id INTEGER NOT NULL,
+    PRIMARY KEY (issue_id, label_id),
+    FOREIGN KEY(issue_id) REFERENCES issues (id) ON DELETE CASCADE,
+    FOREIGN KEY(label_id) REFERENCES labels (id) ON DELETE CASCADE
+);
+```
+
+`SERIAL` is Postgres shorthand for "an integer that fills itself in with the next number". Lesson 3.6 adds one more column to `chunks`, a searchable form of the text, and its index.
+
+## Common mistakes
+
+- **Natural keys that turn out not to be unique**, or that change.
+- **Comma-separated lists in a column.** A list is a table.
+- **Copying the same fact into several tables** "for convenience", then updating only one.
+- **Skipping constraints** because "the code checks it". The code changes; constraints stay.
+- **Timestamps without time zones.**
+- **Designing for imagined future features.** Model what the product needs now; migrations (lesson 4.11) handle change.
+
+## Check yourself
+
+**1.** Why does `issues` have both an `id` primary key and `UNIQUE (repo_id, number)`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`id` is a stable, simple reference for other tables (like `issue_labels`). The unique constraint encodes the real-world rule that an issue number appears once per repository, which the database then enforces.
+:::
+
+**2.** A teammate proposes `issues.labels text` holding `'bug,docs'`. What goes wrong?
+
+::: {.callout-tip collapse="true" title="Answer"}
+You can't index or count by label efficiently, renaming a label means editing text in many rows, nothing stops typos like `'dcos'`, and "issues with label X" needs fragile text matching. Labels are rows in their own table, linked through `issue_labels`.
+:::
+
+**3.** Why `ON DELETE CASCADE` from documents to chunks, rather than `RESTRICT`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A chunk is meaningless without its document. When a document is removed (re-indexing, or deleting a repository), its chunks should go too, automatically and in the same statement.
+:::
+
+## Exercise
+
+The practice database already has tables named `repos`, `issues` and `labels` from lessons 3.2 and 3.3, so make a fresh one: `create database schema_practice;` then `\c schema_practice`. Create the six tables above (copy the SQL), insert one repo, two documents and three chunks by hand, then:
+
+1. Try to insert a chunk with `start_line = 10, end_line = 5`. Read the error.
+2. Try to insert a second document with the same path in the same repo. Read the error.
+3. Delete the repo and confirm with `SELECT count(*) FROM chunks` that its chunks are gone.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+INSERT INTO repos (full_name) VALUES ('example/demo') RETURNING id;
+INSERT INTO documents (repo_id, path, kind, content_hash, line_count)
+VALUES (1, 'README.md', 'doc', 'abc', 3), (1, 'main.py', 'code', 'def', 2);
+INSERT INTO chunks (document_id, start_line, end_line, text)
+VALUES (1, 1, 3, '# Demo'), (2, 1, 1, 'import sys'), (2, 2, 2, 'print(sys.argv)');
+
+INSERT INTO chunks (document_id, start_line, end_line, text) VALUES (1, 10, 5, 'x');
+-- ERROR: ... violates check constraint "chunks_line_range_valid"
+
+INSERT INTO documents (repo_id, path, kind, content_hash, line_count)
+VALUES (1, 'README.md', 'doc', 'zzz', 1);
+-- ERROR: duplicate key value violates unique constraint "documents_repo_id_path_key"
+
+DELETE FROM repos WHERE id = 1;
+SELECT count(*) FROM chunks;   -- 0
+```
+
+Your ids may differ if you've inserted rows before; use the ids `RETURNING` gives you.
+:::
+
+## Stretch
+
+Atlas will later let users save notes about issues (Part 4). Sketch the table: which columns, which keys, which constraints, and what should happen to a user's notes when an issue is deleted because it was closed?
+
+::: {.callout-tip collapse="true" title="One reasonable design"}
+```sql
+CREATE TABLE issue_notes (
+    id         serial      PRIMARY KEY,
+    user_id    integer     NOT NULL,           -- REFERENCES users (id), from Part 4
+    repo_id    integer     NOT NULL REFERENCES repos (id) ON DELETE CASCADE,
+    issue_number integer   NOT NULL,
+    body       text        NOT NULL CHECK (length(body) > 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, repo_id, issue_number)
+);
+```
+
+The note points at `(repo_id, issue_number)` rather than `issues.id`, because Atlas deletes issues that are no longer open (lesson 3.8): a note written by the user shouldn't vanish when the issue closes. That's a design decision driven by the product, which is the point of this lesson.
+:::
+
+## What changed in the project
+
+You have Atlas's schema. Lesson 3.8 turns it into Python classes in `my-atlas`, and Postgres creates the tables from them.

@@ -1,0 +1,262 @@
+---
+title: "3.2 SQL I: create, insert, select, update, delete"
+description: "Create a table with types and rules, add rows, ask questions with SELECT, change and remove data, and read Postgres's error messages."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 2 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: ordering from a menu, not cooking"}
+In Python you tell the computer *how* to do something, step by step: loop over the lines, check each one, collect the matches. **SQL** (Structured Query Language) is different: you describe *what* you want ("the open issues with more than one comment, most discussed first") and the database works out how to get it, like ordering a dish instead of cooking it. That difference is why a database can make your question fast without you changing it (lesson 3.6).
+:::
+
+## Tables, rows and columns
+
+A **table** has named **columns**, each with a **type**, and holds **rows**. Unlike a spreadsheet, every value in a column must have that column's type, and the rules you declare are enforced on every write.
+
+Connect to the practice database from lesson 3.1 (`docker compose exec db psql -U atlas -d practice`) and create a table:
+
+```sql
+CREATE TABLE issues (
+    number      integer     PRIMARY KEY,
+    repo        text        NOT NULL,
+    title       text        NOT NULL,
+    state       text        NOT NULL DEFAULT 'open',
+    comments    integer     NOT NULL DEFAULT 0,
+    created_at  timestamptz NOT NULL
+);
+```
+
+| Part | Means |
+|---|---|
+| `integer`, `text`, `timestamptz` | column types: whole numbers, text of any length, and a time-zone-aware timestamp (lesson 1.7's advice, enforced by the database) |
+| `PRIMARY KEY` | this column uniquely identifies each row: no two rows may share it, and it can't be empty |
+| `NOT NULL` | a value is required. `NULL` is SQL's "no value", like Python's `None` |
+| `DEFAULT 'open'` | used when an insert doesn't provide a value |
+
+SQL keywords aren't case-sensitive; writing them in capitals is a common convention that makes them stand out. Statements end with `;`. Text values use **single** quotes: `'open'`.
+
+## INSERT: adding rows
+
+```sql
+INSERT INTO issues (number, repo, title, comments, created_at) VALUES
+    (101, 'pytorch/ignite', 'Fix typo in Engine docstring',  2, '2026-11-02 09:14Z'),
+    (102, 'pytorch/ignite', 'Add example for EarlyStopping', 5, '2026-10-20 15:00Z'),
+    (103, 'pytorch/ignite', 'Support new metric: MAPE',      0, '2026-06-01 08:30Z'),
+    (104, 'pytorch/vision', 'Clarify transforms docs',       1, '2026-11-10 12:00Z'),
+    (105, 'pytorch/ignite', 'Flaky test in test_checkpoint', 8, '2025-12-24 18:45Z');
+```
+```text
+INSERT 0 5
+```
+
+`state` wasn't listed, so every row got the default, `'open'`. (These issues are practice data.)
+
+## SELECT: asking questions
+
+```sql
+SELECT * FROM issues;
+```
+```text
+ number |      repo      |             title             | state | comments |       created_at
+--------+----------------+-------------------------------+-------+----------+------------------------
+    101 | pytorch/ignite | Fix typo in Engine docstring  | open  |        2 | 2026-11-02 09:14:00+00
+    102 | pytorch/ignite | Add example for EarlyStopping | open  |        5 | 2026-10-20 15:00:00+00
+    103 | pytorch/ignite | Support new metric: MAPE      | open  |        0 | 2026-06-01 08:30:00+00
+    104 | pytorch/vision | Clarify transforms docs       | open  |        1 | 2026-11-10 12:00:00+00
+    105 | pytorch/ignite | Flaky test in test_checkpoint | open  |        8 | 2025-12-24 18:45:00+00
+(5 rows)
+```
+
+`*` means "every column". In real code, name the columns you need. A useful query picks columns, filters rows, and orders them:
+
+```sql
+SELECT number, title, comments
+FROM issues
+WHERE repo = 'pytorch/ignite' AND comments > 1
+ORDER BY comments DESC;
+```
+```text
+ number |             title             | comments
+--------+-------------------------------+----------
+    105 | Flaky test in test_checkpoint |        8
+    102 | Add example for EarlyStopping |        5
+    101 | Fix typo in Engine docstring  |        2
+(3 rows)
+```
+
+Read it in the order the database thinks about it: **FROM** this table, keep rows **WHERE** the condition holds, **SELECT** these columns, **ORDER BY** this. `DESC` means descending (`ASC`, ascending, is the default). Without `ORDER BY`, rows come back in no guaranteed order, even if it looks consistent.
+
+### Filtering
+
+| Condition | Matches |
+|---|---|
+| `comments > 1`, `=`, `<>` (not equal), `<=` | comparisons |
+| `AND`, `OR`, `NOT` | combine conditions |
+| `title LIKE 'Fix%'` | text pattern: `%` is any run of characters, `_` one character |
+| `title ILIKE '%doc%'` | the same, ignoring case (a Postgres extra) |
+| `number IN (101, 104)` | one of a list |
+| `created_at >= '2026-10-01'` | dates compare naturally |
+| `deleted_at IS NULL` | no value. Never `= NULL`: nothing equals NULL, not even NULL |
+
+```sql
+SELECT title FROM issues WHERE title ILIKE '%doc%';
+```
+```text
+            title
+------------------------------
+ Fix typo in Engine docstring
+ Clarify transforms docs
+(2 rows)
+```
+
+### Limiting
+
+```sql
+SELECT number, title FROM issues ORDER BY created_at DESC LIMIT 2;
+```
+
+returns the two newest. `LIMIT` with `OFFSET` gives pages, like GitHub's (lesson 4.10 does this properly).
+
+### Counting and summarising
+
+**Aggregate functions** turn many rows into one value:
+
+```sql
+SELECT count(*) FROM issues;
+SELECT count(*), max(comments), avg(comments) FROM issues WHERE repo = 'pytorch/ignite';
+```
+```text
+ count
+-------
+     5
+(1 row)
+
+ count | max |        avg
+-------+-----+--------------------
+     4 |   8 | 3.7500000000000000
+(1 row)
+```
+
+Also `min`, `sum`. Lesson 3.3 groups rows to get one summary per repository.
+
+## UPDATE and DELETE
+
+```sql
+UPDATE issues SET state = 'closed' WHERE number = 101;
+```
+```text
+UPDATE 1
+```
+
+```sql
+DELETE FROM issues WHERE number = 999;
+```
+```text
+DELETE 0
+```
+
+The reply says how many rows were affected: always read it. `DELETE 0` means nothing matched: harmless here, but if you expected one row, something's wrong.
+
+**`UPDATE` or `DELETE` without `WHERE` changes every row in the table.** Before running one, run the same `WHERE` as a `SELECT` and check what it returns.
+
+## The database enforces your rules
+
+```sql
+INSERT INTO issues (number, repo, title, created_at)
+VALUES (101, 'pytorch/ignite', 'Duplicate', now());
+```
+```text
+ERROR:  duplicate key value violates unique constraint "issues_pkey"
+DETAIL:  Key (number)=(101) already exists.
+```
+
+```sql
+INSERT INTO issues (number, repo, created_at) VALUES (106, 'pytorch/ignite', now());
+```
+```text
+ERROR:  null value in column "title" of relation "issues" violates not-null constraint
+DETAIL:  Failing row contains (106, pytorch/ignite, null, open, 0, 2026-11-17 17:20:40.306318+00).
+```
+
+Read errors the same way as Python tracebacks: what rule (`not-null constraint`), which column (`title`), which data (`DETAIL`). Rules in the database protect your data from *every* program that writes to it, including future ones with bugs. Python checks can be skipped; constraints can't.
+
+(Look closely at the first error. Using the issue number alone as the primary key has a flaw: issue 101 in `pytorch/vision` could never be stored. You'll fix the design in lesson 3.4.)
+
+## Common mistakes
+
+- **Double quotes for text.** `WHERE repo = "pytorch/ignite"` fails: double quotes are for names of columns and tables. Text uses single quotes.
+- **`= NULL`** instead of `IS NULL`.
+- **`UPDATE`/`DELETE` without `WHERE`.**
+- **Relying on row order** without `ORDER BY`.
+- **Forgetting the semicolon** in psql: the prompt changes to `atlas-#`, waiting for the rest of the statement. Type `;` and Enter.
+
+## Check yourself
+
+**1.** Write a query for the titles of open issues in `pytorch/ignite` created in 2026, oldest first.
+
+::: {.callout-tip collapse="true" title="Answer"}
+```sql
+SELECT title
+FROM issues
+WHERE repo = 'pytorch/ignite'
+  AND state = 'open'
+  AND created_at >= '2026-01-01'
+ORDER BY created_at;
+```
+:::
+
+**2.** An `UPDATE` replies `UPDATE 0`. What does that tell you?
+
+::: {.callout-tip collapse="true" title="Answer"}
+No rows matched the `WHERE` condition, so nothing changed. Usually a wrong value in the condition, or the row doesn't exist.
+:::
+
+**3.** Why put `NOT NULL` on `title` when the Python code always sets it?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Because other code (another script, a future feature, a manual fix in psql) can write to the table too, and the Python check doesn't protect against them. The database rule applies to every write, from every client.
+:::
+
+## Exercise
+
+In the practice database:
+
+1. Insert two more issues for `pytorch/ignite`, one with 3 comments.
+2. Find every issue whose title starts with `Add` or `Support`.
+3. Close every `pytorch/ignite` issue with zero comments, checking with a `SELECT` first.
+4. Show the number of open issues and the total comments across them.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+INSERT INTO issues (number, repo, title, comments, created_at) VALUES
+    (106, 'pytorch/ignite', 'Document the State object', 3, now()),
+    (107, 'pytorch/ignite', 'Add type hints to metrics', 0, now());
+
+SELECT number, title FROM issues WHERE title LIKE 'Add%' OR title LIKE 'Support%';
+
+SELECT number FROM issues WHERE repo = 'pytorch/ignite' AND comments = 0;
+UPDATE issues SET state = 'closed' WHERE repo = 'pytorch/ignite' AND comments = 0;
+
+SELECT count(*), sum(comments) FROM issues WHERE state = 'open';
+```
+
+The `SELECT` before the `UPDATE` uses exactly the same `WHERE`, so you know which rows will change.
+:::
+
+## Stretch
+
+Postgres can return the rows an `INSERT`, `UPDATE` or `DELETE` touched, with `RETURNING`. Close issue 102 and get back its number, title and new state in one statement. Why is this useful for an API?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+UPDATE issues SET state = 'closed' WHERE number = 102 RETURNING number, title, state;
+```
+
+An API that changes something usually responds with the changed resource. `RETURNING` gets it in the same round trip instead of a second `SELECT`, and it's guaranteed to be exactly the rows that changed.
+:::
+
+## What changed in the project
+
+Nothing in `my-atlas` yet: this lesson practised SQL on the practice database. Lesson 3.4 designs Atlas's real tables.
