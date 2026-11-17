@@ -29,7 +29,7 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 
 1. Context docs (this folder), `README.md`, `CLAUDE.md`. Pushed to `main`.
 2. Tags preserving the past: `posts-api-v1` (the original app) and `posts-api-solution-v1` (the tutorial's reference solution).
-3. Restructure: remove `app/` and `solutions/` from the working tree (their content returns, reshaped, in Part 4); add `course/`, `atlas/`, `web/`, `sandbox-images/`, `infra/`, `evals/`, and a git-ignored `workspace/`.
+3. Restructure: remove `app/` and `solutions/` from the working tree (their content returns, reshaped, in Part 4); add `course/`, `atlas/`, `web/`, `sandbox-images/`, `infra/`, `evals/`. (Learners keep their own code in a separate `my-atlas` repository; see D18.)
 4. Quarto site: `course/_quarto.yml` with a docked left sidebar listing all parts and lessons, top navbar, right-hand "On this page", search, light and dark themes, code copy buttons; landing page; one fully written sample lesson (0.1) proving the template. Part overview pages and the sidebar are generated from `04-curriculum.md` by `course/_tools/generate_part_pages.py`; CI fails if they are stale.
 5. GitHub Actions: `site.yml` renders Quarto and publishes to GitHub Pages; `ci.yml` runs ruff, mypy and pytest for `atlas/`.
 6. `atlas/` uv project: Python 3.13, ruff, mypy, pytest, pre-commit config, empty package with a passing smoke test.

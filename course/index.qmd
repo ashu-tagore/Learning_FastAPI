@@ -55,4 +55,4 @@ Each part ends with a **review and practice** lesson: tasks without step-by-step
 
 ## The code
 
-Everything lives in the [course repository](https://github.com/ashu-tagore/Learning_FastAPI). You write your own code in `workspace/`; the reference implementation is in `atlas/`, tagged at the end of each part so you can compare.
+Everything lives in the [course repository](https://github.com/ashu-tagore/Learning_FastAPI). You write your own code in your own repository, `my-atlas`; the reference implementation is in `atlas/`, tagged at the end of each part so you can compare.

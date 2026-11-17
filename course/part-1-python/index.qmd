@@ -8,7 +8,7 @@ title: "Part 1: Programming with Python"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 1.1 | Installing Python with uv, running code, the REPL *(coming soon)* | `workspace/` project |
+| 1.1 | Installing Python with uv, running code, the REPL *(coming soon)* | Your `my-atlas` repository |
 | 1.2 | Values, variables, types, operators *(coming soon)* |  |
 | 1.3 | Control flow: conditions and loops; reading code like a computer *(coming soon)* |  |
 | 1.4 | Functions and modules *(coming soon)* |  |

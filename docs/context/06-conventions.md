@@ -16,11 +16,10 @@
 ├── sandbox-images/         one Dockerfile per target repo
 ├── infra/                  Terraform
 ├── evals/                  evaluation datasets and runners
-├── workspace/              learners' own code (git-ignored)
 └── .github/workflows/      ci.yml, site.yml, later deploy.yml
 ```
 
-Learners write their own code in `workspace/` (or their own fork) and compare with `atlas/` at the matching checkpoint tag.
+Learners write their own code in their own repository, `my-atlas` (created in lesson 1.1), and compare with `atlas/` at the matching checkpoint tag.
 
 ## Code style
 

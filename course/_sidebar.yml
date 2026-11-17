@@ -10,6 +10,8 @@ website:
         href: part-0-start-here/index.qmd
         contents:
           - part-0-start-here/01-what-is-a-backend.qmd
+          - part-0-start-here/02-your-workstation.qmd
+          - part-0-start-here/03-git-and-github.qmd
       - section: "Part 1: Programming with Python"
         href: part-1-python/index.qmd
         contents:

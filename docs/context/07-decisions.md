@@ -4,6 +4,11 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D18. Learners keep their code in their own `my-atlas` repository (2026-11-17)
+**Decision:** each learner creates a separate repository, `my-atlas`, in lesson 1.1. The course repo is cloned only for reading lessons and the reference code.
+**Why:** the planned git-ignored `workspace/` folder inside the course repo meant learners could never commit their own work, which defeats Part 0's Git lessons. A repository of their own also becomes their portfolio.
+**Supersedes:** the `workspace/` folder in the original M0 plan.
+
 ### D17. GitHub sign-in with identity scopes only (2026-11-17)
 **Decision:** lesson 4.8 adds "Sign in with GitHub" (OAuth2), refresh tokens and an `admin` role. The OAuth app requests identity scopes only.
 **Why:** real products rarely stop at password login, and the learner will meet OAuth everywhere. Identity-only scopes keep the rule that Atlas can never write to GitHub.
