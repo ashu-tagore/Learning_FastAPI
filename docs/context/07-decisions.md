@@ -1,0 +1,67 @@
+# 07. Decisions
+
+Newest first. Each entry: the decision, why, and what was rejected. Superseded entries stay, marked as such.
+
+---
+
+### D14. Own agent loop on the Messages API, not a hosted agent service (2026-11-17)
+**Decision:** Atlas Agents runs its own agent loop and its own sandbox.
+**Why:** the provider must be swappable, including local models through Ollama, and building the loop, tools, state machine and sandbox is the core learning goal of Part 8.
+**Rejected:** a hosted agent service (less code to own, but ties the project to one provider and hides exactly what the learner needs to understand). Mentioned in lesson 8.1 as the right choice in many real projects.
+
+### D13. Swappable LLM providers behind one small interface (2026-11-17)
+**Decision:** `ChatProvider` and `EmbeddingProvider` interfaces. Hosted chat through the official `anthropic` SDK (default model `claude-opus-5-5`, configurable); local chat and default embeddings through Ollama.
+**Why:** owner's requirement; free local runs for exercises; hosted quality when needed.
+**Rejected:** routing Claude through OpenAI-compatible shims (loses SDK features and typed errors); a large multi-provider framework (hides the concepts being taught).
+
+### D12. The Issue Brief contains no patch (2026-11-17)
+**Decision:** the brief explains, locates and reproduces; it never includes code for the fix.
+**Why:** PyTorch-Ignite's `AGENTS.md` requires the user to understand the task and forbids agent-authored PR text; GSoC mentors judge the human's understanding. Supersedes an earlier idea of keeping draft fix code locally.
+
+### D11. Target project: PyTorch-Ignite (2026-11-17)
+**Decision:** one target, `pytorch/ignite`.
+**Why:** its `CONTRIBUTING.md` explicitly allows AI tools and `AGENTS.md` sets clear rules the product can encode; clear `good first issue` label; documented checks. sktime's contribution site could not be read during evaluation, so its policy was unknown.
+**Rejected for now:** sktime and ML4SCI (ML4SCI is an umbrella of many repositories). Revisit after Checkpoint 8.
+
+### D10. Ready-made web UI in plain HTML/CSS/JS (2026-11-17)
+**Decision:** a small static frontend with no build step, explained but not taught.
+**Why:** keeps the course on backend; no Node toolchain; deploys to S3 and CloudFront as plain files.
+**Rejected:** teaching frontend (about 4 extra lessons); React (build tooling to explain).
+
+### D9. One product in stages: Atlas, then Atlas Agents (2026-11-17)
+**Decision:** one codebase; the agent platform builds on Atlas, and Atlas search is the agents' first tool.
+**Why:** avoids building auth, data and deployment twice; gives a genuine reason for a separate worker service.
+**Rejected:** two separate projects. Earlier product framings (a document librarian; a research-paper copilot) were replaced by the open-source-contribution focus that serves the owner's GSoC goal.
+
+### D8. Postgres for everything, including vectors (2026-11-17)
+**Decision:** Postgres with pgvector and full-text search; tests on real Postgres.
+**Why:** one database to learn and operate; hybrid search in one query; transactional consistency between chunks and their vectors.
+**Rejected:** a separate vector database; SQLite for tests (no pgvector, different behaviour).
+
+### D7. Queue behind an interface: Redis locally, SQS on AWS (2026-11-17)
+**Decision:** a small `Queue` interface; messages carry ids only; state lives in Postgres.
+**Why:** cheap local development, managed queue in production, idempotent and inspectable jobs.
+**Rejected:** Celery (a large framework that hides the at-least-once and idempotency lessons).
+
+### D6. Deploy on AWS with Terraform and ECS Fargate (2026-11-17)
+**Decision:** AWS, everything in Terraform, ECS Fargate, RDS, S3, SQS, CloudFront, Secrets Manager; no NAT gateway; budget alarm first.
+**Why:** owner's choice of AWS; Fargate avoids managing servers while still teaching containers; Kubernetes is introduced conceptually only.
+**Rejected:** Kubernetes as the deployment target (too much for a truly-zero learner); click-ops.
+
+### D5. Course site built with Quarto, published to GitHub Pages (2026-11-17)
+**Decision:** lessons are `.qmd` files in `course/`, rendered by Quarto in CI and published to GitHub Pages. Layout follows the familiar Quarto course style: docked sidebar of all lessons, top navbar, right-hand table of contents, search, light and dark themes.
+**Why:** owner wanted a sidebar-of-contents course site; lessons live in git next to the code; free hosting for a public repo.
+**Rejected:** a single published HTML page (the earlier 17-chapter tutorial); MkDocs (also fine, but Quarto handles notebooks and diagrams natively).
+
+### D4. Fold the original tutorial into the new course (2026-11-17)
+**Decision:** the 17 FastAPI chapters and the `solutions/` reference become Part 4, retargeted to Atlas. Exact past states are preserved by tags `posts-api-v1` and `posts-api-solution-v1`.
+**Why:** one storyline, no duplicated lessons, nothing lost.
+**Rejected:** keeping the old tutorial as a separate archive (duplicate material that drifts out of date).
+
+### D3. Starting level: truly zero (2026-11-17)
+**Decision:** the course starts at "what is a terminal" and "what is a variable".
+
+### D2. Concepts language-agnostic, Python/FastAPI as the vehicle (2026-11-17)
+
+### D1. Repository purpose: zero to production backend for AI engineering (2026-11-17)
+**Decision:** the repo becomes "Zero to Production in FastAPI", a full course plus one growing project, instead of a FastAPI learning sandbox.
