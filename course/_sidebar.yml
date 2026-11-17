@@ -10,10 +10,23 @@ website:
         href: part-0-start-here/index.qmd
         contents:
           - part-0-start-here/01-what-is-a-backend.qmd
+          - part-0-start-here/02-your-workstation.qmd
+          - part-0-start-here/03-git-and-github.qmd
       - section: "Part 1: Programming with Python"
         href: part-1-python/index.qmd
         contents:
-          []
+          - part-1-python/01-installing-python.qmd
+          - part-1-python/02-values-and-variables.qmd
+          - part-1-python/03-control-flow.qmd
+          - part-1-python/04-functions-and-modules.qmd
+          - part-1-python/05-collections.qmd
+          - part-1-python/06-iteration.qmd
+          - part-1-python/07-text-dates-regex.qmd
+          - part-1-python/08-classes-and-dataclasses.qmd
+          - part-1-python/09-errors-files-json.qmd
+          - part-1-python/10-packages-and-cli.qmd
+          - part-1-python/11-testing-and-debugging.qmd
+          - part-1-python/12-review-and-practice.qmd
       - section: "Part 2: Computers and the internet"
         href: part-2-computers-and-internet/index.qmd
         contents:

@@ -1,0 +1,252 @@
+---
+title: "1.6 Iteration in depth"
+description: "Use enumerate and zip, write comprehensions, and create generators that produce values one at a time, so Atlas can search huge files without loading them all."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 6 · About 50 minutes
+:::
+
+::: {.callout-note title="Analogy: a conveyor belt"}
+A list is a full tray: every item is made in advance and sits there taking space. A **generator** is a conveyor belt: it produces the next item only when you're ready for it, and never holds the whole batch. For a few items, either works. For a 2-gigabyte log file, only the conveyor belt fits in the kitchen.
+:::
+
+## Iterables and iterators
+
+Anything you can loop over with `for` is an **iterable**: strings, lists, tuples, dicts, sets, ranges, and (lesson 1.9) open files. Behind the scenes, `for` asks the iterable for an **iterator**, an object that hands out one item at a time until it runs out. You rarely deal with iterators directly, but generators (below) are built on this idea.
+
+## enumerate: counting for you
+
+In lesson 1.3 you counted lines by hand, and lesson 1.3's common mistakes showed how easy it is to get wrong. `enumerate` pairs each item with its position:
+
+```python
+lines = ["class Engine:", "    def run(self):", "        self.fire_event(Events.STARTED)"]
+for line_number, line in enumerate(lines, start=1):
+    print(line_number, line.strip())
+```
+```text
+1 class Engine:
+2 def run(self):
+3 self.fire_event(Events.STARTED)
+```
+
+`start=1` because humans (and editors, and Atlas's output) number lines from 1.
+
+## zip: walking two sequences together
+
+```python
+names = ["engine.py", "metrics.py"]
+sizes = [1650, 900]
+for name, size in zip(names, sizes):
+    print(name, size)
+```
+```text
+engine.py 1650
+metrics.py 900
+```
+
+`zip` stops at the end of the shorter sequence.
+
+## Comprehensions
+
+A **comprehension** builds a list (or dict, or set) from a loop in one expression. These two are equivalent:
+
+```python
+lengths = []
+for line in lines:
+    lengths.append(len(line))
+
+lengths = [len(line) for line in lines]
+```
+
+Add a condition to filter:
+
+```python
+short = [line.strip() for line in lines if len(line) < 20]
+print(short)
+```
+```text
+['class Engine:', 'def run(self):']
+```
+
+Dict and set versions use curly brackets:
+
+```python
+by_number = {number: line.strip() for number, line in enumerate(lines, start=1)}
+print(by_number)
+```
+```text
+{1: 'class Engine:', 2: 'def run(self):', 3: 'self.fire_event(Events.STARTED)'}
+```
+
+Read a comprehension as "**the** `len(line)` **for each** `line` **in** `lines` **where** ...". Keep them to one simple loop and one condition. If you need nested loops or several conditions, a normal `for` loop is clearer.
+
+## Generators: one value at a time
+
+A function that uses `yield` instead of `return` becomes a **generator function**. Calling it doesn't run it; it returns a generator, which runs the function body step by step, pausing at each `yield`:
+
+```python
+def iter_matches(lines, query):
+    for line_number, line in enumerate(lines, start=1):
+        if query in line:
+            yield line_number, line.strip()
+
+matches = iter_matches(lines, "Engine")
+print(matches)
+print(next(matches))
+print(list(iter_matches(lines, "e")))
+```
+```text
+<generator object iter_matches at 0x7f2be51514e0>
+(1, 'class Engine:')
+[(1, 'class Engine:'), (2, 'def run(self):'), (3, 'self.fire_event(Events.STARTED)')]
+```
+
+- `next()` asks for one more value; the function runs until the next `yield` and pauses there.
+- `list(...)` collects everything; `for` loops over it one value at a time.
+- A generator can be consumed **once**. Loop over it a second time and it's empty.
+
+```{mermaid}
+sequenceDiagram
+  participant L as Your for loop
+  participant G as iter_matches (generator)
+  L->>G: next value?
+  G->>G: run until yield
+  G-->>L: (1, 'class Engine:')
+  L->>G: next value?
+  G->>G: continue from where it paused
+  G-->>L: (3, '...')
+  L->>G: next value?
+  G-->>L: no more (loop ends)
+```
+
+Why bother? Memory and speed of first result. A generator over the lines of a file holds one line at a time, however big the file. In lesson 1.9 Atlas reads files this way.
+
+**Generator expressions** are comprehensions in round brackets: they produce values lazily instead of building a list. They are perfect inside functions like `sum`, `any` and `all`:
+
+```python
+print(sum(1 for line in lines if "self" in line))
+print(any("def" in line for line in lines), all(line for line in lines))
+```
+```text
+2
+True True
+```
+
+- `any(...)` is `True` if at least one value is true; it stops at the first one.
+- `all(...)` is `True` if every value is true. A non-empty string counts as true.
+
+## Sorting by a key
+
+`sorted` can sort by any property, using `key=` and a small function. A **lambda** is a tiny one-line function without a name: `lambda item: item[1]` means "given an item, return its second element".
+
+```python
+files = [("engine.py", 1650), ("metrics.py", 900), ("README.md", 1650)]
+print(sorted(files, key=lambda item: item[1], reverse=True))
+```
+```text
+[('engine.py', 1650), ('README.md', 1650), ('metrics.py', 900)]
+```
+
+Only use `lambda` for these small "which value to sort by" functions; anything longer deserves a proper `def` with a name.
+
+## In the project
+
+Rewrite `find_matches` in `search.py` as a generator, using `enumerate`:
+
+```python
+def iter_matches(lines, query: str, ignore_case: bool = False):
+    """Yield (line_number, line) for each line containing the query."""
+    for line_number, line in enumerate(lines, start=1):
+        if line_matches(line, query, ignore_case):
+            yield line_number, line.strip()
+```
+
+It now accepts any iterable of lines (a list today, an open file in lesson 1.9), and the manual counter is gone. In `main.py`:
+
+```python
+matches = list(iter_matches(sample.splitlines(), "fire_event"))
+for line_number, line in matches:
+    print(f"engine.py:{line_number}: {line}")
+print(f"{len(matches)} matches")
+```
+
+## Common mistakes
+
+- **Reusing a used-up generator.** The second loop sees nothing. Call the generator function again, or turn it into a list once.
+- **`print(generator)`** shows `<generator object ...>`, not the values. Use `list(...)` to see them.
+- **Over-clever comprehensions.** Two `for`s and three `if`s in one line is a puzzle, not code. Use a loop.
+- **Forgetting `start=1`** in `enumerate`: every line number is one too low.
+
+## Check yourself
+
+**1.** What is printed?
+
+```python
+squares = (n * n for n in range(4))
+print(sum(squares))
+print(sum(squares))
+```
+
+::: {.callout-tip collapse="true" title="Answer"}
+`14` then `0`. The generator expression is used up by the first `sum` (0 + 1 + 4 + 9 = 14); the second sum sees no values.
+:::
+
+**2.** Rewrite as a comprehension: `result = []`, then for each `path` in `paths`, if it ends with `.py`, append `path.upper()`.
+
+::: {.callout-tip collapse="true" title="Answer"}
+`result = [path.upper() for path in paths if path.endswith(".py")]`
+:::
+
+**3.** When is a generator better than a list?
+
+::: {.callout-tip collapse="true" title="Answer"}
+When there are many values (or an endless stream), when you may stop early, or when you process each value once and don't need them all at the same time. It uses memory for one value instead of all of them, and the first result arrives immediately.
+:::
+
+## Exercise
+
+Using `enumerate`, a comprehension and `sorted` with a `key`:
+
+1. From a list of lines, build a list of `(line_number, length)` pairs for every non-blank line.
+2. Print the three longest lines' numbers, longest first.
+3. Print how many lines contain `"self"`, using a generator expression with `sum`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+lengths = [
+    (line_number, len(line))
+    for line_number, line in enumerate(lines, start=1)
+    if line.strip()
+]
+longest = sorted(lengths, key=lambda pair: pair[1], reverse=True)[:3]
+print([line_number for line_number, length in longest])
+print(sum(1 for line in lines if "self" in line))
+```
+
+`if line.strip()` works because an empty string counts as false.
+:::
+
+## Stretch
+
+Write a generator `chunks(items, size)` that yields lists of at most `size` items: `list(chunks([1, 2, 3, 4, 5], 2))` gives `[[1, 2], [3, 4], [5]]`. (In Part 6 you'll send text to an AI model in exactly this kind of batch.)
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def chunks(items, size):
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+```
+
+The last `if` yields the leftover partial batch. Without it, `[5]` would be lost.
+:::
+
+## What changed in the project
+
+`search.py` now has `iter_matches`, a generator using `enumerate`, ready to read from files. Commit: `feat: Streamed matches with a generator`.

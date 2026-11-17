@@ -1,0 +1,273 @@
+---
+title: "1.7 Text, dates and regular expressions"
+description: "Clean and format text, understand encodings, work with dates and time zones, and search with regular expressions."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 7 · About 70 minutes
+:::
+
+::: {.callout-note title="Analogy: a search with wildcards"}
+Searching for the exact word `Engine` is like looking for one particular person in a crowd by name. A **regular expression** is a description instead: "anyone wearing a red hat and carrying two bags". It finds every match for a *pattern*: "the word `def`, a space, then a name, then an opening bracket" finds every function definition, whatever it's called.
+:::
+
+## Everyday string methods
+
+```python
+line = "    self.fire_event(Events.STARTED)  "
+print(repr(line.strip()), line.lower().strip(), line.strip().startswith("self"))
+print("ignite/engine/engine.py".split("/"), "/".join(["ignite", "engine"]))
+print("a,b,,c".split(","), "Events.STARTED".replace(".", "_"))
+```
+```text
+'self.fire_event(Events.STARTED)' self.fire_event(events.started) True
+['ignite', 'engine', 'engine.py'] ignite/engine
+['a', 'b', '', 'c'] Events_STARTED
+```
+
+| Method | Does |
+|---|---|
+| `.strip()`, `.lstrip()`, `.rstrip("\n")` | remove whitespace (or given characters) from both ends, the left, or the right |
+| `.lower()`, `.upper()` | change case |
+| `.startswith(x)`, `.endswith(x)` | check the beginning or end |
+| `.split(sep)` | cut into a list at each separator |
+| `sep.join(list)` | glue a list of strings together with a separator |
+| `.replace(a, b)` | swap every `a` for `b` |
+
+`repr()` shows a string with its quotes, which makes leading and trailing spaces visible: handy when debugging. Strings never change in place: every method returns a **new** string.
+
+## Formatting numbers and columns
+
+f-strings can format values. After the variable, a `:` starts a **format spec**:
+
+```python
+print(f"{'type':<6}|{'files':>6}|")
+print(f"{'.py':<6}|{362:>6}|")
+print(f"{3.14159:.2f} {1234567:,}")
+```
+```text
+type  |  files|
+.py   |   362|
+3.14 1,234,567
+```
+
+`<6` means "left-align in 6 characters", `>6` right-aligns, `.2f` shows two decimal places, and `,` adds thousands separators. You'll use this to print the `atlas stats` table in the review lesson.
+
+## Characters, bytes and encodings
+
+Computers store **bytes** (numbers from 0 to 255), not letters. An **encoding** is the rule for turning text into bytes and back. The universal standard is **UTF-8**: English letters take one byte, other characters take two to four.
+
+```python
+print("é".encode("utf-8"), len("é"), len("é".encode("utf-8")))
+```
+```text
+b'\xc3\xa9' 1 2
+```
+
+One character, two bytes. Always say `encoding="utf-8"` when reading or writing text files (lesson 1.9). When bytes aren't valid UTF-8 (an image, say), decoding fails with `UnicodeDecodeError`, which Atlas must handle.
+
+## Dates and times
+
+Data from the web carries timestamps. GitHub, for example, says an issue was created at `"2026-11-02T09:14:00Z"`: the ISO 8601 format, where `Z` means UTC (Coordinated Universal Time, the reference time zone).
+
+```python
+from datetime import datetime, timedelta, timezone
+
+created = datetime.fromisoformat("2026-11-02T09:14:00Z")
+now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+age = now - created
+print(created, age, age.days)
+print(created + timedelta(days=30))
+print(created.strftime("%d %b %Y"))
+```
+```text
+2026-11-02 09:14:00+00:00 15 days, 2:46:00 15
+2026-12-02 09:14:00+00:00
+02 Nov 2026
+```
+
+- `datetime.fromisoformat` parses ISO text into a `datetime`.
+- Subtracting two datetimes gives a `timedelta` (a duration); adding a `timedelta` moves a date.
+- `strftime` formats a date for humans (`%d` day, `%b` short month name, `%Y` year).
+- In real code, "now" is `datetime.now(timezone.utc)`.
+
+**Always use time-zone-aware datetimes in UTC** for anything stored or compared, and convert to local time only for display. A datetime without a time zone is ambiguous: 09:14 where? Mixing the two raises a `TypeError`, which is Python protecting you.
+
+## Regular expressions
+
+The `re` module searches text with **patterns**:
+
+```python
+import re
+
+print(re.search(r"\d+", "issue #3932 opened"))
+print(re.search(r"\d+", "issue #3932 opened").group())
+print(re.findall(r"def (\w+)\(", "def run(self):\ndef accuracy():"))
+print(bool(re.search(r"^class \w+", "class Engine:")))
+```
+```text
+<re.Match object; span=(7, 11), match='3932'>
+3932
+['run', 'accuracy']
+True
+```
+
+The essential pattern pieces:
+
+| Pattern | Matches |
+|---|---|
+| `abc` | the literal text `abc` |
+| `.` | any one character |
+| `\d` / `\w` / `\s` | a digit / a "word" character (letter, digit, `_`) / whitespace |
+| `+` / `*` / `?` | one or more / zero or more / zero or one of the previous thing |
+| `[abc]` | one of `a`, `b`, `c` |
+| `^` / `$` | start / end of the text |
+| `\b` | a word boundary: the edge between a word character and anything else |
+| `( )` | a group: `findall` returns what's inside |
+| `\(`, `\.` | a literal `(` or `.` (the backslash cancels the special meaning) |
+
+- Write patterns as **raw strings**, `r"..."`, so Python leaves backslashes alone for `re`.
+- `re.search` finds the first match anywhere and returns a match object, or `None`.
+- `re.findall` returns every match (or every group).
+- `re.compile(pattern, flags)` prepares a pattern once for repeated use; `re.IGNORECASE` makes it case-insensitive.
+
+### Plain text inside a pattern: re.escape
+
+If a user searches for `run(self)`, the brackets would be read as a group, and `.` would match anything. `re.escape` turns plain text into a pattern that matches it literally:
+
+```python
+print(re.escape("run(self)"))
+pattern = re.compile("events", re.IGNORECASE)
+print(bool(pattern.search("Events.STARTED")))
+```
+```text
+run\(self\)
+True
+```
+
+### Invalid patterns
+
+A broken pattern raises `re.error`:
+
+```python
+try:
+    re.compile("(unclosed")
+except re.error as error:
+    print("error:", error)
+```
+```text
+error: missing ), unterminated subpattern at position 0
+```
+
+(`try`/`except` catches errors so the program can respond instead of crashing; lesson 1.9 covers it fully.)
+
+## In the project
+
+Give Atlas two options, case-insensitive search and regex search, with one function that turns the user's query into a compiled pattern. Add to `search.py`:
+
+```python
+import re
+
+
+def build_pattern(query: str, *, ignore_case: bool, use_regex: bool) -> re.Pattern[str]:
+    """Turn the user's query into a compiled regular expression.
+
+    Plain queries are escaped so characters like "." or "(" match literally.
+    Raises re.error if use_regex is True and the query is not a valid pattern.
+    """
+    source = query if use_regex else re.escape(query)
+    flags = re.IGNORECASE if ignore_case else 0
+    return re.compile(source, flags)
+```
+
+Then make `iter_matches` take the compiled pattern instead of a query:
+
+```python
+def iter_matches(lines, pattern: re.Pattern[str]):
+    for line_number, line in enumerate(lines, start=1):
+        if pattern.search(line):
+            yield line_number, line.strip()
+```
+
+`line_matches` is no longer needed: `pattern.search` does its job, for both modes. Two new pieces of syntax:
+
+- `x if condition else y` is a **conditional expression**: one value or another, in one line.
+- The `*` in the parameter list means everything after it must be passed by name: `build_pattern("Engine", ignore_case=True, use_regex=False)`. It forbids the unreadable `build_pattern("Engine", True, False)`.
+
+Real searches over Ignite, as you'll run them in lesson 1.10, show why regex matters. A plain search for `class Engine` also finds `class EngineForTests`; the regex `class Engine\b` doesn't, because `\b` requires the word to end there.
+
+## Common mistakes
+
+- **Forgetting `r` before a pattern.** `"\b"` is a backspace character to Python; `r"\b"` is a word boundary to `re`.
+- **Unescaped user input in a pattern.** Always `re.escape` text that should match literally.
+- **`.` meaning "a dot".** In a pattern it means "any character"; use `\.`.
+- **Naive datetimes.** `datetime.now()` without a time zone; use `datetime.now(timezone.utc)`.
+- **Over-engineering regexes.** If `in` or `.startswith()` does the job, use them: they're easier to read.
+
+## Check yourself
+
+**1.** Which lines does the pattern `^\s*def ` match: `def run():`, `    def run(self):`, `undef x`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The first two. `^` anchors to the start, `\s*` allows any indentation, then `def ` must follow. `undef x` doesn't start (after spaces) with `def `.
+:::
+
+**2.** Why does `build_pattern` call `re.escape` when `use_regex` is false?
+
+::: {.callout-tip collapse="true" title="Answer"}
+So characters that are special in patterns (`.`, `(`, `*`, ...) match literally. Without it, searching for `run(self)` would fail or match the wrong thing.
+:::
+
+**3.** An issue was created at `2026-11-02T09:14:00Z`. How do you compute how many days ago that was?
+
+::: {.callout-tip collapse="true" title="Answer"}
+```python
+created = datetime.fromisoformat("2026-11-02T09:14:00Z")
+age_in_days = (datetime.now(timezone.utc) - created).days
+```
+:::
+
+## Exercise
+
+Write a regex, and test it with `re.findall` on a few lines copied from Ignite:
+
+1. All function names defined with `def` (including indented methods).
+2. All event names written as `Events.SOMETHING` (capital letters and underscores).
+3. All numbers that follow a `#`, like issue references `#3932`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import re
+
+text = """    def run(self):
+        self.fire_event(Events.STARTED)
+def accuracy():  # see #3932
+        self.fire_event(Events.EPOCH_COMPLETED)"""
+
+print(re.findall(r"def (\w+)\(", text))
+print(re.findall(r"Events\.([A-Z_]+)", text))
+print(re.findall(r"#(\d+)", text))
+```
+```text
+['run', 'accuracy']
+['STARTED', 'EPOCH_COMPLETED']
+['3932']
+```
+:::
+
+## Stretch
+
+Write `highlight(line, pattern)` that returns the line with every match wrapped in square brackets: `highlight("fire_event(Events.STARTED)", re.compile("Event"))` returns `"fire_event([Event]s.STARTED)"`. Hint: `pattern.sub(replacement, text)` replaces matches, and in the replacement `\g<0>` means "the whole match".
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def highlight(line: str, pattern: re.Pattern[str]) -> str:
+    return pattern.sub(r"[\g<0>]", line)
+```
+
+`fire_event` isn't highlighted because the pattern is `Event` with a capital E. Terminal tools use the same idea with colour codes instead of brackets.
+:::
+
+## What changed in the project
+
+`search.py` gained `build_pattern`, and `iter_matches` now searches with a compiled pattern, supporting case-insensitive and regex searches. Commit: `feat: Added regex and case-insensitive search`.

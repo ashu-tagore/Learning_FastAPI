@@ -93,7 +93,7 @@ Atlas never posts anything to GitHub and never writes your fix. Open-source main
 ## How to use this course
 
 - **Parts and checkpoints.** The course has 10 parts. Each part ends at a **checkpoint**: a saved version of the project where everything works.
-- **Your code and the reference code.** You write your own code in the `workspace/` folder. The finished version of each step lives in `atlas/`. Compare only *after* you have tried.
+- **Your code and the reference code.** You write your own code in your own repository, `my-atlas`, created in lesson 1.1. The finished version of each step lives in the course's `atlas/` folder. Compare only *after* you have tried.
 - **Every lesson has exercises.** Do them. Reading about swimming does not teach swimming.
 - **The 20-minute rule.** When stuck, struggle for 20 minutes before opening a solution. The struggle is where learning happens. After 20 minutes, look, then close it and redo the exercise from memory.
 - **Explain it back.** After each lesson, explain the main idea out loud in two sentences, as if to a friend. If you can't, reread the theory section.

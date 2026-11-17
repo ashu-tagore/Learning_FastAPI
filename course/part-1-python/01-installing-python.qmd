@@ -1,0 +1,209 @@
+---
+title: "1.1 Installing Python with uv"
+description: "Install Python and uv, create your own project repository my-atlas, run a program, and use the Python REPL."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 1 · About 45 minutes
+:::
+
+::: {.callout-note title="Analogy: a translator and a kitchen manager"}
+A computer only understands very low-level instructions. **Python** is a language people can read, plus a translator (the **interpreter**) that reads your Python line by line and tells the computer what to do.
+
+**uv** is the kitchen manager. It fetches the right version of the translator, sets up a clean workspace for each project, and later orders the extra ingredients (libraries) your project needs, writing down exactly which ones so the same meal can be cooked anywhere.
+:::
+
+## What a program is
+
+A **program** is a text file of instructions. Python programs end in `.py`. Running one means handing the file to the Python interpreter, which carries out the instructions from top to bottom.
+
+Python is popular for backends and AI work because it reads almost like English, has libraries for everything, and is what most AI tools are written in. The ideas you learn here (variables, loops, functions, objects) exist in every language; only the spelling changes.
+
+## Install uv
+
+uv installs Python for you, so you don't need to install Python separately. In your terminal (Ubuntu on Windows, Terminal on macOS or Linux):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+`curl` downloads the install script and `| sh` runs it. Close and reopen the terminal so the new `uv` command is on your `PATH` (lesson 0.2), then check:
+
+```text
+$ uv --version
+uv 0.11.32 (x86_64-unknown-linux-gnu)
+```
+
+Your version number will probably be newer; that's fine. Now install Python 3.13, the version this course uses:
+
+```bash
+uv python install 3.13
+```
+
+## Create your project: my-atlas
+
+This is the repository where you will build your own Atlas, lesson by lesson, through the whole course.
+
+```text
+$ cd ~/code
+$ uv init my-atlas
+Initialized project `my-atlas` at `/home/ada/code/my-atlas`
+$ cd my-atlas
+$ ls -a
+.  ..  .git  .gitignore  .python-version  README.md  main.py  pyproject.toml
+```
+
+uv created:
+
+| File | What it is |
+|---|---|
+| `main.py` | A starter program |
+| `pyproject.toml` | The project's settings: its name, the Python version it needs, and later its dependencies |
+| `.python-version` | Which Python version this project uses |
+| `README.md` | A description of the project, shown on GitHub |
+| `.gitignore` | Files Git should ignore |
+| `.git` | uv also ran `git init` for you (lesson 0.3) |
+
+Look at `main.py` in your editor (`code .` opens the current folder in VS Code):
+
+```python
+def main():
+    print("Hello from my-atlas!")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+You will understand every word of this by lesson 1.4. For now: `print(...)` displays text, and the rest makes sure that `print` line runs when you run the file.
+
+## Run it
+
+```text
+$ uv run main.py
+Using CPython 3.13.18 interpreter at: /usr/local/bin/python3.13
+Creating virtual environment at: .venv
+Hello from my-atlas!
+```
+
+The first run also created `.venv`, a **virtual environment**: a private folder holding this project's Python and, later, its libraries, so projects never interfere with each other. You will learn more about it in lesson 1.10. `.venv` is already in `.gitignore`, because it can always be recreated.
+
+`uv run` always means: "run this inside the project's environment". Get into the habit of starting Python commands with it.
+
+## Change it
+
+Edit `main.py` so the `print` line says:
+
+```python
+    print("Atlas: search a codebase")
+```
+
+Keep the four spaces at the start of the line: in Python, indentation is part of the meaning (lesson 1.3). Save and run again:
+
+```text
+$ uv run main.py
+Atlas: search a codebase
+```
+
+That loop of **edit, save, run, read the output** is how all programming works.
+
+## The REPL: Python's scratchpad
+
+The **REPL** (Read, Evaluate, Print, Loop) lets you type one line of Python and see the result immediately. It is perfect for trying things out.
+
+```text
+$ uv run python
+Python 3.13.18 ...
+>>> 2 + 3
+5
+>>> print("hello")
+hello
+>>> "atlas".upper()
+'ATLAS'
+>>> exit()
+```
+
+`>>>` is the REPL's prompt. You don't need `print` in the REPL: it shows the value of whatever you type. Use it whenever you wonder "what does this do?".
+
+## Save your work to GitHub
+
+Your project is already a Git repository. Commit and publish it (lesson 0.3):
+
+```bash
+git add .
+git commit -m "feat: Created my-atlas project"
+```
+
+Create an empty repository called `my-atlas` on GitHub (no README), then:
+
+```bash
+git remote add origin git@github.com:YOUR-USERNAME/my-atlas.git
+git push -u origin main
+```
+
+From now on, end every lesson by committing what you built.
+
+## Common mistakes
+
+- **`uv: command not found`** after installing: you didn't reopen the terminal, so `PATH` hasn't been updated.
+- **Running Python outside the project.** `python3 main.py` may use a different Python with different libraries. Use `uv run`.
+- **Removing the indentation** before `print`. Python reports `IndentationError`.
+- **Typing Python into the terminal instead of the REPL**, for example running `print("hi")` at the `$` prompt. The shell doesn't speak Python; start the REPL first.
+
+## Check yourself
+
+**1.** What is the difference between Python and uv?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Python is the language and its interpreter, which runs your code. uv is a tool that installs Python, creates projects and their virtual environments, and manages libraries. uv doesn't run your code itself; it starts Python for you.
+:::
+
+**2.** Why is `.venv` in `.gitignore`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It's generated: uv can recreate it at any time from `pyproject.toml`. Committing it would add thousands of files that differ between operating systems.
+:::
+
+**3.** When should you use the REPL instead of a `.py` file?
+
+::: {.callout-tip collapse="true" title="Answer"}
+For quick experiments: checking what an expression returns or how a function behaves. Anything you want to keep or run again belongs in a file.
+:::
+
+## Exercise
+
+1. Change `main.py` so it prints three lines: the project name, `Part 1: Python`, and your name.
+2. Run it with `uv run main.py`.
+3. Commit with the message `feat: Printed project header` and push.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def main():
+    print("Atlas: search a codebase")
+    print("Part 1: Python")
+    print("Built by Ada")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+uv run main.py
+git add main.py
+git commit -m "feat: Printed project header"
+git push
+```
+:::
+
+## Stretch: explore the REPL
+
+In the REPL, find out: (a) what `10 / 3` and `10 // 3` give; (b) what `len("my-atlas")` returns; (c) what `help(len)` shows (press `q` to leave the help screen). Write one sentence about each.
+
+::: {.callout-tip collapse="true" title="Answer"}
+(a) `3.3333333333333335` and `3`: `/` divides exactly, `//` divides and drops the remainder. (The long decimal is how computers store fractions; lesson 1.2 explains.) (b) `8`: the number of characters. (c) The built-in documentation for `len`: "Return the number of items in a container." `help(anything)` works for every built-in.
+:::
+
+## What changed in the project
+
+You created `my-atlas`, your own repository, and published it to GitHub. It prints a header. By the end of Part 1 it will search Ignite's codebase.

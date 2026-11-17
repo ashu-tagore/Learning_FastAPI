@@ -1,0 +1,242 @@
+---
+title: "0.2 Your workstation"
+description: "Set up a terminal, move around the file system, create and delete files, and understand paths and environment variables."
+---
+
+::: {.lesson-meta}
+Part 0 · Lesson 2 · About 60 minutes, including setup
+:::
+
+::: {.callout-note title="Analogy: a workshop and its intercom"}
+Your computer is a workshop. The folders are shelves and drawers; the files are the things stored in them. Normally you walk around the workshop by clicking (the graphical interface). The **terminal** is an intercom to a very fast, very literal assistant: you say exactly what you want in short commands ("go to the third shelf", "list what's on it", "copy this box"), and it does it instantly, with no clicking. Backend engineers live on that intercom, because servers usually have no screen to click on at all.
+:::
+
+## Why the terminal
+
+Every tool in this course (Python, Git, databases, Docker, AWS) is driven from the terminal. Servers in data centres have no monitor and no mouse; you control them by typing commands. Learning the terminal now pays off in every later lesson.
+
+Three words you will see:
+
+- The **terminal** is the window you type into.
+- The **shell** is the program inside it that reads your command and runs it. We use **bash**, the most common shell on Linux servers. (macOS uses **zsh** by default, which accepts the same commands for everything in this course.)
+- The **prompt** is the text the shell prints when it is ready for your next command, usually ending in `$`.
+
+In this course, a line starting with `$` is something you type (without the `$`). Lines without it are what the computer prints back.
+
+## Set up your terminal
+
+Pick your operating system.
+
+::: {.panel-tabset}
+## Windows
+
+Windows has its own shells, but servers run Linux, so we use **WSL** (Windows Subsystem for Linux): a real Linux system running inside Windows.
+
+1. Open the Start menu, type **PowerShell**, right-click it and choose **Run as administrator**.
+2. Run:
+   ```powershell
+   wsl --install
+   ```
+3. Restart your computer when asked. After the restart, an **Ubuntu** window opens and asks you to create a Linux username and password. Remember the password: you will need it when installing software.
+4. From now on, open **Ubuntu** from the Start menu whenever this course says "open a terminal".
+
+## macOS
+
+Open **Terminal** (press `Cmd + Space`, type `Terminal`, press Enter). macOS is close enough to Linux that every command in this course works.
+
+## Linux
+
+Open your distribution's **Terminal** app (often `Ctrl + Alt + T`). You're already on the operating system servers use.
+:::
+
+Then install a code editor. We use **Visual Studio Code** (free, from code.visualstudio.com). On Windows, also install its **WSL** extension so the editor can open files inside Ubuntu.
+
+## Where am I? Files, folders and paths
+
+Everything on your computer lives in one big tree of folders (also called **directories**). The top of the tree is called the **root** and is written `/`. Your personal folder is called your **home** folder.
+
+A **path** is the address of a file or folder in that tree, with `/` between each step: `/home/ada/code/notes/first.txt` means "start at the root, go into `home`, then `ada`, then `code`, then `notes`, and there you'll find `first.txt`".
+
+```{mermaid}
+flowchart TD
+  R["/ (root)"] --> H[home]
+  R --> U[usr]
+  H --> A["ada (your home folder)"]
+  A --> C[code]
+  C --> N[notes]
+  N --> F[first.txt]
+```
+
+The shell always has a **current working directory**: the folder you are "standing in". Commands act there unless you say otherwise.
+
+| Command | Means | Example |
+|---|---|---|
+| `pwd` | print working directory: where am I? | `pwd` |
+| `ls` | list what's here | `ls`, `ls -l` (details), `ls -a` (include hidden files) |
+| `cd` | change directory: walk somewhere | `cd code`, `cd ..` (up one level), `cd ~` (home) |
+| `mkdir` | make a directory | `mkdir -p code/notes` (`-p` creates missing parents) |
+| `cat` | print a file's contents | `cat first.txt` |
+| `cp` | copy | `cp first.txt copy.txt` |
+| `mv` | move or rename | `mv copy.txt second.txt` |
+| `rm` | remove a file, **permanently** | `rm second.txt` |
+
+Here is a real session on a computer whose user is called `ada`:
+
+```text
+$ pwd
+/home/ada
+$ mkdir -p code/notes
+$ ls
+code
+$ cd code/notes
+$ pwd
+/home/ada/code/notes
+$ echo "Backends store data." > first.txt
+$ ls -l
+total 4
+-rw-rw-r-- 1 ada ada 21 Nov 17 16:25 first.txt
+$ cat first.txt
+Backends store data.
+```
+
+Two new things there:
+
+- `echo "text"` prints text. The `>` sends that output **into a file** instead of the screen, creating or replacing the file. (`>>` appends instead of replacing.)
+- `ls -l` shows details: permissions (`-rw-rw-r--`, covered in lesson 2.4), owner, size in bytes (21), date and name.
+
+### Absolute and relative paths
+
+- An **absolute path** starts with `/` and works from anywhere: `/home/ada/code/notes`.
+- A **relative path** starts from where you are now: if you are in `/home/ada/code`, then `notes/first.txt` means `/home/ada/code/notes/first.txt`.
+- `.` means "this folder", `..` means "the folder above", and `~` means "my home folder".
+
+### Hidden files
+
+Names starting with a dot, like `.gitignore` or `.venv`, are **hidden**: `ls` doesn't show them, `ls -a` does. Tools use them for settings. You will meet many.
+
+## Environment variables
+
+A **variable** is a name that holds a value. The shell keeps a set of **environment variables**: named values that every program you start can read. They are how programs find out things about their surroundings without you passing them in every time.
+
+```text
+$ echo $HOME
+/home/ada
+$ export COURSE=atlas
+$ printenv COURSE
+atlas
+```
+
+- `$NAME` means "the value of variable `NAME`".
+- `export NAME=value` sets one for this terminal session and every program started from it. (No spaces around `=`.)
+- They disappear when you close the terminal unless you add the `export` line to your shell's startup file (`~/.bashrc` for bash, `~/.zshrc` for zsh).
+
+One variable matters more than the others: **`PATH`**. It is a list of folders, separated by `:`, where the shell looks for programs. When you type `python3`, the shell searches those folders in order and runs the first `python3` it finds:
+
+```text
+$ which python3
+/usr/local/bin/python3
+```
+
+Your `echo $PATH` output will be a long line like `/usr/local/bin:/usr/bin:/bin:...`. If you ever see `command not found` right after installing something, the usual cause is that its folder isn't in `PATH` yet: closing and reopening the terminal often fixes it.
+
+You will use environment variables constantly later: in lesson 4.2 the API reads its database password from one, so the password never has to be written in the code.
+
+## Reading errors
+
+The terminal tells you exactly what went wrong, if you read it:
+
+```text
+$ cd nowhere
+-bash: cd: nowhere: No such file or directory
+```
+
+That says: the program `bash`, running the command `cd`, could not find `nowhere`. Most beginner errors are a typo in a name, or running a command from the wrong folder (check with `pwd`).
+
+## Keyboard habits that save hours
+
+- **Tab** completes file and folder names. Type `cd co` then Tab and it becomes `cd code/`. If nothing happens, press Tab twice to see the options.
+- **Up arrow** brings back previous commands.
+- **Ctrl + C** stops the running command. Use it whenever something seems stuck.
+- **Ctrl + L** (or `clear`) clears the screen.
+- `man ls` (or `ls --help`) shows the manual for a command. Press `q` to leave the manual.
+
+## Common mistakes
+
+- **Typing the `$`.** It's part of the prompt, not the command.
+- **`rm` is forever.** There is no recycle bin. Read the command twice before pressing Enter, and never run `rm -rf` on a path you haven't checked with `ls` first.
+- **Spaces in names.** `mkdir my notes` creates two folders, `my` and `notes`. Use `my-notes`, or quote it: `mkdir "my notes"`. This course always uses lowercase names with hyphens.
+- **Working in the wrong folder.** When a command can't find a file, run `pwd` and `ls` before anything else.
+- **On Windows, mixing worlds.** Keep course files inside Ubuntu's home folder (`~`), not on the Windows `C:` drive. It's faster and avoids permission problems.
+
+## Check yourself
+
+**1.** You are in `/home/ada/code`. What does `cd ../..` do, and where do you end up?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`..` means "the folder above", twice: from `/home/ada/code` up to `/home/ada`, then up to `/home`. You end up in `/home`.
+:::
+
+**2.** What is the difference between `echo hi > notes.txt` and `echo hi >> notes.txt`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`>` replaces the file's contents with `hi` (creating the file if needed). `>>` adds `hi` as a new line at the end, keeping what was already there.
+:::
+
+**3.** You installed a tool, but typing its name gives `command not found`. What is the most likely reason?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The folder containing the tool isn't in your `PATH` yet. Close and reopen the terminal (so it re-reads its startup files), or follow the installer's instructions for adding it to `PATH`.
+:::
+
+## Exercise: build your course folder
+
+Using only the terminal:
+
+1. Go to your home folder and confirm it with `pwd`.
+2. Create a folder `code` in your home folder. All course work lives here.
+3. Inside `code`, create a folder `scratch`, and inside it a file `plan.txt` containing the line `Part 0: terminal`.
+4. Add a second line `Part 1: Python` to the same file, without deleting the first.
+5. Make a copy called `plan-backup.txt`, then rename the copy to `old-plan.txt`.
+6. Print the contents of `plan.txt`, then delete `old-plan.txt`.
+7. Set an environment variable `EDITOR_NAME` to the name of your editor and print it.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+cd ~
+pwd
+mkdir -p code/scratch
+cd code/scratch
+echo "Part 0: terminal" > plan.txt
+echo "Part 1: Python" >> plan.txt
+cp plan.txt plan-backup.txt
+mv plan-backup.txt old-plan.txt
+cat plan.txt
+rm old-plan.txt
+export EDITOR_NAME=vscode
+echo $EDITOR_NAME
+```
+
+`cat plan.txt` should print both lines. If it shows only `Part 1: Python`, you used `>` instead of `>>` on step 4.
+:::
+
+## Stretch: find things fast
+
+Two more commands that backend engineers use daily:
+
+- `grep TEXT FILE` prints the lines of `FILE` that contain `TEXT`. Add `-r` to search every file in a folder, and `-n` to show line numbers.
+- `find FOLDER -name "PATTERN"` lists files whose names match, where `*` means "anything".
+
+Create a few files in `~/code/scratch` with different words in them. Then: (a) find every line containing `Python` across all files in the folder, with line numbers; (b) list every file ending in `.txt`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+grep -rn "Python" ~/code/scratch
+find ~/code/scratch -name "*.txt"
+```
+
+`grep -rn` prints results as `path:line_number:text`. Remember that format: in Part 1 you will build your own version of this tool in Python, and it is the first piece of Atlas.
+:::
+
+## What changed in the project
+
+You now have a `~/code` folder where every project in this course will live. Next, in lesson 0.3, you put your work under version control with Git and connect it to GitHub.

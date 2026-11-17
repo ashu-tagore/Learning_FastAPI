@@ -8,15 +8,15 @@ title: "Part 1: Programming with Python"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 1.1 | Installing Python with uv, running code, the REPL *(coming soon)* | `workspace/` project |
-| 1.2 | Values, variables, types, operators *(coming soon)* |  |
-| 1.3 | Control flow: conditions and loops; reading code like a computer *(coming soon)* |  |
-| 1.4 | Functions and modules *(coming soon)* |  |
-| 1.5 | Collections: list, dict, set, tuple; a first feel for Big-O *(coming soon)* |  |
-| 1.6 | Iteration in depth: iterators, generators, comprehensions *(coming soon)* |  |
-| 1.7 | Text, dates and regular expressions *(coming soon)* |  |
-| 1.8 | Classes, objects, composition, dataclasses *(coming soon)* |  |
-| 1.9 | Errors, files, `pathlib`, JSON, type hints *(coming soon)* |  |
-| 1.10 | Packages, dependencies and project layout *(coming soon)* | `atlas` package skeleton |
-| 1.11 | Testing with pytest; debugging *(coming soon)* | `atlas` CLI v0 with tests |
-| 1.12 | Review and practice *(coming soon)* | Unguided: `atlas stats` command |
+| 1.1 | [Installing Python with uv, running code, the REPL](01-installing-python.qmd) | Your `my-atlas` repository |
+| 1.2 | [Values, variables, types, operators](02-values-and-variables.qmd) |  |
+| 1.3 | [Control flow: conditions and loops; reading code like a computer](03-control-flow.qmd) |  |
+| 1.4 | [Functions and modules](04-functions-and-modules.qmd) |  |
+| 1.5 | [Collections: list, dict, set, tuple; a first feel for Big-O](05-collections.qmd) |  |
+| 1.6 | [Iteration in depth: iterators, generators, comprehensions](06-iteration.qmd) |  |
+| 1.7 | [Text, dates and regular expressions](07-text-dates-regex.qmd) |  |
+| 1.8 | [Classes, objects, composition, dataclasses](08-classes-and-dataclasses.qmd) |  |
+| 1.9 | [Errors, files, `pathlib`, JSON, type hints](09-errors-files-json.qmd) |  |
+| 1.10 | [Packages, dependencies and project layout](10-packages-and-cli.qmd) | `atlas` package skeleton |
+| 1.11 | [Testing with pytest; debugging](11-testing-and-debugging.qmd) | `atlas` CLI v0 with tests |
+| 1.12 | [Review and practice](12-review-and-practice.qmd) | Unguided: `atlas stats` command |

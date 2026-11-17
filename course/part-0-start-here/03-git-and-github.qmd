@@ -1,0 +1,351 @@
+---
+title: "0.3 Git and GitHub"
+description: "Save your work as a history of commits, work on branches, publish to GitHub, and understand forks and pull requests well enough to contribute to open source."
+---
+
+::: {.lesson-meta}
+Part 0 · Lesson 3 · About 90 minutes, including setup
+:::
+
+::: {.callout-note title="Analogy: save points and a shared album"}
+In a video game you save before the boss fight, so a mistake costs minutes instead of hours. **Git** gives your project save points, called **commits**, and lets you jump back to any of them. It also lets you try something risky in a parallel timeline (a **branch**) without touching the main one.
+
+**GitHub** is a website that hosts copies of those timelines online, like a shared photo album that teammates can view, copy and suggest additions to. A suggestion to add your photos to someone else's album is a **pull request**.
+:::
+
+## Why version control
+
+Without it, projects end up as `final.py`, `final-v2.py`, `final-v2-REALLY.py`. With Git:
+
+- every change is recorded, with who made it, when and why
+- you can see exactly what changed between any two points
+- you can undo mistakes safely
+- several people can work on the same project at once and combine their work
+
+Every company and every open-source project you will ever touch uses Git. PyTorch-Ignite, the project Atlas studies, is developed entirely through Git and GitHub.
+
+## The three places your changes live
+
+```{mermaid}
+flowchart LR
+  W[Working folder<br/>files you edit] -->|git add| S[Staging area<br/>changes chosen for<br/>the next commit]
+  S -->|git commit| H[History<br/>commits saved<br/>in .git]
+  H -->|git push| G[GitHub<br/>shared copy]
+  G -->|git pull / git clone| W
+```
+
+- The **working folder** is the files you see and edit.
+- The **staging area** is a list of changes you have chosen to include in the next commit. It lets you commit some changes and not others.
+- The **history** is the chain of commits, stored in a hidden `.git` folder inside your project.
+- A **remote** is a copy of the repository somewhere else, usually GitHub.
+
+A **repository** (or **repo**) is a project folder that Git is tracking.
+
+## Install and configure
+
+::: {.panel-tabset}
+## Windows (Ubuntu in WSL) and Linux
+
+```bash
+sudo apt update
+sudo apt install git
+```
+
+`sudo` runs a command as the administrator; it asks for the password you created when setting up Ubuntu.
+
+## macOS
+
+```bash
+xcode-select --install
+```
+
+This installs Apple's command-line developer tools, which include Git.
+:::
+
+Check it worked, then tell Git who you are. These details are stamped on every commit you make, so use the email you will use for GitHub.
+
+```bash
+git --version
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+git config --global init.defaultBranch main
+```
+
+The last line names the first branch of new repositories `main`, which is the modern convention.
+
+## Your first repository
+
+Here is a real session. Follow along in `~/code`.
+
+```text
+$ mkdir -p ~/code/hello-git
+$ cd ~/code/hello-git
+$ git init
+Initialized empty Git repository in /home/ada/code/hello-git/.git/
+$ echo "# Hello Git" > README.md
+$ git status
+On branch main
+
+No commits yet
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	README.md
+
+nothing added to commit but untracked files present (use "git add" to track)
+```
+
+`git status` is the command you will run most. Read it every time: it says which branch you are on and what has changed. **Untracked** means Git sees the file but isn't saving its history yet.
+
+```text
+$ git add README.md
+$ git status
+On branch main
+
+No commits yet
+
+Changes to be committed:
+  (use "git rm --cached <file>..." to unstage)
+	new file:   README.md
+
+$ git commit -m "docs: Added README"
+[main (root-commit) 6b43169] docs: Added README
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+```
+
+`6b43169` is the commit's **id** (the start of a longer unique code called a hash). Yours will differ.
+
+Now change the file and look at the difference before committing:
+
+```text
+$ echo "Learning Git, one commit at a time." >> README.md
+$ git diff
+diff --git a/README.md b/README.md
+index ab690e8..98cbc4e 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ # Hello Git
++Learning Git, one commit at a time.
+$ git commit -am "docs: Described the project"
+$ git log --oneline
+1ae4d9c docs: Described the project
+6b43169 docs: Added README
+```
+
+In a diff, lines starting with `+` were added and lines starting with `-` were removed. `commit -a` stages every change to files Git already tracks, then commits. It never includes brand-new files; those still need `git add`.
+
+### Writing good commit messages
+
+A commit message explains *why* a change was made; the diff already shows *what*. This course uses one consistent style, `type: Past-tense sentence`:
+
+| Type | Use for | Example |
+|---|---|---|
+| `feat` | a new feature | `feat: Added search command` |
+| `fix` | a bug fix | `fix: Skipped binary files during search` |
+| `docs` | documentation | `docs: Explained the --regex flag` |
+| `test` | tests only | `test: Covered empty folders` |
+| `chore` | maintenance | `chore: Removed unused imports` |
+
+Keep each commit to one logical change. Small commits are easy to understand, review and undo.
+
+### Ignoring files
+
+Some files should never be committed: passwords, generated files, tool caches. List them in a file called `.gitignore`, one pattern per line:
+
+```text
+.venv/
+__pycache__/
+.env
+```
+
+**Never commit a password or secret key.** Deleting it in a later commit doesn't remove it from history; anyone with the repository can still find it. If it happens, treat the secret as leaked and replace it.
+
+## Branches
+
+A **branch** is a separate line of commits. You create one to work on something without disturbing `main`, then **merge** it back when it is ready.
+
+```{mermaid}
+gitGraph
+  commit id: "Added README"
+  commit id: "Described project"
+  branch add-notes
+  checkout add-notes
+  commit id: "Added notes"
+  checkout main
+  merge add-notes
+```
+
+```text
+$ git switch -c add-notes
+Switched to a new branch 'add-notes'
+$ echo "notes" > notes.md
+$ git add notes.md
+$ git commit -m "docs: Added notes"
+$ git switch main
+Switched to branch 'main'
+$ git merge add-notes
+Updating 1ae4d9c..28449c1
+Fast-forward
+ notes.md | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 notes.md
+```
+
+`switch -c` creates a branch and moves onto it. **Fast-forward** means `main` had not changed since the branch started, so Git simply moved `main` forward to include the new commit.
+
+If both branches changed the same lines, Git can't decide which version wins and reports a **merge conflict**. It marks the clashing section in the file between `<<<<<<<` and `>>>>>>>` lines; you edit the file to keep what you want, delete the markers, then `git add` and `git commit`. Conflicts are normal, not a disaster.
+
+## GitHub
+
+1. Create a free account at github.com.
+2. Connect your computer with an **SSH key**: a pair of files that proves to GitHub who you are, so you don't type a password each time. The **private key** stays on your computer and is never shared. The **public key** is given to GitHub.
+
+```bash
+ssh-keygen -t ed25519 -C "you@example.com"
+```
+
+Press Enter to accept the default location, and choose a passphrase (or press Enter for none). Then print the public key:
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+Copy the whole line it prints. On GitHub, open **Settings → SSH and GPG keys → New SSH key**, paste it and save. Test the connection:
+
+```bash
+ssh -T git@github.com
+```
+
+The first time, type `yes` to trust GitHub's server. A greeting containing your username, saying you've successfully authenticated, means it worked.
+
+### Publishing a repository
+
+On GitHub, click **New repository**, name it `hello-git`, leave every box unticked (no README, no .gitignore), and create it. GitHub shows the address to use. Then, in your terminal:
+
+```bash
+cd ~/code/hello-git
+git remote add origin git@github.com:YOUR-USERNAME/hello-git.git
+git push -u origin main
+```
+
+- `remote add origin ...` records GitHub's copy under the name `origin` (the conventional name).
+- `push` uploads your commits. `-u` remembers the pairing, so next time `git push` is enough.
+- `git pull` does the reverse: downloads new commits from GitHub and merges them in.
+- `git clone ADDRESS` downloads a whole repository you don't have yet.
+
+## Pull requests
+
+A **pull request** (PR) is a proposal on GitHub: "please merge the commits on my branch into `main`". It shows the diff, lets people comment line by line, runs automated checks, and records the discussion. Every change to serious projects goes through one, including every change to this course.
+
+The everyday loop:
+
+```{mermaid}
+flowchart LR
+  A[git switch -c my-change] --> B[edit, commit]
+  B --> C[git push -u origin my-change]
+  C --> D[Open a PR on GitHub]
+  D --> E[Review and checks]
+  E --> F[Merge on GitHub]
+  F --> G[git switch main<br/>git pull]
+```
+
+## Forks and open source
+
+You can't push branches to someone else's repository. Instead you make a **fork**: your own copy of their repository on GitHub. You push to your fork, then open a pull request from your fork to the original, which is called **upstream**.
+
+This is exactly how you will contribute to PyTorch-Ignite. Good open-source manners:
+
+- **Read `CONTRIBUTING.md` first**, and any other rules files. Ignite also has `AGENTS.md`, with rules for AI-assisted work: AI tools may help you understand, but you must understand the change yourself, and AI must not write issues, pull-request descriptions or replies to reviewers. Atlas is designed to follow those rules.
+- **Ask before starting.** Comment on the issue to say you'd like to work on it, and wait for a maintainer to agree.
+- **Keep pull requests small** and focused on one thing.
+- **Be patient and polite.** Maintainers are often volunteers.
+
+## Get the course and Ignite on your computer
+
+```bash
+cd ~/code
+git clone https://github.com/ashu-tagore/Learning_FastAPI.git course
+git clone --depth 1 https://github.com/pytorch/ignite.git ignite
+```
+
+- `course` holds the lessons and the reference code in `atlas/`. You read it; you don't work in it.
+- `ignite` is the codebase Atlas will study. `--depth 1` downloads only the latest commit, which is much smaller; that's all Part 1 needs.
+
+Your own code will live in your own repository, `my-atlas`, which you create in lesson 1.1.
+
+## Common mistakes
+
+- **Committing secrets.** Add `.env` to `.gitignore` before you ever create one.
+- **One giant commit at the end of the day.** Commit each small step that works.
+- **Working directly on `main`** for anything bigger than a typo. Use a branch.
+- **Forgetting to pull** before starting work, then hitting conflicts. Start each session with `git pull`.
+- **Force-pushing** (`git push --force`) to a shared branch. It overwrites other people's work. You won't need it in this course.
+- **Panicking at a conflict.** Read the markers, choose the right lines, commit. That's all it is.
+
+## Check yourself
+
+**1.** You edited `a.py` and `b.py` but only want `a.py` in the next commit. What do you run?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`git add a.py` then `git commit -m "..."`. Only staged changes go into a commit; `b.py` stays modified in your working folder for a later commit. (`git commit -a` would have included both.)
+:::
+
+**2.** What is the difference between a branch and a fork?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A **branch** is a separate line of commits inside one repository. A **fork** is a whole copy of someone else's repository under your GitHub account. You fork when you can't push to the original; then you create branches inside your fork and open pull requests from them.
+:::
+
+**3.** You accidentally committed a file containing a password and pushed it. You delete the file and commit again. Is the password safe now?
+
+::: {.callout-tip collapse="true" title="Answer"}
+No. The old commit still contains it, and anyone can read history. Change the password (treat it as leaked) and make sure the file is listed in `.gitignore` from now on.
+:::
+
+## Exercise: your first pull request
+
+1. Push `hello-git` to GitHub as shown above.
+2. Create a branch `add-goals`. Add a file `goals.md` listing three things you want to build in this course. Commit it with a message in the course's style.
+3. Push the branch: `git push -u origin add-goals`.
+4. On GitHub, open a pull request from `add-goals` into `main`. Read the "Files changed" tab, then merge it.
+5. Back in the terminal, switch to `main` and pull. Confirm `goals.md` is there and `git log --oneline` shows your commit.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+cd ~/code/hello-git
+git switch -c add-goals
+echo "- Build Atlas" > goals.md
+echo "- Deploy to AWS" >> goals.md
+echo "- Contribute to PyTorch-Ignite" >> goals.md
+git add goals.md
+git commit -m "docs: Added my course goals"
+git push -u origin add-goals
+# open and merge the pull request on github.com
+git switch main
+git pull
+ls
+git log --oneline
+```
+
+If `git pull` says "There is no tracking information", run `git push -u origin main` once to pair `main` with GitHub, then pull again.
+:::
+
+## Stretch: read a real project's history and rules
+
+In your Ignite clone:
+
+1. Open `CONTRIBUTING.md` and `AGENTS.md` in your editor. Find: the command to run the code-style checks, and two things AI agents must not do.
+2. On GitHub, open Ignite's issues and filter by the label `good first issue`. Pick one and read the whole discussion.
+3. Run `git log --oneline -5` in the clone. Why do you see only one commit?
+
+::: {.callout-tip collapse="true" title="Answer"}
+1. `pre-commit run --all-files` (it runs `ruff` for linting and formatting). Agents must not open issues or pull requests, and must not write pull-request descriptions, commit messages or replies to reviewers on the user's behalf. (Rules change; always read the current files.)
+2. Notice how the discussion goes: someone describes a problem, often with a small code example that shows it (a reproduction); a maintainer confirms; a contributor asks to work on it. Atlas Agents will prepare exactly that kind of understanding for you.
+3. You cloned with `--depth 1`, which downloads only the latest commit. `git fetch --unshallow` would download the full history when you need it.
+:::
+
+## What changed in the project
+
+You can now save, branch, publish and propose changes. You have three folders in `~/code`: `hello-git` (practice), `course` (lessons and reference code) and `ignite` (the codebase Atlas will search). Part 1 starts your own project, `my-atlas`.

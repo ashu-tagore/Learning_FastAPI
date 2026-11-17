@@ -32,7 +32,7 @@ Full lesson list: [docs/context/04-curriculum.md](docs/context/04-curriculum.md)
 ## How to use this repo
 
 - **Read the course** on the course site (link added once GitHub Pages is live), or in `course/`.
-- **Write your own code** in `workspace/` or in your fork.
+- **Write your own code** in your own repository, `my-atlas`, which you create in lesson 1.1.
 - **Compare** with the reference implementation in `atlas/` at the matching checkpoint tag (`git checkout checkpoint-04`).
 
 ## Project documentation

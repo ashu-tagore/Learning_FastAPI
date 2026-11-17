@@ -1,0 +1,239 @@
+---
+title: "1.2 Values, variables, types, operators"
+description: "Store values in variables, know the basic types, combine values with operators, and build the 'path:line: text' format Atlas prints."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 2 · About 45 minutes
+:::
+
+::: {.callout-note title="Analogy: labelled jars"}
+A **value** is a thing: the number 42, the text `"engine.py"`. A **variable** is a label you stick on it so you can refer to it later. Every value also has a **type**, like the kind of jar it's in: you can add numbers, you can glue pieces of text together, but adding a number to a piece of text makes no sense, and Python will tell you so.
+:::
+
+## Variables
+
+```python
+path = "ignite/engine/engine.py"
+line_number = 42
+text = "    self.fire_event(Events.STARTED)"
+```
+
+`=` means "make this name refer to this value" (not "is equal to"). Names use lowercase words joined by underscores (`line_number`), a style called **snake_case**. Choose names that say what the value *means*: `line_number`, not `n`.
+
+You can point a name at a new value at any time:
+
+```python
+count = 0
+count = count + 1   # count is now 1
+count += 1          # shorthand for the same thing; count is now 2
+```
+
+Anything after `#` is a **comment**: a note for humans that Python ignores.
+
+## The basic types
+
+| Type | Name in Python | Examples |
+|---|---|---|
+| Whole number | `int` | `42`, `-7`, `1_000_000` |
+| Decimal number | `float` | `3.5`, `0.1` |
+| Text | `str` (string) | `"engine.py"`, `'hello'` |
+| True or false | `bool` (boolean) | `True`, `False` |
+| Nothing | `NoneType` | `None` |
+
+`type()` tells you a value's type:
+
+```python
+print(type(path), type(line_number), type(3.5), type(True), type(None))
+```
+```text
+<class 'str'> <class 'int'> <class 'float'> <class 'bool'> <class 'NoneType'>
+```
+
+`None` means "no value": for example, "this file has no line count because it isn't a text file". You will see it a lot.
+
+## Numbers and operators
+
+```python
+print(7 + 3, 7 - 3, 7 * 3, 7 / 2, 7 // 2, 7 % 2, 2 ** 10)
+```
+```text
+10 4 21 3.5 3 1 1024
+```
+
+| Operator | Means |
+|---|---|
+| `/` | divide, always giving a `float` |
+| `//` | divide and drop the remainder |
+| `%` | the remainder ("modulo"): `7 % 2` is 1, so 7 is odd |
+| `**` | power |
+
+Floats are stored in binary, so some decimals can't be represented exactly: `0.1 + 0.2` gives `0.30000000000000004`. This is true in every language. Never use floats for money; you will see the alternative when it matters.
+
+## Strings
+
+A string is a sequence of characters, written in single or double quotes.
+
+```python
+print(len(path))
+print(path[0], path[-1], path[0:6], path[7:])
+```
+```text
+23
+i y ignite engine/engine.py
+```
+
+- `len()` gives the number of characters.
+- `path[0]` is the first character: positions start at **0**. `path[-1]` is the last.
+- `path[0:6]` is a **slice**: characters from position 0 up to, but not including, 6. Leave out a side to mean "from the start" or "to the end".
+
+Strings can be joined with `+`, but the clearest way to build text from values is an **f-string**: put `f` before the quotes and variables inside `{}`.
+
+```python
+print(path + ":" + str(line_number))
+print(f"{path}:{line_number}: {text.strip()}")
+```
+```text
+ignite/engine/engine.py:42
+ignite/engine/engine.py:42: self.fire_event(Events.STARTED)
+```
+
+That second line is exactly the format Atlas will print for every match: **path, line number, text**. `.strip()` removes spaces from both ends; it is a **method**, a function that belongs to a value and is called with a dot. You'll meet many string methods in lesson 1.7.
+
+## Comparisons and booleans
+
+Comparisons produce `True` or `False`:
+
+```python
+print(line_number > 40, line_number == 42, path != "README.md")
+print("fire" in text, "Fire" in text)
+```
+```text
+True True True
+True False
+```
+
+- `==` checks equality (one `=` assigns, two compare).
+- `!=` means "not equal". Also `<`, `<=`, `>`, `>=`.
+- `in` checks whether one string appears inside another. It is **case-sensitive**: `"Fire"` is not in the text.
+
+Combine booleans with `and`, `or` and `not`. When a condition has several parts, give each part a name: it reads like a sentence and keeps your head clear.
+
+```python
+is_python = path.endswith(".py")
+is_test = path.startswith("tests/")
+print(is_python and not is_test)
+```
+```text
+True
+```
+
+## Converting between types
+
+Python won't guess what you mean when types don't match:
+
+```python
+>>> "line " + 42
+TypeError: can only concatenate str (not "int") to str
+```
+
+Convert explicitly:
+
+```python
+print(int("42") + 1, float("2.5"), str(7) + "7")
+```
+```text
+43 2.5 77
+```
+
+`str(7) + "7"` is `"77"`: joining text, not adding numbers. Data from the outside world (files, the terminal, the web) always arrives as text, so you will convert often.
+
+## In the project
+
+Replace `main.py` in `my-atlas` with a small program that describes one search result:
+
+```python
+path = "ignite/engine/engine.py"
+line_number = 890
+text = "    def run("
+
+is_python_file = path.endswith(".py")
+is_inside_package = path.startswith("ignite/")
+
+print(f"{path}:{line_number}: {text.strip()}")
+print(f"Python file: {is_python_file}, part of the package: {is_inside_package}")
+```
+
+```text
+$ uv run main.py
+ignite/engine/engine.py:890: def run(
+Python file: True, part of the package: True
+```
+
+Line 890 of Ignite's `engine.py` really is where `def run(` is (at the commit used for this course): in lesson 1.9 your program will find it by itself.
+
+## Common mistakes
+
+- **`=` versus `==`.** `if count = 3` is an error; comparison is `==`.
+- **Forgetting the `f`** in an f-string: `"{path}"` prints the braces literally.
+- **Off-by-one slicing.** The end position is excluded: `"engine"[0:3]` is `"eng"`.
+- **Mixing types** without converting: `"line " + 42`.
+- **Case sensitivity.** `"Events" in text` and `"events" in text` are different checks.
+
+## Check yourself
+
+**1.** What does `"ignite/engine.py"[-3:]` give?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`".py"`: the last three characters. A negative position counts from the end, and leaving out the end of the slice means "to the end".
+:::
+
+**2.** What are the values of `17 // 5` and `17 % 5`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`3` and `2`: 17 divided by 5 is 3 with remainder 2.
+:::
+
+**3.** Why does `print("count: " + count)` fail when `count` is `3`, and what are two ways to fix it?
+
+::: {.callout-tip collapse="true" title="Answer"}
+You can't join a `str` and an `int`. Fix with `"count: " + str(count)` or, more readably, `f"count: {count}"`.
+:::
+
+## Exercise
+
+Given `path = "tests/ignite/metrics/test_accuracy.py"`, write a program that prints:
+
+1. The file name only (`test_accuracy.py`), using a slice. Hint: count the characters before it, or use `path[-16:]`.
+2. Whether it is a test file (starts with `tests/`) **and** a Python file, using two named booleans.
+3. The line `tests/ignite/metrics/test_accuracy.py:12: def test_binary():` built with one f-string from variables.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+path = "tests/ignite/metrics/test_accuracy.py"
+line_number = 12
+text = "def test_binary():"
+
+print(path[-16:])
+
+is_test = path.startswith("tests/")
+is_python = path.endswith(".py")
+print(is_test and is_python)
+
+print(f"{path}:{line_number}: {text}")
+```
+
+Counting characters by hand is fragile; in lesson 1.7 you will use `path.split("/")[-1]`, and in 1.9 `Path(path).name`, which work for any path.
+:::
+
+## Stretch
+
+Python strings have dozens of methods. In the REPL, try `dir("text")` to list them. Find three you can guess the meaning of, try each on `"  Events.STARTED  "`, and write down what they do.
+
+::: {.callout-tip collapse="true" title="Example answer"}
+`"  Events.STARTED  ".lower()` gives `'  events.started  '`; `.strip()` gives `'Events.STARTED'`; `.replace(".", "_")` gives `'  Events_STARTED  '`; `.count("E")` gives `2`. Names starting with `__` in the list are internal; ignore them for now.
+:::
+
+## What changed in the project
+
+`main.py` now builds and prints a search result in Atlas's `path:line: text` format. Commit it: `feat: Printed a sample search result`.

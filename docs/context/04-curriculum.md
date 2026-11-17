@@ -18,7 +18,7 @@ Parts 1 to 8 end with a **Review and practice** lesson: mixed exercises without 
 
 | Id | Lesson | Builds |
 |---|---|---|
-| 1.1 | Installing Python with uv, running code, the REPL | `workspace/` project |
+| 1.1 | Installing Python with uv, running code, the REPL | Your `my-atlas` repository |
 | 1.2 | Values, variables, types, operators | |
 | 1.3 | Control flow: conditions and loops; reading code like a computer | |
 | 1.4 | Functions and modules | |

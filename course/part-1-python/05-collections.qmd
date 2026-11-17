@@ -1,0 +1,283 @@
+---
+title: "1.5 Collections"
+description: "Store many values with lists, tuples, dictionaries and sets, choose the right one for the job, and get a first feel for how fast operations are (Big-O)."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 5 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: four kinds of storage"}
+- A **list** is a queue of people: ordered, you can add or remove people, and the same person could appear twice.
+- A **tuple** is a printed ticket: a fixed group of values (seat, row, date) that never changes.
+- A **dictionary** is a coat check: you hand in a ticket number (the **key**) and get exactly one coat (the **value**) back, instantly.
+- A **set** is a guest list: each name appears once, and checking "is this person on the list?" is instant.
+:::
+
+## Lists
+
+A **list** holds values in order, inside square brackets:
+
+```python
+matches = []
+matches.append((3, "self.fire_event(Events.STARTED)"))
+matches.append((4, "self.fire_event(Events.COMPLETED)"))
+print(len(matches), matches[0], matches[-1])
+```
+```text
+2 (3, 'self.fire_event(Events.STARTED)') (4, 'self.fire_event(Events.COMPLETED)')
+```
+
+- `[]` is an empty list; `.append(x)` adds to the end; `len()` counts the items.
+- Indexing and slicing work exactly like strings: `matches[0]`, `matches[-1]`, `matches[1:]`.
+- Lists can change: `matches[0] = ...` replaces an item, `.remove(x)` and `.pop()` take items out.
+- `.sort()` sorts a list **in place**; `sorted(x)` returns a new sorted list and leaves `x` alone.
+
+```python
+numbers = [5, 3, 9, 1]
+numbers.sort()
+print(numbers, sorted(["metrics.py", "engine.py", "README.md"]))
+```
+```text
+[1, 3, 5, 9] ['README.md', 'engine.py', 'metrics.py']
+```
+
+(`README.md` comes first because uppercase letters sort before lowercase ones.)
+
+## Tuples
+
+Each match above is a **tuple**: values in round brackets, grouped together, that can't be changed after creation. Use a tuple for a small, fixed bundle where each position has a meaning: (line number, line text).
+
+You can **unpack** a tuple into separate variables in one go:
+
+```python
+line_number, line = matches[0]
+print(line_number, line)
+```
+```text
+3 self.fire_event(Events.STARTED)
+```
+
+## Dictionaries
+
+A **dictionary** (`dict`) maps keys to values. It answers "what is the value for this key?" instantly. Here it counts matches per file:
+
+```python
+counts = {}
+for path in ["engine.py", "metrics.py", "engine.py", "engine.py"]:
+    counts[path] = counts.get(path, 0) + 1
+print(counts)
+print(counts["engine.py"], counts.get("missing.py"), counts.get("missing.py", 0))
+```
+```text
+{'engine.py': 3, 'metrics.py': 1}
+3 None 0
+```
+
+- `counts[key] = value` sets a value; `counts[key]` reads it, and raises `KeyError` if the key is missing.
+- `counts.get(key, default)` reads it safely, returning the default (or `None`) if missing. That's what makes the counting line work for a file seen for the first time.
+- Keys must be unchangeable values (strings, numbers, tuples). Values can be anything.
+
+Loop over keys and values together with `.items()`:
+
+```python
+for path, count in counts.items():
+    print(path, count)
+```
+```text
+engine.py 3
+metrics.py 1
+```
+
+Dictionaries remember insertion order. You will see them everywhere: JSON from web APIs (lesson 2.5) arrives as dictionaries.
+
+## Sets
+
+A **set** holds unique values, with no order:
+
+```python
+extensions = [".py", ".md", ".py", ".rst", ".md"]
+print(set(extensions))
+print(".py" in {".py", ".md"})
+```
+```text
+{'.rst', '.py', '.md'}
+True
+```
+
+Duplicates disappear. The printed order of a set can differ between runs; never rely on it. Use sets to remove duplicates and for fast "is it in here?" checks.
+
+## How fast is "in"? A first look at Big-O
+
+To check `x in some_list`, Python looks at the items one by one until it finds `x` or reaches the end. Double the list, double the work. To check `x in some_set` (or a dictionary key), Python computes where `x` would be stored and looks only there: the time barely changes however big the set grows.
+
+Measured on a million file names:
+
+```python
+import time
+
+names_list = [f"file{n}.py" for n in range(1_000_000)]
+names_set = set(names_list)
+
+start = time.perf_counter()
+"file999999.py" in names_list
+list_seconds = time.perf_counter() - start
+
+start = time.perf_counter()
+"file999999.py" in names_set
+set_seconds = time.perf_counter() - start
+
+print(f"list: {list_seconds * 1000:.3f} ms, set: {set_seconds * 1000:.4f} ms")
+```
+```text
+list: 12.103 ms, set: 0.0022 ms
+```
+
+(The first line builds a list with a *comprehension*, explained in lesson 1.6. Your timings will differ; the gap won't.)
+
+Engineers describe how work grows with input size using **Big-O notation**:
+
+| Notation | Name | Meaning | Example |
+|---|---|---|---|
+| O(1) | constant | same time whatever the size | `x in some_set`, `d[key]` |
+| O(n) | linear | time grows with the size | `x in some_list`, a `for` loop over all items |
+| O(n²) | quadratic | double the input, four times the work | a loop inside a loop over the same items |
+
+You don't need maths for this; just ask "if the data were ten times bigger, how much more work would this do?". It matters when your code runs on Ignite's 400 files, and much more when a database holds millions of rows (Part 3).
+
+## Choosing a collection
+
+| You need | Use |
+|---|---|
+| Items in order, possibly repeated | list |
+| A fixed bundle of related values | tuple |
+| Look up a value by a key | dict |
+| Unique items, fast membership checks | set |
+
+## In the project
+
+Change `search.py` so the search **returns** its results instead of printing them, as a list of `(line_number, line)` tuples:
+
+```python
+def find_matches(text: str, query: str, ignore_case: bool = False) -> list[tuple[int, str]]:
+    matches = []
+    line_number = 0
+    for line in text.splitlines():
+        line_number += 1
+        if line_matches(line, query, ignore_case):
+            matches.append((line_number, line.strip()))
+    return matches
+```
+
+The type hint `list[tuple[int, str]]` reads "a list of tuples, each holding an int and a str". Now `main.py` decides what to do with the results:
+
+```python
+matches = find_matches(sample, "fire_event")
+for line_number, line in matches:
+    print(f"engine.py:{line_number}: {line}")
+print(f"{len(matches)} matches")
+```
+
+Separating "finding" from "showing" is a big step: the same `find_matches` will later feed a terminal, a JSON file, a web API and an AI model.
+
+## Common mistakes
+
+- **`list.sort()` returns `None`.** `numbers = numbers.sort()` loses your list. Use `numbers.sort()` alone, or `numbers = sorted(numbers)`.
+- **`KeyError`** from `d[key]` on a missing key. Use `.get()` when the key might not be there.
+- **Changing a list while looping over it.** Removing items mid-loop skips elements. Build a new list instead.
+- **`{}` is an empty dict, not an empty set.** An empty set is `set()`.
+
+## Check yourself
+
+**1.** You need to record, for each file path, how many lines it has. Which collection?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A dictionary: path as the key, line count as the value, e.g. `{"ignite/engine/engine.py": 1500}`.
+:::
+
+**2.** Why is `x in big_set` much faster than `x in big_list`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A list is checked item by item (O(n)); a set jumps straight to where `x` would be stored (O(1)), so the time doesn't grow with its size.
+:::
+
+**3.** What does this print?
+
+```python
+point = (3, "engine.py")
+line_number, path = point
+print(path, line_number)
+```
+
+::: {.callout-tip collapse="true" title="Answer"}
+`engine.py 3`. The tuple is unpacked into the two variables in order.
+:::
+
+## Exercise
+
+Given this list of matches across files:
+
+```python
+results = [
+    ("ignite/engine/engine.py", 890),
+    ("README.md", 227),
+    ("ignite/engine/engine.py", 1021),
+    ("ignite/metrics/accuracy.py", 41),
+    ("README.md", 229),
+]
+```
+
+1. Build a dictionary counting matches per file and print each file with its count.
+2. Print the set of distinct file extensions (hint: `path[path.rfind("."):]` slices from the last dot).
+3. Print the list of files sorted alphabetically, without duplicates.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+counts = {}
+extensions = set()
+for path, line_number in results:
+    counts[path] = counts.get(path, 0) + 1
+    extensions.add(path[path.rfind("."):])
+
+for path, count in counts.items():
+    print(path, count)
+print(extensions)
+print(sorted(set(path for path, line_number in results)))
+```
+```text
+ignite/engine/engine.py 2
+README.md 2
+ignite/metrics/accuracy.py 1
+{'.py', '.md'}
+['README.md', 'ignite/engine/engine.py', 'ignite/metrics/accuracy.py']
+```
+
+Your set may print in a different order. The last line uses a *generator expression*, coming properly in lesson 1.6. A simpler way is `sorted(counts)`: looping over a dict gives its keys, which are already unique.
+:::
+
+## Stretch
+
+Write a function `most_matched_file(results)` that returns the path with the most matches, using your counting dictionary. Then think: what is its Big-O, in terms of the number of results *n*?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def most_matched_file(results: list[tuple[str, int]]) -> str | None:
+    counts = {}
+    for path, line_number in results:
+        counts[path] = counts.get(path, 0) + 1
+
+    best_path = None
+    best_count = 0
+    for path, count in counts.items():
+        if count > best_count:
+            best_path = path
+            best_count = count
+    return best_path
+```
+
+O(n): one pass to count, and one pass over at most *n* distinct paths. Ties keep the first path seen. With an empty list it returns `None`.
+:::
+
+## What changed in the project
+
+`find_matches` returns a list of `(line_number, line)` tuples, and `main.py` prints them and a total. Commit: `feat: Returned search results as a list`.

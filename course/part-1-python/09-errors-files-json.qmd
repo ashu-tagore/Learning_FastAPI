@@ -1,0 +1,358 @@
+---
+title: "1.9 Errors, files, paths, JSON and type hints"
+description: "Read tracebacks, handle errors deliberately, read and write files, walk folders with pathlib, save results as JSON, and make your types explicit. Atlas searches a real codebase."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 9 · About 80 minutes
+:::
+
+::: {.callout-note title="Analogy: a delivery driver's plan B"}
+A good delivery driver has a plan for each thing that can go wrong: nobody home (leave a card), wrong address (call the office), road closed (reroute). They don't stop working the moment something unexpected happens, and they don't pretend it didn't happen either. **Exception handling** is your program's plan B: deciding in advance which problems you can deal with, and how.
+:::
+
+## Reading a traceback
+
+When something goes wrong, Python raises an **exception** and, if nothing handles it, stops with a **traceback**:
+
+```python
+def average(numbers):
+    return sum(numbers) / len(numbers)
+
+print(average([]))
+```
+```text
+Traceback (most recent call last):
+  File "/tmp/snip/crash.py", line 4, in <module>
+    print(average([]))
+          ~~~~~~~^^^^
+  File "/tmp/snip/crash.py", line 2, in average
+    return sum(numbers) / len(numbers)
+           ~~~~~~~~~~~~~^~~~~~~~~~~~~~
+ZeroDivisionError: division by zero
+```
+
+Read it **from the bottom up**:
+
+1. The last line says *what* happened: `ZeroDivisionError: division by zero`.
+2. The lines above say *where*: line 2, inside `average`, which was called from line 4. The `~~~^^^` markers point at the exact expression.
+
+Most bugs are solved by reading the traceback slowly instead of guessing.
+
+## Handling exceptions
+
+```python
+try:
+    text = path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    print(f"no such file: {path}")
+except UnicodeDecodeError:
+    print(f"not a text file: {path}")
+else:
+    print(f"read {len(text)} characters")
+finally:
+    print("done")
+```
+
+- Code in `try` runs; if it raises an exception listed in an `except`, that block runs instead of crashing.
+- `else` runs only if nothing was raised. `finally` always runs, error or not (used for cleanup).
+- `except SomeError as error:` gives you the exception object, whose text explains the problem.
+
+**Catch specific exceptions, and only ones you can do something about.** A bare `except:` or `except Exception:` also hides bugs you didn't anticipate. If you can't handle a problem sensibly, let it crash loudly; that's information.
+
+You can raise exceptions yourself when your function is given something it can't work with:
+
+```python
+if limit < 1:
+    raise ValueError(f"limit must be at least 1, got {limit}")
+```
+
+## Files
+
+```python
+with open("notes.txt", "w", encoding="utf-8") as file:
+    file.write("first line\n")
+
+with open("notes.txt", encoding="utf-8") as file:
+    for line in file:
+        print(line.rstrip("\n"))
+```
+
+- `open(name, mode)`: mode `"r"` reads (the default), `"w"` writes (replacing the file), `"a"` appends.
+- `with` makes sure the file is **closed** when the block ends, even if an error happens inside. Always use it.
+- Looping over an open file gives **one line at a time**, each ending in `"\n"`, like a generator: memory stays flat however big the file is.
+- Always pass `encoding="utf-8"` (lesson 1.7). Without it, the default depends on the operating system, and code that works on Linux can break on Windows.
+
+## Paths with pathlib
+
+The `pathlib` module represents paths as objects instead of plain strings. Here it is on your Ignite clone, run from `~/code`:
+
+```python
+from pathlib import Path
+
+root = Path("ignite")
+engine = root / "ignite" / "engine" / "engine.py"
+print(engine, engine.name, engine.suffix, engine.parent)
+print(engine.exists(), engine.is_file(), root.is_dir())
+
+with engine.open(encoding="utf-8") as file:
+    for line_number, line in enumerate(file, start=1):
+        if "def run(" in line:
+            print(f"{engine.relative_to(root)}:{line_number}: {line.strip()}")
+
+python_files = sorted(root.rglob("*.py"))
+print(len(python_files), python_files[0])
+```
+```text
+ignite/ignite/engine/engine.py engine.py .py ignite/ignite/engine
+True True True
+ignite/engine/engine.py:890: def run(
+362 ignite/assets/tldr/teaser.py
+```
+
+That's your first real search of a real codebase: `def run(` is on line 890 of Ignite's engine.
+
+| Path feature | Gives |
+|---|---|
+| `a / "b" / "c.py"` | joins paths (the `/` works on every OS, even Windows) |
+| `.name`, `.suffix`, `.parent` | `engine.py`, `.py`, the containing folder |
+| `.exists()`, `.is_file()`, `.is_dir()` | checks |
+| `.open()`, `.read_text()`, `.write_text()` | reading and writing |
+| `.rglob("*.py")` | every matching file in all subfolders, recursively |
+| `.relative_to(root)` | the path as seen from `root` |
+| `Path.home()`, `.expanduser()` | your home folder; expand a leading `~` |
+
+## JSON
+
+**JSON** (JavaScript Object Notation) is the text format the web uses to exchange data. It looks almost exactly like Python dicts and lists, and the `json` module converts between them:
+
+```python
+import json
+
+numbers = {"files": 362, "lines": 85932}
+text = json.dumps(numbers)
+print(text, type(text))
+print(json.loads(text)["files"])
+print(json.dumps([{"path": "README.md", "line_number": 227}], indent=2))
+```
+```text
+{"files": 362, "lines": 85932} <class 'str'>
+362
+[
+  {
+    "path": "README.md",
+    "line_number": 227
+  }
+]
+```
+
+`dumps` turns Python data into a JSON string ("dump to string"); `loads` parses one back. JSON only knows strings, numbers, booleans, null (`None`), lists and objects (dicts), so a `Path` must be converted with `str()` first. From Part 2 on, nearly every piece of data Atlas exchanges is JSON.
+
+## Two errors Atlas must expect
+
+```text
+error: [Errno 2] No such file or directory: 'missing.txt'
+error: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+```
+
+The first is `FileNotFoundError`. The second is `UnicodeDecodeError`, raised when a file isn't UTF-8 text: Ignite's `assets` folder has images, and a misnamed binary file would crash a naive search. Atlas should skip such files, not crash, so it catches exactly that exception.
+
+## Type hints, properly
+
+You've been writing hints since lesson 1.4. The full vocabulary you need:
+
+| Hint | Means |
+|---|---|
+| `int`, `str`, `bool`, `Path` | that type |
+| `list[str]` | a list of strings |
+| `dict[str, int]` | a dict with string keys and int values |
+| `tuple[int, str]` | a pair: int then str |
+| `tuple[str, ...]` | a tuple of any number of strings |
+| `int \| None` | an int or `None` |
+| `Iterator[Path]` | something that produces paths one at a time (a generator), from `collections.abc` |
+| `-> None` | the function returns nothing |
+
+Hints don't change how Python runs, but a **type checker** (mypy, set up in lesson 1.10) reads them and reports mistakes like passing a `str` where a `Path` is needed, before you run anything.
+
+## In the project
+
+This is the step where `my-atlas` searches a whole folder. Replace `search.py` with:
+
+```python
+import re
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_EXTENSIONS = (".py", ".md", ".rst")
+
+# Tool and cache folders hold thousands of files nobody wants in search results.
+SKIPPED_FOLDERS = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
+
+
+@dataclass(frozen=True)
+class Match:
+    path: Path  # relative to the folder that was searched
+    line_number: int
+    line: str
+
+
+def iter_source_files(root: Path, extensions: tuple[str, ...]) -> Iterator[Path]:
+    """Yield files under root with one of the given extensions, in a stable order."""
+    for path in sorted(root.rglob("*")):
+        relative_parts = path.relative_to(root).parts
+        is_in_skipped_folder = any(part in SKIPPED_FOLDERS for part in relative_parts)
+        if is_in_skipped_folder:
+            continue
+
+        is_wanted_file = path.is_file() and path.suffix in extensions
+        if is_wanted_file:
+            yield path
+
+
+def search_file(path: Path, pattern: re.Pattern[str]) -> Iterator[tuple[int, str]]:
+    """Yield (line_number, line) for each line in the file that matches."""
+    try:
+        # Reading line by line keeps memory flat even for very large files.
+        with path.open(encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if pattern.search(line):
+                    yield line_number, line.rstrip("\n")
+    except UnicodeDecodeError:
+        # Not a UTF-8 text file (an image saved as .md, for example): skip it.
+        return
+
+
+def search(
+    root: Path,
+    query: str,
+    *,
+    ignore_case: bool = False,
+    use_regex: bool = False,
+    extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
+    limit: int | None = None,
+) -> list[Match]:
+    """Search every source file under root and return matches in file order."""
+    pattern = build_pattern(query, ignore_case=ignore_case, use_regex=use_regex)
+    matches: list[Match] = []
+
+    for path in iter_source_files(root, extensions):
+        for line_number, line in search_file(path, pattern):
+            matches.append(Match(path.relative_to(root), line_number, line.strip()))
+
+            reached_limit = limit is not None and len(matches) >= limit
+            if reached_limit:
+                return matches
+
+    return matches
+```
+
+Keep `build_pattern` from lesson 1.7 in the same file.
+
+```{mermaid}
+flowchart LR
+  Q[query + options] --> BP[build_pattern<br/>compiled regex]
+  R[root folder] --> IF[iter_source_files<br/>yields .py .md .rst paths<br/>skips .git, .venv, ...]
+  IF --> SF[search_file<br/>yields matching lines<br/>skips non-UTF-8 files]
+  BP --> SF
+  SF --> M[Match objects<br/>path, line_number, line]
+  M --> L{limit reached?}
+  L -->|yes| OUT[return matches]
+  L -->|no| SF
+```
+
+What each piece does:
+
+- `iter_source_files` walks the folder, skipping tool folders (`.git` alone holds thousands of internal files), and yields only files with the wanted extensions. `.parts` splits a path into its folder names. Sorting makes results come out in the same order on every computer.
+- `search_file` reads one file line by line and yields matches, skipping non-text files.
+- `search` ties them together and stops early at `limit`.
+
+Try it from `main.py`:
+
+```python
+from pathlib import Path
+
+from search import search
+
+for match in search(Path.home() / "code" / "ignite", "class Engine", limit=5):
+    print(f"{match.path}:{match.line_number}: {match.line}")
+```
+
+This is, line for line, the `search.py` in the course's reference code (`atlas/src/atlas/search.py`). Lesson 1.10 turns it into a real command.
+
+## Common mistakes
+
+- **No `with`** around `open`: files stay open, and on some systems writes are lost.
+- **No `encoding="utf-8"`.** Works on your machine, fails on someone else's.
+- **Catching everything.** `except Exception: pass` turns every future bug into silence.
+- **Building paths with `+`**: `folder + "/" + name` breaks on Windows and on trailing slashes. Use `Path` and `/`.
+- **Forgetting `str()`** before putting a `Path` into JSON: `TypeError: Object of type PosixPath is not JSON serializable`.
+
+## Check yourself
+
+**1.** In a traceback, which line tells you the kind of error, and which lines tell you where it happened?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The **last** line names the exception and message. The `File "...", line N, in name` lines above it show the chain of calls, with the place the error happened at the bottom.
+:::
+
+**2.** Why does `search_file` catch `UnicodeDecodeError` but not `FileNotFoundError`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A binary file in the codebase is normal and expected: skipping it is the right response. A file disappearing between listing and reading is unexpected; there's no sensible plan B inside `search_file`, so it should surface as an error rather than be silently hidden.
+:::
+
+**3.** What do `json.dumps` and `json.loads` do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`dumps` converts Python data (dicts, lists, strings, numbers, booleans, None) into a JSON string. `loads` parses a JSON string back into Python data.
+:::
+
+## Exercise
+
+Add a `--json`-style option to `main.py` by hand: a variable `as_json = True` at the top. When it is true, print the results as a JSON list of objects with keys `path`, `line_number` and `line`, instead of the `path:line: text` lines. Then save the JSON to a file `results.json` as well.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import json
+from pathlib import Path
+
+from search import search
+
+as_json = True
+matches = search(Path.home() / "code" / "ignite", "Engine", limit=2)
+
+if as_json:
+    records = [
+        {"path": str(match.path), "line_number": match.line_number, "line": match.line}
+        for match in matches
+    ]
+    text = json.dumps(records, indent=2)
+    print(text)
+    Path("results.json").write_text(text, encoding="utf-8")
+else:
+    for match in matches:
+        print(f"{match.path}:{match.line_number}: {match.line}")
+```
+
+Add `results.json` to `.gitignore`: it's output, not source.
+:::
+
+## Stretch
+
+Make `search` raise a clear `ValueError` when `root` is not a folder, and when `limit` is given but less than 1. Then call it badly and read the traceback you produced.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+    if not root.is_dir():
+        raise ValueError(f"not a folder: {root}")
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
+```
+
+Put these checks at the top of `search`, before any work. The reference code makes a different choice for the folder check: the command-line layer (lesson 1.10) checks it and prints a friendly message, because "you typed a wrong path" is a user mistake, not a programming error.
+:::
+
+## What changed in the project
+
+`my-atlas` now searches every `.py`, `.md` and `.rst` file in a real codebase, skipping tool folders and binary files. Commit: `feat: Searched a whole folder of files`.
