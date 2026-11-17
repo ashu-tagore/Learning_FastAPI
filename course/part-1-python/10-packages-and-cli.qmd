@@ -1,0 +1,335 @@
+---
+title: "1.10 Packages, dependencies and project layout"
+description: "Turn my-atlas into a proper package with an atlas command, understand virtual environments, dependencies and lockfiles, and add formatting, linting and type checking."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 10 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: from a home kitchen to a product on a shelf"}
+So far your code is a home recipe: it works in your kitchen, run your way. A **package** is the same food in labelled, sealed packaging, with a list of ingredients, so anyone can install it and use it the same way. The **command-line interface** is the instructions printed on the box: what you can do with it and which options exist.
+:::
+
+## Modules, packages and the src layout
+
+- A **module** is one `.py` file.
+- A **package** is a folder of modules with an `__init__.py` file, which marks it as importable (it can be empty).
+
+Professional Python projects put their package inside a `src` folder:
+
+```text
+my-atlas/
+├── pyproject.toml        project settings, dependencies, the atlas command
+├── uv.lock               exact versions of every dependency
+├── README.md
+├── src/
+│   └── atlas/            the package: `import atlas`
+│       ├── __init__.py
+│       ├── cli.py        the command line
+│       └── search.py     the search logic (lesson 1.9)
+└── tests/                lesson 1.11
+```
+
+Why `src/`? It guarantees your code is imported the same way users will import it (as an installed package), not by accident because you happened to run Python from the project folder. Bugs caused by that accident are confusing; the layout removes them.
+
+## Restructure my-atlas
+
+In your `my-atlas` folder:
+
+```bash
+mkdir -p src/atlas
+touch src/atlas/__init__.py
+git mv search.py src/atlas/search.py
+git rm main.py
+```
+
+`git mv` and `git rm` move and delete files *and* tell Git, so history follows the file. Inside a package, imports name the package: `from atlas.search import search`.
+
+Now edit `pyproject.toml`. Change the name to `atlas`, and add two sections at the end:
+
+```toml
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Search a codebase from the command line"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+atlas = "atlas.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+```
+
+- `[project.scripts]` creates a command called `atlas` that calls the `main` function in `atlas/cli.py`.
+- `[build-system]` says which tool packages the code. Use the first two numbers of your `uv --version` for the range: with uv `0.12.3`, write `uv_build>=0.12,<0.13`. The upper bound protects you from a future version that works differently. (TOML, the format of this file, is a simple settings format: `[sections]` of `key = value` lines.)
+
+## A command-line interface with argparse
+
+Users shouldn't edit your code to change the query. The standard library's `argparse` reads options from the command line, validates them, and generates help text. Create `src/atlas/cli.py`:
+
+```python
+"""The `atlas` command line."""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+from atlas.search import DEFAULT_EXTENSIONS, search
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="atlas", description="Explore a codebase.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="find lines containing a query")
+    search_parser.add_argument("query", help="text to look for")
+    search_parser.add_argument("--path", type=Path, default=Path("."), help="folder to search")
+    search_parser.add_argument("-i", "--ignore-case", action="store_true")
+    search_parser.add_argument("--regex", action="store_true", help="treat query as a regex")
+    search_parser.add_argument("--limit", type=int, default=None, help="stop after N matches")
+    search_parser.add_argument("--json", action="store_true", help="print results as JSON")
+    search_parser.add_argument(
+        "--ext",
+        nargs="+",
+        default=list(DEFAULT_EXTENSIONS),
+        help="file extensions to include (default: .py .md .rst)",
+    )
+    return parser
+
+
+def run_search(args: argparse.Namespace) -> int:
+    try:
+        matches = search(
+            args.path,
+            args.query,
+            ignore_case=args.ignore_case,
+            use_regex=args.regex,
+            extensions=tuple(args.ext),
+            limit=args.limit,
+        )
+    except re.error as error:
+        print(f"atlas: invalid regular expression: {error}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        records = [
+            {"path": str(match.path), "line_number": match.line_number, "line": match.line}
+            for match in matches
+        ]
+        print(json.dumps(records, indent=2))
+        return 0
+
+    for match in matches:
+        print(f"{match.path}:{match.line_number}: {match.line}")
+
+    # The count goes to stderr so `atlas search ... > results.txt` saves only the results.
+    noun = "match" if len(matches) == 1 else "matches"
+    print(f"{len(matches)} {noun}", file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    folder_exists = args.path.is_dir()
+    if not folder_exists:
+        print(f"atlas: not a folder: {args.path}", file=sys.stderr)
+        return 1
+
+    return run_search(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+The new ideas:
+
+- **Subcommands.** `add_subparsers` lets one program have several commands, like `git status` and `git commit`. Atlas has `search` now, and `stats` after the review lesson.
+- **Arguments.** `"query"` is **positional** (required, no dashes). `--path`, `--limit` are **options**. `type=Path` and `type=int` convert the text automatically and print an error if it can't. `action="store_true"` makes a flag that is `True` when present.
+- **Standard output and standard error.** Every program has two output streams. `stdout` (normal `print`) carries results; `stderr` (`file=sys.stderr`) carries messages for the human. When you redirect output to a file with `>` (lesson 0.2), only stdout goes into the file, so the summary line doesn't pollute your results.
+- **Exit codes.** When a program ends it returns a number to the shell: `0` means success, anything else means failure. `main` returns one, and `sys.exit(main())` hands it to the shell. Scripts and CI systems (Part 7) use exit codes to decide whether a step failed. In bash, `echo $?` shows the last one.
+- **`main(argv=None)`** reads the real command line when `argv` is `None`, but tests can pass a list of arguments directly (lesson 1.11).
+
+## Run it
+
+```text
+$ uv run atlas --help
+usage: atlas [-h] {search} ...
+...
+$ uv run atlas search "class Engine" --path ~/code/ignite
+ignite/engine/engine.py:20: class Engine(Serializable):
+tests/ignite/base/test_mixins.py:31: class EngineStyleSerializable(Serializable):
+tests/ignite/engine/test_memory_leaks.py:30: class EngineForTests(Engine):
+3 matches
+$ uv run atlas search 'class Engine\b' --regex --path ~/code/ignite
+ignite/engine/engine.py:20: class Engine(Serializable):
+1 match
+$ uv run atlas search "good first issue" -i --path ~/code/ignite
+CONTRIBUTING.md:75: - A good way to start is to tackle one of the [good first issues](https://github.com/pytorch/ignite/labels/good%20first%20issue).
+1 match
+```
+
+The first `uv run` builds and installs your package into `.venv`, and keeps it in sync after every change. Look at the second search: `\b` (lesson 1.7) narrows three results down to the one class you meant.
+
+Errors become clear messages with a failing exit code instead of tracebacks:
+
+```text
+$ uv run atlas search "(" --regex --path ~/code/ignite
+atlas: invalid regular expression: missing ), unterminated subpattern at position 0
+$ echo $?
+1
+```
+
+And stdout and stderr separate as designed:
+
+```text
+$ uv run atlas search Engine --path ~/code/ignite --limit 3 > results.txt
+3 matches
+$ cat results.txt
+CONTRIBUTING.md:117: - [engine](ignite/engine) - Module containing core classes like Engine, Events, State.
+CONTRIBUTING.md:349: engine = Engine(process_function)
+README.md:99: from ignite.engine import Engine, Events, create_supervised_evaluator
+```
+
+```{mermaid}
+flowchart LR
+  T["$ uv run atlas search Engine ..."] --> S["[project.scripts]<br/>atlas = atlas.cli:main"]
+  S --> P["argparse<br/>checks and converts options"]
+  P --> R["run_search"]
+  R --> F["search()<br/>atlas/search.py"]
+  F --> R
+  R -->|results| O[stdout]
+  R -->|"3 matches", errors| E[stderr]
+  R -->|0 or 1| X[exit code]
+```
+
+## Virtual environments and dependencies
+
+A **dependency** is someone else's package that yours uses. Different projects need different versions of the same package, so each project gets its own **virtual environment** (`.venv`): a private folder of installed packages. Nothing you install for `my-atlas` affects any other project.
+
+uv manages it for you:
+
+| Command | Does |
+|---|---|
+| `uv add httpx` | add a **runtime** dependency: needed by your code when it runs (you'll do this in lesson 2.5) |
+| `uv add --dev pytest` | add a **development** dependency: needed only to develop and test |
+| `uv remove httpx` | remove one |
+| `uv sync` | make `.venv` match the project exactly |
+| `uv run CMD` | sync, then run `CMD` inside the environment |
+
+Each `uv add` updates two files. `pyproject.toml` records the *range* you accept (`httpx>=0.28`). `uv.lock` records the *exact* version of every package installed, including the dependencies of your dependencies. **Commit both.** The lockfile is what makes "works on my machine" also work on your teammate's machine, in CI, and on the server.
+
+## Code-quality tools
+
+Add three development tools:
+
+```bash
+uv add --dev ruff mypy pytest
+```
+
+- **ruff** formats your code consistently (`uv run ruff format .`) and finds likely bugs and style problems (`uv run ruff check .`).
+- **mypy** checks your type hints (`uv run mypy src`).
+- **pytest** runs tests (next lesson).
+
+Configure them at the end of `pyproject.toml`:
+
+```toml
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# E/F: real errors, I: import order, B: likely bugs, UP: modern syntax, SIM: simpler code
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+strict = true
+```
+
+`strict = true` makes mypy insist on hints everywhere. It's demanding at first, and it catches real bugs. On the finished code:
+
+```text
+$ uv run ruff check .
+All checks passed!
+$ uv run mypy src
+Success: no issues found in 4 source files
+```
+
+Get in the habit of running all three before every commit. In Part 7 a CI server will run them on every push.
+
+## Common mistakes
+
+- **`ModuleNotFoundError: No module named 'atlas'`**: you ran `python src/atlas/cli.py` instead of `uv run atlas`, or `__init__.py` is missing.
+- **Old-style imports** after the move: `from search import ...` must become `from atlas.search import ...`.
+- **Not committing `uv.lock`**: other machines install different versions and behave differently.
+- **Installing packages globally** with `pip install` outside a project. Use `uv add` inside the project.
+- **Printing errors to stdout**: they end up mixed into saved results. Errors go to stderr.
+
+## Check yourself
+
+**1.** What is the difference between `pyproject.toml` and `uv.lock`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`pyproject.toml` states what the project needs, as acceptable ranges (written by you). `uv.lock` records the exact versions that were resolved for everything, including indirect dependencies (written by uv). Both are committed.
+:::
+
+**2.** Why does Atlas print `3 matches` to stderr?
+
+::: {.callout-tip collapse="true" title="Answer"}
+So that redirecting or piping the output (`> results.txt`) captures only the results. Messages for humans go to stderr, data goes to stdout.
+:::
+
+**3.** A CI script runs `atlas search "(" --regex`. How does it know the command failed?
+
+::: {.callout-tip collapse="true" title="Answer"}
+From the exit code: Atlas returns `1`, and any non-zero exit code means failure.
+:::
+
+## Exercise
+
+Add an option `--files-only` that prints each matching file's path once, instead of every matching line (like `grep -l`). Keep the order of first appearance. Print the count of files to stderr.
+
+::: {.callout-tip collapse="true" title="Solution"}
+In `build_parser`:
+
+```python
+    search_parser.add_argument(
+        "--files-only", action="store_true", help="print each matching file once"
+    )
+```
+
+In `run_search`, before the normal printing loop:
+
+```python
+    if args.files_only:
+        seen: set[Path] = set()
+        for match in matches:
+            if match.path in seen:
+                continue
+            seen.add(match.path)
+            print(match.path)
+        print(f"{len(seen)} files", file=sys.stderr)
+        return 0
+```
+
+A set makes "have I printed this already?" an O(1) check (lesson 1.5). This option isn't part of the reference code; it's your own addition.
+:::
+
+## Stretch
+
+Run `uv run ruff check --select ALL src` once, just to look. Pick two rules it reports, look them up on ruff's website, and decide whether you agree with them.
+
+::: {.callout-tip collapse="true" title="Answer"}
+`ALL` turns on hundreds of rules, many of them matters of taste (docstring formatting, for example). That's why the project selects a focused set. Linters are advice: the skill is knowing which rules protect you from bugs and which only enforce a style.
+:::
+
+## What changed in the project
+
+`my-atlas` is now a package with an `atlas search` command, options, clean errors and exit codes, plus ruff, mypy and pytest. Commit: `feat: Packaged atlas with a search command`.

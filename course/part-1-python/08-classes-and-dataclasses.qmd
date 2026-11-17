@@ -1,0 +1,240 @@
+---
+title: "1.8 Classes, objects and dataclasses"
+description: "Bundle data and behaviour into classes, create objects, use dataclasses for plain records, and prefer composition over inheritance."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 8 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: a form and filled-in copies"}
+A **class** is a blank form: it says which fields exist (name, date, amount) and what you can do with it (submit, cancel). Each filled-in copy is an **object** (an **instance**) with its own values. You design the form once and fill in as many copies as you like.
+:::
+
+## Why classes
+
+So far each match has been a tuple `(line_number, line)`. That worked until Atlas needed a third value, the file path. With tuples, `match[0]`, `match[1]` and `match[2]` mean nothing to a reader, and adding a field means changing every place that unpacks the tuple. A class gives each value a name: `match.path`, `match.line_number`, `match.line`.
+
+## Defining a class
+
+```python
+class Counter:
+    """Counts how many times each word was seen."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def add(self, word: str) -> None:
+        self.counts[word] = self.counts.get(word, 0) + 1
+
+    def most_common(self) -> str:
+        return max(self.counts, key=lambda word: self.counts[word])
+
+
+tally = Counter()
+for word in ["engine", "event", "engine"]:
+    tally.add(word)
+print(tally.counts, tally.most_common())
+print(tally)
+```
+```text
+{'engine': 2, 'event': 1} engine
+<__main__.Counter object at 0x7f33677370e0>
+```
+
+- `class Counter:` defines the class. Class names use **CapitalisedWords**.
+- `Counter()` creates a new object and runs `__init__`, the **initialiser**, which sets up its starting data.
+- `self` is the object itself. `self.counts` is an **attribute**: data stored on this particular object. Every `Counter` has its own `counts`.
+- `add` and `most_common` are **methods**: functions defined in a class. Python passes the object as `self` automatically, so you call `tally.add("engine")`, not `add(tally, "engine")`.
+- The last line prints an unhelpful default description. Dataclasses fix that.
+
+```{mermaid}
+flowchart LR
+  C["class Counter<br/>(the blank form)<br/>__init__, add, most_common"] -->|"Counter()"| O1["tally<br/>counts = {engine: 2, event: 1}"]
+  C -->|"Counter()"| O2["another_tally<br/>counts = {}"]
+```
+
+Each call to `Counter()` makes a separate object with its own `counts`; the methods are shared.
+
+Methods that start and end with double underscores (`__init__`) are called by Python itself at special moments. You'll meet a few more; you rarely call them directly.
+
+## Dataclasses: classes for records
+
+Many classes are mostly **records**: named fields and little behaviour. The `dataclass` decorator writes the boring parts for you: `__init__`, a readable description, and equality comparison.
+
+```python
+from dataclasses import dataclass, FrozenInstanceError
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Match:
+    path: Path
+    line_number: int
+    line: str
+
+
+first = Match(Path("ignite/engine/engine.py"), 3, "self.fire_event(Events.STARTED)")
+print(first)
+print(first.path, first.line_number)
+print(first == Match(Path("ignite/engine/engine.py"), 3, "self.fire_event(Events.STARTED)"))
+try:
+    first.line_number = 4
+except FrozenInstanceError as error:
+    print("error:", error)
+```
+```text
+Match(path=PosixPath('ignite/engine/engine.py'), line_number=3, line='self.fire_event(Events.STARTED)')
+ignite/engine/engine.py 3
+True
+error: cannot assign to field 'line_number'
+```
+
+- A **decorator** (`@dataclass`) is a line above a definition that modifies it. You'll meet more in Part 4: every FastAPI route starts with one.
+- Each field is written `name: type`.
+- `frozen=True` makes the object unchangeable after creation, like a tuple. A search result describes something that happened; it should never be edited by accident.
+- Two dataclass objects with equal fields are `==`, which makes them easy to test (lesson 1.11).
+- `Path` is the standard library's type for file paths. It's the star of lesson 1.9; here it's just "a path".
+
+Use a plain class when the object has meaningful behaviour and changing state (like `Counter`). Use a dataclass when it's mostly named data (like `Match`).
+
+## Composition over inheritance
+
+**Inheritance** lets a class be "a kind of" another class and reuse its code:
+
+```python
+class Animal:
+    def describe(self) -> str:
+        return f"{self.name} says {self.sound()}"
+```
+
+and a `Dog(Animal)` that only defines `sound`. It looks elegant, but understanding `Dog` now means reading `Animal` too, and in real codebases chains like `Dog → Pet → Animal → LivingThing` force readers to jump through many files to learn what one method does.
+
+**Composition** means an object *has* other objects as attributes and uses them. It keeps each class understandable on its own:
+
+```python
+@dataclass
+class ExtensionTotals:
+    files: int = 0
+    lines: int = 0
+
+
+@dataclass
+class FolderStats:
+    totals_by_extension: dict[str, ExtensionTotals]
+```
+
+A `FolderStats` *has* totals for each extension. (These two classes are exactly what you'll build in the review lesson, 1.12.)
+
+The rule this course follows: **prefer composition; inherit at most one level deep**, and only when the "is a kind of" relationship is obvious. You'll see the one-level case in Part 4, where request schemas inherit shared fields from one base schema.
+
+## In the project
+
+Add the `Match` dataclass to `search.py` and make results carry the file path. Since files arrive in lesson 1.9, for now pass the path in:
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Match:
+    path: Path  # relative to the folder that was searched
+    line_number: int
+    line: str
+
+
+def find_matches(path: Path, lines, pattern: re.Pattern[str]) -> list[Match]:
+    return [
+        Match(path, line_number, line.strip())
+        for line_number, line in enumerate(lines, start=1)
+        if pattern.search(line)
+    ]
+```
+
+And print them in `main.py`:
+
+```python
+for match in find_matches(Path("engine.py"), sample.splitlines(), pattern):
+    print(f"{match.path}:{match.line_number}: {match.line}")
+```
+
+Compare that `print` line with lesson 1.2's: it's the same `path:line: text` format, now built from a real object.
+
+## Common mistakes
+
+- **Forgetting `self`** as the first parameter of a method: `TypeError: ... takes 0 positional arguments but 1 was given`.
+- **Forgetting `self.`** when setting data in `__init__`: `counts = {}` creates a local variable that vanishes when `__init__` ends.
+- **Mutable default values** in a dataclass: `items: list = []` is an error. Use `field(default_factory=list)`, which creates a fresh list for each object.
+- **Deep inheritance chains** "to reuse code". Reach for composition first.
+
+## Check yourself
+
+**1.** What's the difference between a class and an object?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A class is the definition (the blank form). An object is one instance created from it, with its own values (a filled-in copy). `Match` is a class; `Match(Path("a.py"), 1, "x")` is an object.
+:::
+
+**2.** Why is `Match` frozen?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A search result records what was found; nothing should change it afterwards. Freezing turns an accidental edit into an immediate error instead of a silent bug.
+:::
+
+**3.** When would you write a normal class instead of a dataclass?
+
+::: {.callout-tip collapse="true" title="Answer"}
+When the object is mainly about behaviour and evolving state (a counter, a connection to a server), rather than being a record of named values.
+:::
+
+## Exercise
+
+Write a dataclass `Issue` with fields `number: int`, `title: str`, `labels: list[str]` (use `field(default_factory=list)`) and a method `is_beginner_friendly(self) -> bool` that returns `True` when `"good first issue"` is one of its labels. Create two issues and print which one is beginner friendly.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Issue:
+    number: int
+    title: str
+    labels: list[str] = field(default_factory=list)
+
+    def is_beginner_friendly(self) -> bool:
+        return "good first issue" in self.labels
+
+
+issues = [
+    Issue(3901, "Fix typo in docs", ["good first issue", "docs"]),
+    Issue(3902, "Refactor distributed launcher"),
+]
+for issue in issues:
+    print(issue.number, issue.is_beginner_friendly())
+```
+```text
+3901 True
+3902 False
+```
+
+The issue numbers here are made up. In Part 2 you'll fetch real ones from GitHub into exactly this kind of class.
+:::
+
+## Stretch
+
+Give `Match` a method `location(self) -> str` that returns `"path:line_number"`. Then think: does adding a method to a frozen dataclass break the "frozen" rule?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+    def location(self) -> str:
+        return f"{self.path}:{self.line_number}"
+```
+
+No: `frozen` stops *changing fields*; methods that only read them are fine.
+:::
+
+## What changed in the project
+
+Results are now `Match` objects with `path`, `line_number` and `line`. Commit: `feat: Represented results as Match objects`.

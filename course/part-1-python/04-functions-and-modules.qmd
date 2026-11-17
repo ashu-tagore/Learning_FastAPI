@@ -1,0 +1,232 @@
+---
+title: "1.4 Functions and modules"
+description: "Package logic into functions with parameters and return values, split code across files with modules, and understand if __name__ == '__main__'."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 4 · About 50 minutes
+:::
+
+::: {.callout-note title="Analogy: kitchen appliances"}
+A toaster has a simple **interface**: put bread in, choose a setting, get toast out. You don't need to know how the heating element works. A **function** is a small appliance you build once and then use anywhere: values go in (**parameters**), a result comes out (the **return value**), and the details stay inside.
+
+A **module** is a drawer where you keep related appliances, so the kitchen (your program) stays tidy.
+:::
+
+## Defining and calling functions
+
+```python
+def line_matches(line: str, query: str) -> bool:
+    """Return True if the line contains the query."""
+    return query in line
+```
+
+- `def` starts a function definition, followed by its name and its **parameters** in brackets.
+- `line: str` is a **type hint**: a note saying "this should be a string". `-> bool` says the function returns a boolean. Python doesn't enforce hints, but they document the function and let tools catch mistakes (lesson 1.9).
+- The string right under the `def` line is a **docstring**: it explains what the function does. `help(line_matches)` shows it.
+- `return` sends a value back to whoever called the function, and ends the function.
+
+Calling it:
+
+```python
+print(line_matches("self.fire_event(x)", "fire_event"))
+```
+```text
+True
+```
+
+A function without `return` returns `None`. Functions that only print things (and return `None`) are harder to reuse than functions that return a value: the caller can't do anything with printed text except look at it.
+
+## Default and keyword arguments
+
+Give a parameter a default value and callers can leave it out:
+
+```python
+def line_matches(line: str, query: str, ignore_case: bool = False) -> bool:
+    """Return True if the line contains the query."""
+    if ignore_case:
+        return query.lower() in line.lower()
+    return query in line
+```
+
+```python
+print(line_matches("Events.STARTED", "events"))
+print(line_matches("Events.STARTED", "events", ignore_case=True))
+```
+```text
+False
+True
+```
+
+Writing `ignore_case=True` (naming the parameter) is a **keyword argument**. Prefer it for booleans: `line_matches(line, q, True)` makes the reader wonder what `True` means; `ignore_case=True` says it.
+
+Notice the shape of the function body: handle the special case and `return` early, then the normal case follows without extra indentation.
+
+## Scope: what a function can see
+
+Variables created inside a function exist only inside it, and only while it runs. They are **local**. Two functions can both have a variable called `count` without interfering. A function should get what it needs through its parameters and give back results through `return`, not by reading or changing variables outside itself. That rule makes functions predictable and easy to test.
+
+## Modules: splitting code into files
+
+Every `.py` file is a **module**. Move the search logic into its own file, `search.py`, next to `main.py`:
+
+```python
+# search.py
+def line_matches(line: str, query: str, ignore_case: bool = False) -> bool:
+    """Return True if the line contains the query."""
+    if ignore_case:
+        return query.lower() in line.lower()
+    return query in line
+
+
+def print_matches(text: str, query: str, ignore_case: bool = False) -> None:
+    line_number = 0
+    for line in text.splitlines():
+        line_number += 1
+        if line_matches(line, query, ignore_case):
+            print(f"{line_number}: {line.strip()}")
+```
+
+Then use it from `main.py` with `import`:
+
+```python
+# main.py
+from search import line_matches, print_matches
+
+sample = """class Engine:
+    def run(self):
+        self.fire_event(Events.STARTED)"""
+
+print(line_matches("Events.STARTED", "events"))
+print(line_matches("Events.STARTED", "events", ignore_case=True))
+print_matches(sample, "EVENTS", ignore_case=True)
+```
+```text
+$ uv run main.py
+False
+True
+3: self.fire_event(Events.STARTED)
+```
+
+- `from search import line_matches` loads `search.py` and brings in that one name.
+- `import search` would bring in the whole module; you'd then write `search.line_matches(...)`.
+- Python also ships with a large **standard library** of modules: `import math`, `import json`, `import re`. You'll use many of them.
+
+```{mermaid}
+flowchart LR
+  M["main.py<br/>(runs the program)"] -->|from search import ...| S["search.py<br/>line_matches<br/>print_matches"]
+  S -->|uses| B["built-ins<br/>print, str methods"]
+```
+
+## `if __name__ == "__main__"`
+
+Now the starter code from lesson 1.1 makes sense:
+
+```python
+def main():
+    print("Hello from my-atlas!")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Python sets a special variable `__name__` in every module. When you **run** a file directly (`uv run main.py`), its `__name__` is `"__main__"`. When a file is **imported** by another, its `__name__` is the module's name (`"search"`). So this `if` means: "only run this part when the file is run directly, not when it's imported".
+
+That lets a module contain a quick demonstration that runs with `uv run search.py` but stays silent when `main.py` imports it.
+
+## Designing good functions
+
+- **One job, clearly named.** `line_matches` answers one question. If you need "and" to describe a function, it may be two.
+- **Inputs in, output out.** Parameters for everything it needs, `return` for its result.
+- **A simple interface hiding real work** is the goal. A function that takes one line and wraps a single other call adds a name to remember without saving any thinking. Make a function when it hides detail or is used in more than one place.
+
+## Common mistakes
+
+- **Calling before defining.** Python reads top to bottom; a function must be defined before the line that calls it runs.
+- **Forgetting `return`.** The function silently returns `None`, and you get errors far away, like `TypeError: 'NoneType' ...`.
+- **Forgetting the brackets.** `print(line_matches)` prints the function itself (`<function line_matches at 0x...>`), not its result.
+- **Naming your file after a standard module**, like `json.py` or `re.py`. Then `import json` imports *your* file, and nothing works. Choose distinct names.
+
+## Check yourself
+
+**1.** What does this print, and why?
+
+```python
+def double(n):
+    n * 2
+
+print(double(4))
+```
+
+::: {.callout-tip collapse="true" title="Answer"}
+`None`. The function computes `n * 2` but never returns it. Fix: `return n * 2`.
+:::
+
+**2.** What is the difference between `import search` and `from search import line_matches`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`import search` gives you the module; you call `search.line_matches(...)`. `from search import line_matches` brings just that name in; you call `line_matches(...)` directly. The first makes it obvious where a name comes from; the second is shorter. Both are fine.
+:::
+
+**3.** `search.py` ends with `print("testing")` (not inside an `if __name__ == "__main__"` block). What happens when you run `main.py`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`testing` is printed, because importing a module runs all of its top-level code. Put demonstration code under `if __name__ == "__main__":` to run it only when the file is executed directly.
+:::
+
+## Exercise
+
+Change `print_matches` into a function that **returns** the number of matching lines instead of printing them, called `count_matches(text, query, ignore_case=False) -> int`. Use it from `main.py` to print `3 matches for 'fire_event'` for a sample text of your choosing.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+# search.py
+def count_matches(text: str, query: str, ignore_case: bool = False) -> int:
+    count = 0
+    for line in text.splitlines():
+        if line_matches(line, query, ignore_case):
+            count += 1
+    return count
+```
+```python
+# main.py
+from search import count_matches
+
+sample = """self.fire_event(Events.STARTED)
+self.fire_event(Events.EPOCH_STARTED)
+self.fire_event(Events.COMPLETED)"""
+
+query = "fire_event"
+print(f"{count_matches(sample, query)} matches for '{query}'")
+```
+:::
+
+## Stretch
+
+Write `first_match(text, query) -> int | None` that returns the line number of the first matching line, or `None` if no line matches. (`int | None` means "an int or None".) Then write a `main.py` that prints either `first match on line N` or `no match`, using `is None` to check.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def first_match(text: str, query: str) -> int | None:
+    line_number = 0
+    for line in text.splitlines():
+        line_number += 1
+        if query in line:
+            return line_number
+    return None
+```
+```python
+result = first_match(sample, "COMPLETED")
+if result is None:
+    print("no match")
+else:
+    print(f"first match on line {result}")
+```
+
+Use `is None` rather than `== None`: `None` is a single unique value, and `is` checks for exactly that value.
+:::
+
+## What changed in the project
+
+`my-atlas` now has a `search.py` module with `line_matches` and a counting or printing function, used by `main.py`. Commit: `feat: Moved search logic into a module`.

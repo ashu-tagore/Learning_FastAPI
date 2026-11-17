@@ -1,0 +1,316 @@
+---
+title: "1.11 Testing with pytest and debugging"
+description: "Write automated tests with pytest, use fixtures and parametrize, test the command line, and debug with tracebacks and breakpoints. This lesson completes Checkpoint 1."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 11 · About 80 minutes
+:::
+
+::: {.callout-note title="Analogy: a pilot's checklist"}
+Before every flight, pilots run a checklist, even after thousands of flights, because skill doesn't stop a forgotten switch. **Automated tests** are your code's checklist: small programs that check your program does what it should, run in seconds, every time you change anything. They catch the bug you'd never think to look for, because it's in the part you didn't touch.
+:::
+
+## Why automated tests
+
+Running `atlas search` by hand and eyeballing the output works once. After ten changes, you won't recheck every option, skipped folder and error message, and something will quietly break. Tests:
+
+- check every behaviour on every change, in seconds
+- let you change code fearlessly (if the tests pass, you didn't break what they cover)
+- document exactly how the code is supposed to behave, with examples
+
+In professional work, code without tests is considered unfinished.
+
+## Your first test
+
+pytest (installed in lesson 1.10) finds files named `test_*.py` in the `tests/` folder and runs every function named `test_*` in them. A test **asserts** facts; `assert x == y` does nothing if true and fails loudly if false.
+
+```python
+# tests/test_search.py
+from atlas.search import build_pattern
+
+
+def test_plain_query_matches_brackets_literally() -> None:
+    pattern = build_pattern("run(self)", ignore_case=False, use_regex=False)
+
+    assert pattern.search("def run(self):")
+    assert not pattern.search("def runself:")
+
+
+def test_ignore_case() -> None:
+    pattern = build_pattern("events", ignore_case=True, use_regex=False)
+
+    assert pattern.search("Events.STARTED")
+```
+
+```text
+$ uv run pytest
+...
+============================== 2 passed in 0.02s ===============================
+```
+
+Each test follows the same three steps, separated by a blank line: **arrange** (set things up), **act** (call the code), **assert** (check the result). Name tests as sentences describing the behaviour: when one fails, its name tells you what broke.
+
+When a test fails, pytest shows exactly what differed:
+
+```text
+>       assert [match.line for match in matches] == ["def accuracy():", "def run(self):"]
+E       AssertionError: assert ['def run(sel... accuracy():'] == ['def accurac...f run(self):']
+E
+E         At index 0 diff: 'def run(self):' != 'def accuracy():'
+E         Use -v to get more diff
+```
+
+`At index 0 diff` says the first items differ: the code found `def run(self):` first.
+
+That real failure happened while writing this course's tests: the *test* was wrong about the order, not the code. `ignite/engine/engine.py` sorts before `ignite/metrics.py`, because `engine` comes before `metrics` alphabetically. Reading the difference carefully tells you which one to fix.
+
+## Fixtures: a fresh, fake codebase for every test
+
+Tests shouldn't depend on Ignite being cloned at a certain commit: Ignite changes, and other people won't have it at `~/code/ignite`. Instead, each test builds a tiny fake codebase containing exactly the situations you want to check.
+
+A **fixture** is a function that prepares something a test needs. pytest gives it to any test that names it as a parameter. pytest's built-in `tmp_path` fixture provides a new, empty temporary folder for each test, deleted afterwards.
+
+Put shared fixtures in `tests/conftest.py`, which pytest loads automatically:
+
+```python
+# tests/conftest.py
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def sample_repo(tmp_path: Path) -> Path:
+    """A tiny fake codebase: two Python files, one doc, and files that must be ignored."""
+    (tmp_path / "ignite" / "engine").mkdir(parents=True)
+    (tmp_path / "ignite" / "engine" / "engine.py").write_text(
+        "class Engine:\n    def run(self):\n        self.fire_event(Events.STARTED)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ignite" / "metrics.py").write_text(
+        "def accuracy():\n    return 1.0\n", encoding="utf-8"
+    )
+    (tmp_path / "README.md").write_text("# Ignite\n\nUse Events to hook into training.\n")
+
+    # Must never appear in results: a skipped folder, a wrong extension, a binary file.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config.py").write_text("Events = 'hidden'\n")
+    (tmp_path / "notes.txt").write_text("Events in a text file\n")
+    (tmp_path / "logo.md").write_bytes(b"\xff\xfe\x00 not utf-8 Events")
+    return tmp_path
+```
+
+Every tricky case from lesson 1.9 is in there on purpose: a `.git` folder, a file with the wrong extension, and a `.md` file that isn't valid UTF-8.
+
+```{mermaid}
+flowchart LR
+  P[pytest] -->|"needs sample_repo"| F["sample_repo fixture"]
+  F -->|"needs tmp_path"| T["tmp_path<br/>(fresh empty folder)"]
+  F -->|"writes fake files"| T
+  F -->|"returns the folder"| X["test function runs"]
+  X --> C["temporary folder deleted"]
+```
+
+## Testing search
+
+```python
+# tests/test_search.py
+from pathlib import Path
+
+import pytest
+
+from atlas.search import Match, iter_source_files, search
+
+
+def test_finds_matching_lines_with_relative_paths_and_line_numbers(sample_repo: Path) -> None:
+    matches = search(sample_repo, "fire_event")
+
+    assert matches == [
+        Match(Path("ignite/engine/engine.py"), 3, "self.fire_event(Events.STARTED)"),
+    ]
+
+
+def test_skips_tool_folders_other_extensions_and_binary_files(sample_repo: Path) -> None:
+    searched = {path.name for path in iter_source_files(sample_repo, (".py", ".md"))}
+
+    assert searched == {"engine.py", "metrics.py", "README.md", "logo.md"}
+    # logo.md is listed but unreadable as text, so it contributes no matches.
+    assert all(match.path.name != "logo.md" for match in search(sample_repo, "Events"))
+```
+
+Because `Match` is a dataclass, comparing a whole list of results with `==` is one clear line (lesson 1.8 promised this).
+
+## Many cases, one test: parametrize
+
+When the same check should hold for several inputs, `@pytest.mark.parametrize` runs one test function once per case:
+
+```python
+@pytest.mark.parametrize(
+    ("query", "ignore_case", "expected_count"),
+    [
+        ("events", False, 0),
+        ("events", True, 2),
+        ("EVENTS", True, 2),
+    ],
+)
+def test_ignore_case(sample_repo: Path, query: str, ignore_case: bool, expected_count: int) -> None:
+    assert len(search(sample_repo, query, ignore_case=ignore_case)) == expected_count
+```
+
+pytest reports each case separately, so you see exactly which combination failed.
+
+## Testing errors
+
+`pytest.raises` checks that code raises the exception it should:
+
+```python
+def test_invalid_regex_raises(sample_repo: Path) -> None:
+    with pytest.raises(re.error):
+        search(sample_repo, "(unclosed", use_regex=True)
+```
+
+## Testing the command line
+
+Because `main` accepts a list of arguments (lesson 1.10), tests can call it like the terminal would. pytest's `capsys` fixture captures what was printed to stdout and stderr:
+
+```python
+# tests/test_cli.py
+from pathlib import Path
+
+import pytest
+
+from atlas.cli import main
+
+
+def test_search_prints_path_line_and_text(
+    sample_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main(["search", "fire_event", "--path", str(sample_repo)])
+
+    output = capsys.readouterr()
+    assert exit_code == 0
+    assert output.out == "ignite/engine/engine.py:3: self.fire_event(Events.STARTED)\n"
+    assert output.err == "1 match\n"
+
+
+def test_missing_folder_is_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["search", "x", "--path", str(tmp_path / "nope")])
+
+    assert exit_code == 1
+    assert "not a folder" in capsys.readouterr().err
+```
+
+The course's reference project has 20 tests like these, covering search, the command line and statistics. All of them run in well under a second:
+
+```text
+$ uv run pytest -q
+....................                                                     [100%]
+20 passed in 0.07s
+```
+
+## Debugging
+
+When a test fails or the program misbehaves:
+
+1. **Read the traceback or assertion message** from the bottom up (lesson 1.9). Most of the time the answer is there.
+2. **Reproduce it with the smallest input.** Add a test that fails; it becomes a permanent guard once fixed.
+3. **Look inside while it runs.** Put `breakpoint()` on a line and run the code: Python pauses there and opens the **debugger** (`pdb`), where you can inspect variables.
+
+| pdb command | Does |
+|---|---|
+| `p name` | print a variable |
+| `n` | run the next line |
+| `s` | step into a function call |
+| `c` | continue until the next breakpoint |
+| `l` | list the code around you |
+| `q` | quit |
+
+Running `uv run pytest --pdb` opens the debugger automatically at the point a test fails. VS Code has a graphical debugger that does the same with clicks. A `print()` is fine for a quick look too; just remove it afterwards.
+
+## What to test
+
+- **Behaviour, not implementation.** Test what `search` returns, not which helper it called; then you can rewrite internals freely.
+- **The unhappy paths:** bad input, missing folders, binary files. Bugs live there.
+- **One behaviour per test,** named as a sentence.
+- **No dependence on the outside world:** no real network, no files outside `tmp_path`, no particular date. Tests must give the same result every time and on every machine.
+
+## Common mistakes
+
+- **A test that never fails.** Before trusting a new test, break the code on purpose and watch the test go red.
+- **Tests depending on each other** or on run order. Each test builds its own data through fixtures.
+- **Testing against the real Ignite clone.** It changes, and others don't have it. Use `tmp_path`.
+- **File names that pytest ignores:** the file must start with `test_`, and so must each test function.
+- **Leaving `breakpoint()` in the code.** The program will stop and wait forever (in CI, until it times out).
+
+## Check yourself
+
+**1.** Why does `sample_repo` create a `.git` folder and a broken `logo.md`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+To prove that the search skips tool folders and survives non-UTF-8 files. Tests should include the tricky cases on purpose; the happy path rarely breaks.
+:::
+
+**2.** What does `capsys` let you test?
+
+::: {.callout-tip collapse="true" title="Answer"}
+What the code printed: `capsys.readouterr()` returns the captured stdout (`.out`) and stderr (`.err`) separately, so you can check both the results and the human messages.
+:::
+
+**3.** You change `iter_source_files` to use a different way of walking folders, and every test still passes. What does that tell you?
+
+::: {.callout-tip collapse="true" title="Answer"}
+That the observable behaviour the tests cover is unchanged: the tests check *what* happens, not *how*. That's exactly what makes refactoring safe. (It doesn't prove behaviour the tests don't cover is unchanged, which is why the tricky cases matter.)
+:::
+
+## Exercise
+
+Write tests for these behaviours (all already in the reference code):
+
+1. Results come in file order: searching `sample_repo` for `Events` returns `README.md` before `ignite/engine/engine.py`.
+2. `--limit` stops early: searching for `e` with `limit=3` returns exactly 3 matches.
+3. `--json` prints valid JSON: `main(["search", "accuracy", "--path", ..., "--json"])` prints a list with one record whose `path` is `ignite/metrics.py`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import json
+
+
+def test_results_are_in_file_order(sample_repo: Path) -> None:
+    paths = [match.path for match in search(sample_repo, "Events")]
+
+    assert paths == [Path("README.md"), Path("ignite/engine/engine.py")]
+
+
+def test_limit_stops_early(sample_repo: Path) -> None:
+    assert len(search(sample_repo, "e", limit=3)) == 3
+
+
+def test_search_json_output(sample_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    main(["search", "accuracy", "--path", str(sample_repo), "--json"])
+
+    records = json.loads(capsys.readouterr().out)
+    assert records == [{"path": "ignite/metrics.py", "line_number": 1, "line": "def accuracy():"}]
+```
+
+Then break the code on purpose (for example, remove `sorted` in `iter_source_files`) and watch the first test fail.
+:::
+
+## Stretch: test-driven development
+
+Use **test-driven development** for one small feature: write the failing test first, watch it fail, write the least code that makes it pass, then tidy up. Feature: plain searches should ignore a leading and trailing space in the query, so `search(root, " Engine ")` behaves like `search(root, "Engine")`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Test first:
+
+```python
+def test_plain_query_ignores_surrounding_spaces(sample_repo: Path) -> None:
+    assert search(sample_repo, " fire_event ") == search(sample_repo, "fire_event")
+```
+
+It fails. Then the smallest fix, at the start of `build_pattern`: `query = query if use_regex else query.strip()` (regex queries keep their spaces, since a space can be meaningful in a pattern). The test passes; run the whole suite to check nothing else broke. This isn't in the reference code: it's a design choice you made, guarded by your own test.
+:::
+
+## What changed in the project
+
+`my-atlas` has a `tests/` folder with fixtures and tests for search and the command line. `atlas search` works on a real codebase and is tested: that is the core of **Checkpoint 1**. The review lesson adds one more command, then you can compare your project with the course's reference code at tag `checkpoint-01`. Commit: `test: Covered search and the command line`.

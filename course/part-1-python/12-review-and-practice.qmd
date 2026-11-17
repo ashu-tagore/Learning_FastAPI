@@ -1,0 +1,182 @@
+---
+title: "1.12 Review and practice"
+description: "Consolidate Part 1 without step-by-step help: mixed exercises, building the atlas stats command from a spec and its tests, and questions revisiting Part 0."
+---
+
+::: {.lesson-meta}
+Part 1 · Lesson 12 · Review · Plan 2 to 4 hours, spread over several sessions
+:::
+
+This lesson has no new theory and no step-by-step instructions. That's deliberate. Until now you followed along; here you work like a developer does: from a description of what's needed, with tests that say when you're done. Getting stuck is part of the exercise. Use the 20-minute rule from lesson 0.1, then the hints.
+
+## Recap
+
+| Lesson | Key idea | One-line reminder |
+|---|---|---|
+| [1.1](01-installing-python.qmd) | uv and projects | `uv run` runs anything inside the project's environment |
+| [1.2](02-values-and-variables.qmd) | Values and types | f-strings build text from values: `f"{path}:{line_number}"` |
+| [1.3](03-control-flow.qmd) | Control flow | early `continue`/`return` keeps the main path flat |
+| [1.4](04-functions-and-modules.qmd) | Functions and modules | inputs as parameters, results via `return` |
+| [1.5](05-collections.qmd) | Collections and Big-O | dict for lookup by key, set for fast membership |
+| [1.6](06-iteration.qmd) | Iteration | `enumerate`, comprehensions, generators with `yield` |
+| [1.7](07-text-dates-regex.qmd) | Text, dates, regex | UTF-8, UTC datetimes, `re.escape` for literal text |
+| [1.8](08-classes-and-dataclasses.qmd) | Classes | dataclasses for records; composition over inheritance |
+| [1.9](09-errors-files-json.qmd) | Errors, files, paths, JSON | catch only what you can handle; `with` and `encoding="utf-8"` |
+| [1.10](10-packages-and-cli.qmd) | Packages and CLIs | src layout, entry points, stdout vs stderr, exit codes |
+| [1.11](11-testing-and-debugging.qmd) | Testing | fixtures, parametrize, `capsys`; test the unhappy paths |
+
+## Mixed practice
+
+Each is a small, self-contained problem. Write each one as a function with at least two tests.
+
+1. **Word frequency.** `top_words(text, n)` returns the `n` most common words in a text, lowercased, as `(word, count)` pairs, most common first. Ignore words shorter than 3 letters.
+2. **TODO finder.** `find_todos(root)` returns every line in `.py` files under a folder containing `TODO` or `FIXME`, as `Match` objects. Reuse `search` rather than rewriting it.
+3. **Issue age.** `days_open(created_at, now)` takes two ISO 8601 strings (like `2026-11-02T09:14:00Z`) and returns the whole number of days between them. Raise `ValueError` if `created_at` is after `now`.
+4. **Deduplicate in order.** `unique_in_order(items)` returns the items without duplicates, keeping the first occurrence of each, in O(n).
+5. **Safe JSON load.** `load_results(path)` reads a `results.json` written by `atlas search --json` and returns a list of `Match` objects. If the file doesn't exist, return an empty list; if it isn't valid JSON, let the error surface.
+
+::: {.callout-tip collapse="true" title="Hints"}
+1. `.split()` with no argument splits on any whitespace; count with a dict; `sorted(..., key=..., reverse=True)[:n]`.
+2. `search(root, "TODO|FIXME", use_regex=True, extensions=(".py",))`.
+3. `datetime.fromisoformat`, subtract, `.days`.
+4. A set of seen items plus a result list.
+5. `json.loads(path.read_text(encoding="utf-8"))`; catch `FileNotFoundError` only. A JSON error is `json.JSONDecodeError`: decide why it's right *not* to catch it.
+:::
+
+## Build it alone: `atlas stats`
+
+### The spec
+
+Add a second command to your `atlas` package that measures a codebase:
+
+```text
+$ uv run atlas stats --path ~/code/ignite --top 3
+type    files    lines
+.md        26     2330
+.py       362    85932
+.rst       15     1658
+
+Largest 3 files:
+    1925  tests/ignite/handlers/test_checkpoint.py
+    1889  ignite/handlers/param_scheduler.py
+    1650  tests/ignite/engine/test_engine.py
+```
+
+Requirements:
+
+- Options: `--path` (default `.`), `--top` (default 5), `--ext` (default `.py .md .rst`).
+- Count only the files `atlas search` would search (same skipped folders, same extensions). Reuse `iter_source_files`; don't copy it.
+- Files that aren't UTF-8 text are left out of all counts.
+- The table lists extensions alphabetically, right-aligning the numbers.
+- "Largest files" lists the biggest by line count, ties broken by path so the output is identical on every machine.
+- A missing folder prints `atlas: not a folder: ...` to stderr and exits with code 1, exactly like `search`.
+- Put the logic in a new module `src/atlas/stats.py`. Keep printing in `cli.py`.
+
+(Your numbers for Ignite will differ if your clone is at a different commit. That's expected.)
+
+### The acceptance tests
+
+Your command is done when these tests pass. Copy them into `tests/test_stats.py` (they use the `sample_repo` fixture from lesson 1.11):
+
+```python
+from pathlib import Path
+
+import pytest
+
+from atlas.cli import main
+from atlas.stats import collect_stats, count_lines
+
+
+def test_count_lines(sample_repo: Path) -> None:
+    assert count_lines(sample_repo / "ignite" / "metrics.py") == 2
+    assert count_lines(sample_repo / "logo.md") is None
+
+
+def test_totals_by_extension_skip_unreadable_files(sample_repo: Path) -> None:
+    stats = collect_stats(sample_repo, (".py", ".md"))
+
+    assert stats.totals_by_extension[".py"].files == 2
+    assert stats.totals_by_extension[".py"].lines == 5
+    assert stats.totals_by_extension[".md"].files == 1  # logo.md is not text
+    assert stats.totals_by_extension[".md"].lines == 3
+
+
+def test_largest_files_biggest_first_and_limited(sample_repo: Path) -> None:
+    stats = collect_stats(sample_repo, (".py", ".md"), top=2)
+
+    assert stats.largest_files == [
+        (Path("README.md"), 3),
+        (Path("ignite/engine/engine.py"), 3),
+    ]
+
+
+def test_stats_table(sample_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["stats", "--path", str(sample_repo), "--top", "1"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert ".py         2        5" in output
+    assert "Largest 1 files:" in output
+```
+
+The tests also tell you the **interface** to build: a `count_lines(path)` function returning an int or `None`, and a `collect_stats(root, extensions, top=5)` function returning an object with `totals_by_extension` (a dict from extension to something with `.files` and `.lines`) and `largest_files` (a list of `(relative path, line count)` tuples).
+
+::: {.callout-tip collapse="true" title="Hint 1: the data shapes"}
+Two dataclasses, using composition (lesson 1.8): `ExtensionTotals` with `files` and `lines`, both defaulting to 0; and `FolderStats` holding a `dict[str, ExtensionTotals]` and a `list[tuple[Path, int]]`. Remember `field(default_factory=...)` for the dict and list.
+:::
+
+::: {.callout-tip collapse="true" title="Hint 2: counting"}
+`count_lines`: open with UTF-8 and count lines with `sum(1 for _ in file)` (a generator expression, lesson 1.6; `_` is the conventional name for a value you don't use). Catch `UnicodeDecodeError` and return `None`.
+
+`dict.setdefault(key, default)` returns the existing value for `key`, or stores `default` and returns it: perfect for "get this extension's totals, creating them if new".
+:::
+
+::: {.callout-tip collapse="true" title="Hint 3: sorting with tie-breaks"}
+Sort the `(path, lines)` list with a key that is a tuple: `key=lambda item: (-item[1], str(item[0]))`. Tuples compare element by element, so this sorts by lines descending (the minus sign), then by path ascending.
+:::
+
+::: {.callout-tip collapse="true" title="Hint 4: the command"}
+Add a `stats` subparser next to `search`, a `run_stats(args)` function that prints the table, and dispatch in `main` with `if args.command == "search": return run_search(args)`, otherwise `return run_stats(args)`. For the table, format specs from lesson 1.7: `f"{extension:<6} {totals.files:>6} {totals.lines:>8}"`.
+:::
+
+When your tests pass, compare with the reference: `atlas/src/atlas/stats.py` and `atlas/src/atlas/cli.py` in the course repository. Different code that passes the same tests is a valid solution. Look for ideas, not for permission.
+
+## From earlier parts
+
+**1.** (0.2) You run `uv run atlas search Engine > out.txt` and the terminal still shows `1297 matches`. Why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`>` redirects only stdout into the file. Atlas prints the count to stderr, which still goes to the terminal.
+:::
+
+**2.** (0.3) You want to try a risky refactor of `search.py` without endangering working code. What Git steps do you take?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Create a branch (`git switch -c refactor-search`), commit there, and run the tests. If it works, merge into `main` (or open a pull request); if not, switch back to `main` and delete the branch. `main` was never touched.
+:::
+
+**3.** (0.3) `git status` lists `results.json` as untracked after every search. What should you do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Add `results.json` to `.gitignore`. It's generated output, not source code.
+:::
+
+## Self-check
+
+You're ready for Part 2 when you can do these **without notes**:
+
+- [ ] Create a uv project, add a dependency, and run a command in its environment.
+- [ ] Write a function with type hints, a default argument and an early return.
+- [ ] Choose between a list, tuple, dict and set, and explain why for a given problem.
+- [ ] Write a generator with `yield`, and explain when it beats a list.
+- [ ] Read a traceback and point to the line that failed and why.
+- [ ] Read a file safely with `with` and `encoding="utf-8"`, and handle one specific exception.
+- [ ] Explain what `[project.scripts]` and `uv.lock` are for.
+- [ ] Write a test with a fixture and parametrize, and make it fail on purpose.
+- [ ] Explain the difference between stdout and stderr, and what an exit code is.
+
+If two or more are shaky, redo the exercises from those lessons before moving on. Part 2 builds on all of them.
+
+## What changed in the project
+
+`atlas` now has two commands, `search` and `stats`, with tests. **Checkpoint 1 is complete.** Commit, push, and compare with the reference at tag `checkpoint-01`. Next, Part 2: what actually happens when one computer talks to another, and fetching real issues from GitHub.

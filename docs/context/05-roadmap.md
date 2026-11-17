@@ -7,7 +7,7 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 | # | Milestone | Delivers | Status |
 |---|---|---|---|
 | M0 | Foundation | Context docs, repo restructure, Quarto site skeleton on GitHub Pages, CI, `atlas/` package skeleton with tooling, lesson template | Done (site publishes once Pages is enabled) |
-| M1 | Parts 0-1 | 15 lessons; `atlas` CLI v0 keyword search | Not started |
+| M1 | Parts 0-1 | 15 lessons; `atlas` CLI v0 keyword search | Done (tag `checkpoint-01` pending: this environment cannot push tags) |
 | M2 | Part 2 | 7 lessons; OS and network basics, GitHub client, concurrent issue fetch | Not started |
 | M3 | Part 3 | 12 lessons; Postgres schema, query tuning, concurrency, SQL search | Not started |
 | M4 | Part 4 | 16 lessons (12 ported from the original tutorial); GitHub sign-in; async API v1; web UI v1 | Not started |
