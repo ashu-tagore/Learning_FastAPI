@@ -1,0 +1,145 @@
+---
+title: "2.7 Review and practice"
+description: "Consolidate Part 2 without step-by-step help: mixed exercises on processes, networks and HTTP, building atlas commits from a spec and its tests, and questions revisiting Part 1."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 7 · Review · Plan 2 to 4 hours, spread over several sessions
+:::
+
+As in lesson 1.12: no new theory, no step-by-step instructions. Use the 20-minute rule, then the hints.
+
+## Recap
+
+| Lesson | Key idea | One-line reminder |
+|---|---|---|
+| [2.1](01-how-the-os-runs-code.qmd) | Processes and signals | `SIGTERM` asks politely; servers should finish in-flight work and exit |
+| [2.2](02-networks.qmd) | IP, ports, TCP, DNS | `127.0.0.1` is "this machine only"; `0.0.0.0` accepts from outside |
+| [2.3](03-http-in-depth.qmd) | HTTP and HTTPS | 4xx is the client's fault, 5xx the server's; never disable certificate checks |
+| [2.4](04-linux-servers-and-ssh.qmd) | Linux servers and SSH | least privilege: non-root users, `600` for secrets, keys instead of passwords |
+| [2.5](05-web-apis-and-github.qmd) | Web APIs | timeouts always; follow `Link` for pagination; tokens in env vars, read-only |
+| [2.6](06-concurrency.qmd) | Concurrency | async for waiting, processes for calculating; never block inside `async def` |
+
+## Mixed practice
+
+Write each as a function with at least two tests. Use `httpx.MockTransport` (lesson 2.6) for anything that would touch the network.
+
+1. **Status family.** `describe_status(code)` returns `"success"`, `"redirect"`, `"client error"` or `"server error"`, and raises `ValueError` for codes outside 100 to 599.
+2. **Reset countdown.** `seconds_until_reset(headers, now)` reads `x-ratelimit-reset` from a dict of headers and returns how many seconds remain (never negative).
+3. **Retry politely.** `get_with_retries(client, url, attempts=3)` retries only on 502, 503 and 504, waiting 1, 2, then 4 seconds between attempts (**exponential backoff**), and returns the last response. Test it with a fake transport that fails twice and then succeeds. Make the waiting function a parameter so the test doesn't actually sleep.
+4. **Label census.** `count_by_label(issues)` returns a dict from label name to how many of the given `Issue` objects carry it.
+5. **Health check.** `check_all(urls)` fetches every URL concurrently with `httpx.AsyncClient` and returns a dict from URL to status code, or to the string `"unreachable"` when the request raises `httpx.RequestError`.
+
+::: {.callout-tip collapse="true" title="Hints"}
+1. Integer division: `code // 100` gives the family digit.
+2. `int(headers["x-ratelimit-reset"]) - int(now.timestamp())`, then `max(0, ...)`.
+3. Pass `sleep=time.sleep` as a default parameter; tests pass a function that records the delays into a list. Why retry only 502/503/504 and not 400 or 404? Think about which errors might go away by themselves.
+4. A dict and `.get(label, 0) + 1` for each label of each issue (lesson 1.5).
+5. One coroutine per URL wrapping `try`/`except httpx.RequestError`, then `asyncio.gather`; build the dict with `zip(urls, results)`.
+:::
+
+## Build it alone: `atlas commits`
+
+### The spec
+
+A command listing the most recent commits of a GitHub repository, useful for seeing what changed in Ignite since you last looked:
+
+```text
+$ atlas commits --limit 1
+0abbcab  2026-11-15  Maintainer            Pin pytest to 9.1.1 (#3932)
+```
+
+(That output is from the course's fake GitHub; against the real Ignite you'll see real commits.)
+
+Requirements:
+
+- Options: `--repo` (default `pytorch/ignite`) and `--limit` (default 10).
+- Use `GET /repos/{repo}/commits` with `per_page` set to the limit. GitHub allows at most 100 per page; reject a limit outside 1 to 100 with `atlas: --limit must be between 1 and 100` on stderr and exit code 1, **without** calling GitHub.
+- Each line: the first 7 characters of the commit's SHA (its unique id), the commit date (`YYYY-MM-DD`), the author's name padded to 20 characters, and only the **first line** of the commit message.
+- Read the response fields from GitHub's documentation for "List commits". The date to use is the committer date, inside the `commit` object.
+- Errors from GitHub become `atlas: <message>` on stderr with exit code 1, exactly like `atlas issues`.
+- Put the fetching in `github.py` as an async function returning a list of `Commit` dataclass objects; keep printing in `cli.py`.
+
+### The acceptance tests
+
+Add a commits endpoint to your fake GitHub that returns one commit shaped like GitHub's real response:
+
+```python
+    if path == "/repos/pytorch/ignite/commits":
+        commit = {
+            "sha": "0abbcab1234567890",
+            "commit": {
+                "author": {"name": "Maintainer"},
+                "committer": {"date": "2026-11-15T10:00:00Z"},
+                "message": "Pin pytest to 9.1.1 (#3932)\n\nLonger explanation.",
+            },
+        }
+        return httpx.Response(200, json=[commit])
+```
+
+Then your command is done when these pass:
+
+```python
+def test_recent_commits_use_short_sha_and_first_message_line() -> None:
+    commits = asyncio.run(fetch_recent_commits("pytorch/ignite", 1, transport=TRANSPORT))
+
+    assert commits[0].sha == "0abbcab"
+    assert commits[0].summary == "Pin pytest to 9.1.1 (#3932)"
+    assert commits[0].author == "Maintainer"
+
+
+def test_commits_rejects_out_of_range_limit(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["commits", "--limit", "500"]) == 1
+    assert "between 1 and 100" in capsys.readouterr().err
+```
+
+::: {.callout-tip collapse="true" title="Hint 1: the data shape"}
+A frozen dataclass `Commit` with `sha: str`, `author: str`, `committed_at: datetime` and `summary: str`. Convert GitHub's JSON into it right away, as `parse_issue` does (lesson 2.5).
+:::
+
+::: {.callout-tip collapse="true" title="Hint 2: first line and short SHA"}
+`message.splitlines()[0]` and `sha[:7]`. Commit messages can be long; the first line is the summary by convention (lesson 0.3).
+:::
+
+::: {.callout-tip collapse="true" title="Hint 3: validate before calling"}
+Check the limit at the start of `run_commits` with a named boolean (`limit_is_valid = 1 <= args.limit <= 100`) and return early. Python allows chained comparisons like `1 <= x <= 100`.
+:::
+
+When your tests pass, compare with the reference: `fetch_recent_commits` in `atlas/src/atlas/github.py` and `run_commits` in `atlas/src/atlas/cli.py`.
+
+## From earlier parts
+
+**1.** (1.5) `fetch_issues` deduplicates with `unique[issue.number] = issue`. Why a dict and not a list with an `if issue not in issues` check?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Checking membership in a list is O(n), so deduplicating n issues that way is O(n²). A dict lookup or assignment is O(1), making the whole thing O(n). It also keys on the issue number, which is what makes two issues "the same".
+:::
+
+**2.** (1.9) `issue_cache.load` catches `json.JSONDecodeError`, but lesson 1.12's `load_results` exercise said *not* to. Contradiction?
+
+::: {.callout-tip collapse="true" title="Answer"}
+No: it depends on whether there's a sensible plan B. A corrupt *cache* can always be rebuilt by fetching again, so treating it as missing is correct. A corrupt *results file* the user asked to load has no plan B; hiding the error would mislead them.
+:::
+
+**3.** (1.11) Why do Atlas's GitHub tests use a fake transport instead of the real API?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The real API is slow, rate-limited, needs the network, and its data changes, so tests would be flaky and could fail for reasons unrelated to the code. A fake returns the same answer every time, including error cases that are hard to trigger for real.
+:::
+
+## Self-check
+
+You're ready for Part 3 when you can, **without notes**:
+
+- [ ] Explain the difference between a program and a process, and between `SIGTERM` and `SIGKILL`.
+- [ ] Explain what an IP address, a port and DNS are, and why a server on `127.0.0.1` can't be reached from outside.
+- [ ] Write out an HTTP request and response by hand, and name the status-code families.
+- [ ] Say what HTTPS guarantees and why `verify=False` is dangerous.
+- [ ] Read `ls -l` permissions and set a secret file to `600`.
+- [ ] Call a JSON API with httpx, with a timeout, handling errors and pagination.
+- [ ] Explain I/O-bound versus CPU-bound work, and when to use async, threads or processes.
+- [ ] Use `asyncio.gather`, and test an HTTP client without the network.
+
+## What changed in the project
+
+`atlas` now has four commands: `search`, `stats`, `issues` and `commits`. **Checkpoint 2 is complete.** Commit, push, and compare with the reference at tag `checkpoint-02`. Next, Part 3: storing Atlas's data in a real database.

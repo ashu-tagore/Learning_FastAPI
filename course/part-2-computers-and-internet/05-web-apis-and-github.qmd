@@ -1,0 +1,321 @@
+---
+title: "2.5 Web APIs and JSON: the GitHub REST API"
+description: "Call a real web API with httpx: query parameters, headers, tokens, pagination, rate limits and errors. Atlas fetches PyTorch-Ignite's good first issues."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 5 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: a library's request desk"}
+A big library won't let you wander the archives. It has a **request desk** with a printed list of what you may ask for and how ("Form B: list all books on a shelf; write the shelf number here"). That list is the **API documentation**. The desk hands results back in a standard format, a few pages at a time ("page 1 of 4: ask again for page 2"), and limits how many requests one visitor may make per hour. Show a library card (a **token**) and the limit goes up.
+:::
+
+## What a web API is
+
+An **API** (Application Programming Interface) is a way for programs to use another system's features. A **web API** does it over HTTP (lesson 2.3): you send requests to documented URLs and get structured data back, almost always as JSON (lesson 1.9).
+
+A **REST** API organises those URLs around **resources** (things) and uses HTTP methods as the verbs:
+
+| Request | Means |
+|---|---|
+| `GET /repos/pytorch/ignite` | read the repository |
+| `GET /repos/pytorch/ignite/issues` | list its issues |
+| `GET /repos/pytorch/ignite/issues/3932` | read one issue |
+| `GET /repos/pytorch/ignite/commits` | list its commits |
+
+GitHub documents every endpoint in its REST API reference at docs.github.com, including parameters, response fields and limits. Reading API documentation is a core backend skill: in the job, you'll integrate with payment providers, email services and AI model APIs the same way.
+
+## httpx
+
+`httpx` is a popular Python library for HTTP. Add it to `my-atlas` as a **runtime** dependency (lesson 1.10):
+
+```bash
+uv add httpx
+```
+
+A first real call, to this course's own public repository:
+
+```python
+import httpx
+
+headers = {"Accept": "application/vnd.github+json", "User-Agent": "atlas-course"}
+with httpx.Client(base_url="https://api.github.com", headers=headers, timeout=10.0) as client:
+    response = client.get(
+        "/repos/ashu-tagore/Learning_FastAPI/issues",
+        params={"state": "all", "per_page": 2},
+    )
+    print(response.status_code, response.headers["content-type"])
+    print(response.url)
+    items = response.json()
+    print(type(items), len(items))
+    first = items[0]
+    print(first["number"], first["state"], "pull_request" in first)
+    print(response.links["next"]["url"][:80], "...")
+    print("remaining requests:", response.headers["x-ratelimit-remaining"])
+
+    missing = client.get("/repos/ashu-tagore/Learning_FastAPI/issues/99999")
+    print(missing.status_code, missing.json()["message"])
+```
+```text
+200 application/json; charset=utf-8
+https://api.github.com/repos/ashu-tagore/Learning_FastAPI/issues?state=all&per_page=2
+<class 'list'> 2
+3 closed True
+https://api.github.com/repositories/1299106774/issues?state=all&per_page=2&after ...
+remaining requests: 14982
+404 Not Found
+```
+
+(The remaining count is high because this was captured on an authenticated network; see rate limits below.)
+
+What's happening:
+
+- `httpx.Client` keeps connections open and reuses them across requests (skipping repeated TCP and TLS handshakes, lessons 2.2 and 2.3), and applies `base_url`, `headers` and `timeout` to every request. Use it in a `with` block so connections are closed.
+- `params` builds the query string for you, escaping spaces and special characters. You never paste `?state=all&...` together by hand.
+- `response.json()` parses the JSON body into Python lists and dicts.
+- **Always set a timeout.** Without one, a stuck server can hang your program forever.
+- Look at `"pull_request" in first`: this "issue" #3 is really a pull request. GitHub's issues endpoint returns **both**, and marks pull requests with a `pull_request` key. Atlas must skip them.
+- A 404 is still a valid HTTP response. httpx doesn't raise an exception for it; checking the status is your job.
+
+## Pagination
+
+APIs return long lists in **pages**. GitHub returns up to 30 items per request by default (100 with `per_page=100`) and tells you where the next page is in the `Link` header (lesson 2.3). httpx parses it into `response.links`. When there's no `next` link, you're on the last page.
+
+```{mermaid}
+sequenceDiagram
+  participant A as Atlas
+  participant G as GitHub API
+  A->>G: GET /repos/pytorch/ignite/issues?labels=good first issue&per_page=100
+  G-->>A: 100 items + a Link header pointing to page 2
+  A->>G: GET (the "next" URL)
+  G-->>A: 37 items, no "next" link
+  Note over A: done: 137 items
+```
+
+Always follow the link GitHub gives you rather than building page URLs yourself: as the output above shows, GitHub's next-page URL can include a cursor (`after=...`) you couldn't have guessed.
+
+## Authentication and rate limits
+
+Public data needs no login, but anonymous clients get **60 requests per hour**, shared by everyone at your IP address. With a **personal access token** the limit is 5,000 per hour. Every response tells you where you stand:
+
+| Header | Meaning |
+|---|---|
+| `x-ratelimit-limit` | requests allowed per hour |
+| `x-ratelimit-remaining` | requests left |
+| `x-ratelimit-reset` | when the count resets, as a Unix timestamp (seconds since 1 January 1970, UTC) |
+
+When you run out, GitHub answers `403` or `429` with `x-ratelimit-remaining: 0`.
+
+To get a token: on GitHub, **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**. Give it an expiry date and **public repositories, read-only** access. Atlas needs nothing more, and a token that can't write can't do damage if it leaks.
+
+Give it to your program through an **environment variable** (lesson 0.2), never in the code:
+
+```bash
+export GITHUB_TOKEN=github_pat_...
+```
+
+```python
+import os
+
+token = os.environ.get("GITHUB_TOKEN")  # None if not set
+```
+
+It travels in the `Authorization: Bearer <token>` header, only ever over HTTPS. Never print it, log it or commit it. (In Part 4, settings move into a proper configuration object instead of reading `os.environ` directly.)
+
+## In the project: `github.py`
+
+Create `src/atlas/github.py`:
+
+```python
+"""Read-only access to the GitHub REST API.
+
+Atlas never writes to GitHub, so this module only ever sends GET requests.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+import httpx
+
+GITHUB_API = "https://api.github.com"
+
+
+class GitHubError(Exception):
+    """A problem talking to GitHub, explained in words a user can act on."""
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str
+    url: str
+    author: str
+    labels: tuple[str, ...]
+    comments: int
+    created_at: datetime
+
+
+def build_headers(token: str | None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        # GitHub rejects requests without a User-Agent.
+        "User-Agent": "atlas-course",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def check_response(response: httpx.Response) -> None:
+    """Raise GitHubError with a clear message unless the response succeeded."""
+    if response.is_success:
+        return
+    out_of_requests = response.headers.get("x-ratelimit-remaining") == "0"
+    if out_of_requests:
+        raise GitHubError("GitHub rate limit reached; try again later or set GITHUB_TOKEN")
+    if response.status_code == 404:
+        raise GitHubError(f"not found on GitHub: {response.request.url.path}")
+    raise GitHubError(f"GitHub answered {response.status_code}: {response.text[:200]}")
+
+
+def parse_issue(item: dict[str, Any]) -> Issue:
+    return Issue(
+        number=item["number"],
+        title=item["title"],
+        url=item["html_url"],
+        author=item["user"]["login"],
+        labels=tuple(label["name"] for label in item["labels"]),
+        comments=item["comments"],
+        created_at=datetime.fromisoformat(item["created_at"]),
+    )
+
+
+def fetch_issues(
+    repo: str,
+    label: str,
+    *,
+    token: str | None = None,
+    max_pages: int = 10,
+    transport: httpx.BaseTransport | None = None,
+) -> list[Issue]:
+    """All open issues in repo carrying the label, following pagination."""
+    url = f"/repos/{repo}/issues"
+    params: dict[str, str | int] | None = {"state": "open", "labels": label, "per_page": 100}
+    issues: list[Issue] = []
+
+    with httpx.Client(
+        base_url=GITHUB_API, headers=build_headers(token), timeout=10.0, transport=transport
+    ) as client:
+        for _ in range(max_pages):
+            response = client.get(url, params=params)
+            check_response(response)
+
+            for item in response.json():
+                # The issues endpoint also returns pull requests; they carry this key.
+                is_pull_request = "pull_request" in item
+                if is_pull_request:
+                    continue
+                issues.append(parse_issue(item))
+
+            next_page = response.links.get("next")
+            if next_page is None:
+                break
+            # The "next" link already contains every query parameter.
+            url = next_page["url"]
+            params = None
+
+    return issues
+```
+
+Design choices worth noticing:
+
+- **Raw JSON stops at the border.** `parse_issue` turns GitHub's large, loosely-typed dict (`dict[str, Any]`: "keys are strings, values could be anything") into a small, typed `Issue`. The rest of Atlas never touches GitHub's raw format, so if GitHub changes a field, only `parse_issue` changes.
+- **One kind of error.** Every way talking to GitHub can fail becomes a `GitHubError` with a message a human can act on. A custom exception is just a class that inherits from `Exception`: one of the rare places where inheritance is exactly right.
+- **`max_pages`** stops a runaway loop if something unexpected keeps returning `next` links.
+- **`transport`** lets tests swap the network for a fake GitHub (lesson 2.6). Normal callers never pass it.
+
+Try it from the REPL (`uv run python`) against Ignite:
+
+```python
+>>> from atlas.github import fetch_issues
+>>> issues = fetch_issues("pytorch/ignite", "good first issue")
+>>> len(issues)
+>>> issues[0].title
+```
+
+You'll see however many good first issues Ignite has open today, as real `Issue` objects.
+
+## Common mistakes
+
+- **No timeout.** Your program can hang forever on a stuck server.
+- **Ignoring status codes** and calling `.json()` on an error page, then crashing with a confusing `KeyError`.
+- **Treating the issues list as issues only.** Pull requests are included; skip them.
+- **Building page URLs by hand** instead of following `Link`.
+- **Putting a token in code or a URL.** Use an environment variable and the `Authorization` header.
+- **Burning the rate limit while developing** by re-fetching on every run. The next lesson adds a cache.
+
+## Check yourself
+
+**1.** Why does Atlas convert GitHub's JSON into `Issue` objects right away?
+
+::: {.callout-tip collapse="true" title="Answer"}
+So the rest of the code works with a small, typed, documented structure instead of GitHub's raw format. If GitHub's format changes, only `parse_issue` needs to change, and mypy can check every use of `Issue`.
+:::
+
+**2.** How does Atlas know it has reached the last page?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The response has no `next` entry in its `Link` header, so `response.links.get("next")` returns `None`.
+:::
+
+**3.** What permissions should Atlas's GitHub token have, and why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Read-only access to public repositories, with an expiry date. Atlas only reads, and a token that can't write is harmless if it leaks.
+:::
+
+## Exercise
+
+Write `fetch_repository(repo, token=None) -> dict[str, Any]` that returns a dict with just `full_name`, `stars` (`stargazers_count`), `open_issues` (`open_issues_count`) and `default_branch`, using `GET /repos/{repo}` and `check_response`. Print it for `pytorch/ignite`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def fetch_repository(repo: str, *, token: str | None = None) -> dict[str, Any]:
+    with httpx.Client(base_url=GITHUB_API, headers=build_headers(token), timeout=10.0) as client:
+        response = client.get(f"/repos/{repo}")
+    check_response(response)
+    data = response.json()
+    return {
+        "full_name": data["full_name"],
+        "stars": data["stargazers_count"],
+        "open_issues": data["open_issues_count"],
+        "default_branch": data["default_branch"],
+    }
+```
+
+Note: GitHub's `open_issues_count` includes open pull requests, for the same historical reason the issues endpoint returns them.
+:::
+
+## Stretch
+
+Make `check_response` report *when* the rate limit resets, in a readable form like `resets at 10:42 UTC`, using the `x-ratelimit-reset` header and `datetime.fromtimestamp(seconds, tz=UTC)`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from datetime import UTC, datetime
+
+    if out_of_requests:
+        reset_epoch = int(response.headers.get("x-ratelimit-reset", "0"))
+        reset_at = datetime.fromtimestamp(reset_epoch, tz=UTC).strftime("%H:%M UTC")
+        raise GitHubError(f"GitHub rate limit reached; it resets at {reset_at}")
+```
+
+`UTC` is a shortcut for `timezone.utc`, available since Python 3.11. This is what the reference code does.
+:::
+
+## What changed in the project
+
+`my-atlas` has a `github.py` module that fetches open issues by label, following pagination, with clear errors. Commit: `feat: Fetched issues from the GitHub API`.

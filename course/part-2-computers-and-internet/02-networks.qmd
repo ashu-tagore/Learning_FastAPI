@@ -1,0 +1,224 @@
+---
+title: "2.2 Networks: IP addresses, ports, TCP and DNS"
+description: "Learn how two programs on different computers find and talk to each other, and build a tiny client and server with Python sockets."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 2 · About 50 minutes
+:::
+
+::: {.callout-note title="Analogy: a postal system for flats"}
+An **IP address** is a building's street address. A **port** is the flat number inside the building: one computer runs many programs, each listening at its own flat number. **TCP** is a registered-mail service that numbers every page, confirms delivery, and re-sends lost pages, so the letter arrives complete and in order. **DNS** is the phone book that turns a name you can remember (`github.com`) into the street address the post office actually needs.
+:::
+
+## IP addresses
+
+Every device on a network has an **IP address**. The common format, IPv4, is four numbers from 0 to 255: `140.82.114.3`. The newer IPv6 format is longer (`2606:50c0:8000::153`) because the world ran out of IPv4 addresses.
+
+Some addresses are special:
+
+| Address | Meaning |
+|---|---|
+| `127.0.0.1` (name: `localhost`) | "this same computer". Traffic never leaves the machine. |
+| `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x` | **private** addresses, used inside home and company networks and cloud VPCs (Part 7). Not reachable from the internet directly. |
+| `0.0.0.0` | when a server listens on it: "accept connections on every network interface" |
+
+A server bound to `127.0.0.1` is reachable only from the same machine; bound to `0.0.0.0`, it's reachable from outside too. That one detail causes many "my server works locally but nobody else can reach it" problems, including inside Docker containers (lesson 7.1).
+
+## Ports
+
+One machine runs many network programs at once, so each one listens on a **port**, a number from 1 to 65535. Well-known services have conventional ports:
+
+| Port | Service |
+|---|---|
+| 22 | SSH (lesson 2.4) |
+| 80 | HTTP |
+| 443 | HTTPS |
+| 5432 | PostgreSQL (Part 3) |
+| 6379 | Redis (Part 5) |
+| 8000 | FastAPI during development (Part 4) |
+
+A connection is identified by both ends: (your IP, your port) to (server IP, server port). Your side's port is picked automatically from a high range. Only one program can listen on a given port at a time:
+
+```text
+OSError: [Errno 98] Address already in use
+```
+
+When you see that, another process (often an old copy of your own server) already holds the port.
+
+## TCP: reliable conversations
+
+Data travels across networks in small **packets**. Packets can be lost, duplicated or arrive out of order. **TCP** (Transmission Control Protocol) builds a reliable two-way stream on top: it numbers the bytes, acknowledges what arrived, re-sends what didn't, and reassembles everything in order.
+
+Before any data flows, the two sides agree to talk with a **handshake**:
+
+```{mermaid}
+sequenceDiagram
+  participant C as Client
+  participant S as Server (listening on a port)
+  C->>S: SYN ("can we talk?")
+  S-->>C: SYN-ACK ("yes, can you hear me?")
+  C->>S: ACK ("yes")
+  Note over C,S: connection open: both can send bytes
+  C->>S: data
+  S-->>C: data
+  C->>S: FIN ("I'm done")
+```
+
+That handshake costs a round trip before the first byte of data. It's one reason reusing connections (as `httpx.Client` does) makes repeated requests faster.
+
+**UDP** is the alternative: no handshake, no guarantees, just fire packets. It suits live video and games, where a late packet is useless anyway. Almost everything in this course uses TCP.
+
+## A client and a server, in 20 lines
+
+Python's `socket` module talks TCP directly. The server:
+
+```python
+# echo_server.py
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 9000))
+    server.listen()
+    print("listening on 127.0.0.1:9000", flush=True)
+    connection, address = server.accept()
+    with connection:
+        print(f"connection from {address}", flush=True)
+        data = connection.recv(1024)
+        connection.sendall(b"echo: " + data)
+```
+
+The client:
+
+```python
+# echo_client.py
+import socket
+
+with socket.create_connection(("127.0.0.1", 9000)) as connection:
+    connection.sendall(b"hello server")
+    print(connection.recv(1024).decode("utf-8"))
+```
+
+Run the server in one terminal and the client in another:
+
+```text
+$ python3 echo_server.py
+listening on 127.0.0.1:9000
+connection from ('127.0.0.1', 49696)
+```
+```text
+$ python3 echo_client.py
+echo: hello server
+```
+
+- `AF_INET` means IPv4; `SOCK_STREAM` means TCP.
+- `bind` claims the address and port; `listen` starts accepting; `accept` waits for one client and returns a new connection for it.
+- `49696` is the client's automatically chosen port.
+- Sockets send **bytes** (`b"..."`), not strings: you encode and decode explicitly (lesson 1.7).
+- `SO_REUSEADDR` lets you restart the server immediately instead of waiting for the OS to release the port.
+
+Every web server, database and message queue in this course is, underneath, this pattern: a process listening on a port, accepting TCP connections, reading bytes and writing bytes back. What differs is the **protocol**: the agreed format of those bytes. HTTP (next lesson) is one.
+
+## DNS: names to addresses
+
+You type `github.com`, but TCP needs an IP address. **DNS** (Domain Name System) translates. Your computer asks a DNS **resolver** (usually run by your internet provider or network), which looks the name up in a worldwide hierarchy of servers and caches the answer for a while.
+
+```text
+$ getent hosts github.com
+140.82.114.3    github.com
+```
+
+```python
+import socket
+
+print(socket.gethostbyname("api.github.com"))
+```
+```text
+140.82.114.6
+```
+
+(Big services have many addresses; you may get a different one.) `dig github.com` or `nslookup github.com` show more detail if they're installed.
+
+When "the site is down" for you but not for others, DNS is a frequent suspect. In Part 7, you'll point your own domain name at your AWS deployment with DNS records.
+
+```{mermaid}
+flowchart LR
+  A["httpx.get('https://api.github.com/...')"] --> D[DNS: api.github.com?]
+  D -->|140.82.114.6| T[TCP connect to 140.82.114.6:443]
+  T --> L[TLS handshake: encrypt the connection]
+  L --> H[HTTP request and response]
+```
+
+That chain (DNS, TCP, TLS, HTTP) is what happens on every web request. The next lesson covers the last two.
+
+## Common mistakes
+
+- **Server bound to `127.0.0.1` when you need outside access** (or the reverse: exposed to the world when it should be local only).
+- **"Address already in use"**: an old process still holds the port. Find it with `lsof -i :9000` or `ss -ltnp`, and stop it.
+- **Treating bytes as strings** with sockets. Encode before sending, decode after receiving.
+- **Assuming `recv(1024)` returns a whole message.** TCP is a stream: a message can arrive in several pieces. Real protocols mark where messages end (HTTP uses `Content-Length`, for example).
+
+## Check yourself
+
+**1.** Why can two different programs on one machine both be network servers?
+
+::: {.callout-tip collapse="true" title="Answer"}
+They listen on different ports. The IP address identifies the machine; the port identifies the program on it.
+:::
+
+**2.** What does TCP add on top of raw packets?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A reliable, ordered, two-way byte stream: it numbers the data, acknowledges receipt, re-sends lost packets, and reassembles them in order. It also opens connections with a handshake and closes them cleanly.
+:::
+
+**3.** Your FastAPI server runs inside a container, listening on `127.0.0.1:8000`, and nothing outside the container can reach it. Why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`127.0.0.1` inside the container means "this container only". The server must listen on `0.0.0.0` to accept connections from outside it. You'll set exactly this in lesson 7.1.
+:::
+
+## Exercise
+
+Change the echo server so it handles **several clients one after another** (loop around `accept`), replying in upper case, and stops when a client sends `quit`. Test it with three client runs.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 9000))
+    server.listen()
+    while True:
+        connection, address = server.accept()
+        with connection:
+            message = connection.recv(1024).decode("utf-8")
+            if message == "quit":
+                connection.sendall(b"bye")
+                break
+            connection.sendall(message.upper().encode("utf-8"))
+```
+
+This server handles one client at a time: a slow client blocks everyone else. Lesson 2.6 is about doing many things at once.
+:::
+
+## Stretch
+
+Use `socket.getaddrinfo("github.com", 443)` to list every address returned for GitHub on port 443. How many are there, and which are IPv4 versus IPv6?
+
+::: {.callout-tip collapse="true" title="Answer"}
+```python
+import socket
+
+for family, _, _, _, address in socket.getaddrinfo("github.com", 443, proto=socket.IPPROTO_TCP):
+    print(family.name, address)
+```
+
+`AF_INET` entries are IPv4, `AF_INET6` are IPv6. The count depends on your network and DNS resolver; some networks return only IPv4.
+:::
+
+## What changed in the project
+
+No changes to `my-atlas` yet. You now know what happens beneath every request Atlas will make to GitHub in lesson 2.5.

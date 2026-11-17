@@ -30,7 +30,13 @@ website:
       - section: "Part 2: Computers and the internet"
         href: part-2-computers-and-internet/index.qmd
         contents:
-          []
+          - part-2-computers-and-internet/01-how-the-os-runs-code.qmd
+          - part-2-computers-and-internet/02-networks.qmd
+          - part-2-computers-and-internet/03-http-in-depth.qmd
+          - part-2-computers-and-internet/04-linux-servers-and-ssh.qmd
+          - part-2-computers-and-internet/05-web-apis-and-github.qmd
+          - part-2-computers-and-internet/06-concurrency.qmd
+          - part-2-computers-and-internet/07-review-and-practice.qmd
       - section: "Part 3: Databases"
         href: part-3-databases/index.qmd
         contents:

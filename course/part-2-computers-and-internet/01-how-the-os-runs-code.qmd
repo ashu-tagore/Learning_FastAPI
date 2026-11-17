@@ -1,0 +1,226 @@
+---
+title: "2.1 How the operating system runs your code"
+description: "Understand processes, memory, file handles and signals, the operating-system ideas every server relies on, and make a program shut down cleanly."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 1 · About 50 minutes
+:::
+
+::: {.callout-note title="Analogy: a building manager"}
+A computer is a building with one manager: the **operating system** (OS). Each program that runs is a tenant (a **process**) with its own locked flat (its **memory**). Tenants can't walk into each other's flats; they ask the manager for everything else: a key to the storage room (a **file handle**), a phone line (a network connection), more space. The manager can also slip a note under any door (a **signal**): "please leave by tonight" or, if ignored, "you are being removed now".
+:::
+
+## Programs and processes
+
+A **program** is a file on disk (`worker.py`, or the `python3` interpreter itself). A **process** is a program that is *running*: the OS has loaded it into memory, given it an identity and started executing it. Run the same program twice and you get two separate processes.
+
+Every process has:
+
+- a **PID** (process ID), a number that identifies it
+- a **parent**: the process that started it (your shell, when you type a command)
+- its own **memory**, invisible to other processes
+- a set of open **file handles** and network connections
+- an **exit code** when it ends (lesson 1.10)
+
+Here is a small worker that runs forever, doing a "job" every half second:
+
+```python
+# worker.py
+import os
+import signal
+import sys
+import time
+
+print(f"worker running as process {os.getpid()}, parent {os.getppid()}", flush=True)
+
+
+def handle_stop(signal_number, frame):
+    print(f"got signal {signal.Signals(signal_number).name}: finishing current job, then exiting", flush=True)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, handle_stop)
+
+job = 0
+while True:
+    job += 1
+    time.sleep(0.5)
+```
+
+Start it in the background (the `&` at the end means "run it and give me my prompt back"), then look at it with `ps`:
+
+```text
+$ python3 worker.py &
+worker running as process 2994, parent 2991
+$ ps -o pid,ppid,stat,etime,cmd -p 2994
+  PID  PPID STAT     ELAPSED CMD
+ 2994  2991 S          00:01 python3 worker.py
+```
+
+`STAT` `S` means "sleeping": waiting (here, in `time.sleep`). Most server processes spend most of their life sleeping, waiting for work. `ps aux` lists every process on the machine, and `top` (or `htop`) shows a live view of what's using CPU and memory; press `q` to quit.
+
+## Memory
+
+**RAM** (memory) is fast but temporary: it's wiped when the process ends or the machine restarts. **Disk** is slower but permanent. A process's variables, lists and objects live in RAM; anything that must survive goes to disk (a file, and from Part 3, a database).
+
+Two consequences you'll meet as a backend engineer:
+
+- If a server process crashes, everything it held only in memory is gone. That's why Atlas caches issues *to disk* in this part, and why Part 3 moves data into a database.
+- Memory is limited. Reading a 5 GB file into one string can exhaust it, and the OS will kill the process. That's why lesson 1.9 reads files line by line.
+
+## File handles
+
+When a process opens a file, the OS gives it a **file handle** (on Linux, a **file descriptor**): a small number standing for "this open file". Every process starts with three:
+
+| Number | Name | Usually connected to |
+|---|---|---|
+| 0 | standard input (stdin) | the keyboard |
+| 1 | standard output (stdout) | the terminal |
+| 2 | standard error (stderr) | the terminal |
+
+That's why stdout and stderr (lesson 1.10) are separate: they're different handles, and the shell's `>` redirects only number 1. The next file you open gets the next free number:
+
+```python
+import os
+
+f = open("worker.py", encoding="utf-8")
+print(f.fileno())
+print(sorted(os.listdir("/proc/self/fd")))
+```
+```text
+3
+['0', '1', '2', '3', '4']
+```
+
+(`/proc/self/fd` is a Linux folder listing the current process's open handles; `4` is the folder listing itself.) Network connections are file handles too. The OS limits how many a process may have open, often to 1,024, which is why forgetting to close files or connections (no `with`) eventually breaks a long-running server with `Too many open files`.
+
+## Signals
+
+A **signal** is a short message the OS delivers to a process. The ones that matter most:
+
+| Signal | Sent by | Default effect |
+|---|---|---|
+| `SIGINT` | pressing **Ctrl + C** | stop (Python raises `KeyboardInterrupt`) |
+| `SIGTERM` | `kill PID`, or a server platform shutting your app down | stop; **can be caught** |
+| `SIGKILL` | `kill -9 PID`, or the OS when memory runs out | stop immediately; **cannot be caught** |
+
+Our worker catches `SIGTERM` and exits cleanly:
+
+```text
+$ kill -TERM 2994
+got signal SIGTERM: finishing current job, then exiting
+$ wait 2994
+$ echo $?
+0
+```
+
+`wait PID` waits for a background process to end; `echo $?` then shows *its* exit code. (Run `echo $?` straight after `kill` and you'd see the exit code of `kill` itself.) `SIGKILL` gives the process no chance at all:
+
+```text
+$ kill -KILL 2998
+$ wait 2998
+[1]+  Killed                  python3 worker.py
+$ echo $?
+137
+```
+
+Exit code 137 is 128 + 9, the shell's way of saying "killed by signal 9". When you press Ctrl + C in Python, `SIGINT` becomes a `KeyboardInterrupt` exception:
+
+```text
+Traceback (most recent call last):
+  ...
+KeyboardInterrupt
+```
+
+### Why this matters: graceful shutdown
+
+When you deploy a new version of a web service (Part 7), the platform sends the old processes `SIGTERM`, waits a few seconds, then sends `SIGKILL`. A well-behaved server uses that window to finish the requests it's handling, close database connections and exit. A badly behaved one is killed mid-request, and users see errors on every deploy. Uvicorn, the server that runs FastAPI, handles this for you; lesson 7.9 checks that it's configured properly.
+
+```{mermaid}
+sequenceDiagram
+  participant P as Platform
+  participant S as Your server process
+  P->>S: SIGTERM ("please stop")
+  S->>S: stop accepting new work
+  S->>S: finish in-flight requests, close connections
+  S-->>P: exit code 0
+  Note over P,S: if still running after the grace period
+  P->>S: SIGKILL (no choice)
+```
+
+## Common mistakes
+
+- **`kill -9` as the first resort.** It skips cleanup: half-written files, abandoned connections. Use `kill PID` (SIGTERM) and wait.
+- **Keeping important data only in memory** in a server process. A restart loses it.
+- **Leaking file handles** by opening files without `with`. Fine in a 2-second script, fatal in a server that runs for weeks.
+- **Background jobs you forgot about.** `jobs` lists the shell's background processes; `kill %1` stops the first one.
+
+## Check yourself
+
+**1.** What's the difference between a program and a process?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A program is a file of instructions on disk. A process is one running instance of it, with its own PID, memory and open files. One program can have many processes.
+:::
+
+**2.** A process exits with code 137. What probably happened?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It was killed by `SIGKILL` (128 + 9): by someone running `kill -9`, by a platform after the grace period, or by the OS because the machine ran out of memory.
+:::
+
+**3.** Why does `atlas search ... > results.txt` still show `3 matches` on screen?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`>` redirects file handle 1 (stdout) to the file. Atlas prints the count on handle 2 (stderr), which still points at the terminal.
+:::
+
+## Exercise
+
+1. Save `worker.py`, start it in the background, and find its PID with `ps aux | grep worker` (the `|` sends one command's output into another).
+2. Stop it with `kill PID` and confirm it printed its goodbye message.
+3. Start it again and stop it with `kill -9 PID`. What's different?
+4. Change `handle_stop` so it prints how many jobs it completed before exiting.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Steps 1 to 3: with `kill PID` you see `got signal SIGTERM: ...`; with `kill -9` you see only `Killed`, because `SIGKILL` can't be caught. For step 4, the handler needs to read the module-level `job` counter:
+
+```python
+def handle_stop(signal_number, frame):
+    print(f"stopping after {job} jobs", flush=True)
+    sys.exit(0)
+```
+
+Reading a module-level variable inside a function works; changing one would need the `global` keyword, which this course avoids by keeping state in objects instead.
+:::
+
+## Stretch
+
+Make the worker also stop cleanly on Ctrl + C, by catching `KeyboardInterrupt` around the loop, and print the same goodbye message in both cases without duplicating code.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def say_goodbye() -> None:
+    print(f"stopping after {job} jobs", flush=True)
+
+
+def handle_stop(signal_number, frame):
+    say_goodbye()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, handle_stop)
+
+try:
+    while True:
+        job += 1
+        time.sleep(0.5)
+except KeyboardInterrupt:
+    say_goodbye()
+```
+:::
+
+## What changed in the project
+
+No code changes in `my-atlas` this lesson. You now know why Atlas writes its issue cache to disk (lesson 2.6), and what will happen to your server processes when they're deployed.

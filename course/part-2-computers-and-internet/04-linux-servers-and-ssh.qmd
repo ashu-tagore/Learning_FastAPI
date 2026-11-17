@@ -1,0 +1,241 @@
+---
+title: "2.4 Linux servers and SSH"
+description: "Understand users, permissions, packages, services and logs on a Linux server, and log in to remote machines securely with SSH."
+---
+
+::: {.lesson-meta}
+Part 2 · Lesson 4 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: keys to a shared office building"}
+A server is an office building shared by many people and programs. Each person has an ID badge (a **user**), belongs to teams (**groups**), and every room has a sign saying who may enter, look inside or change things (**permissions**). The facilities manager (**root**) can open any door, so you borrow their master key only briefly and on purpose (**sudo**). And you reach the building remotely through a secure, badge-checked tunnel: **SSH**.
+:::
+
+## Why this lesson
+
+In Part 7 your code runs on servers in a data centre: machines with no screen, that you reach over the network and control with the same terminal commands from lesson 0.2. Even with managed platforms, sooner or later you'll log in to a Linux machine to read a log or check why a process died. This lesson gives you the minimum to be safe and effective there. Practise on your own machine (Linux, WSL or macOS); you'll use a real cloud server in Part 7.
+
+## Users and groups
+
+Every process runs as some **user**, and that user decides what it may do.
+
+```text
+$ whoami
+ada
+$ id
+uid=30033(ada) gid=30033(ada) groups=30033(ada)
+```
+
+- `uid` is the user's number, `gid` the main group's number; `groups` lists every group the user belongs to. (On a typical personal machine your first user is number 1000.)
+- **root** (uid 0) is the administrator and can do anything, including destroying the system.
+- Services run as their own limited users (Postgres as `postgres`, for example), so a bug in one service can't touch the others' files. Your API will run as a non-root user too (lesson 7.1).
+
+## Permissions
+
+`ls -l` shows who may do what with a file:
+
+```text
+-rw-rw-r-- 1 ada ada 27 Nov 17 16:57 deploy.sh
+```
+
+Read the first column as 1 + 3 + 3 + 3 characters:
+
+| Part | Here | Meaning |
+|---|---|---|
+| type | `-` | a regular file (`d` would be a directory) |
+| owner | `rw-` | the owner (`ada`) may **r**ead and **w**rite, not e**x**ecute |
+| group | `rw-` | members of group `ada`: read and write |
+| others | `r--` | everyone else: read only |
+
+For a folder, `x` means "may enter it". Which is why a script you just wrote won't run:
+
+```text
+$ ./deploy.sh
+-bash: ./deploy.sh: Permission denied
+$ chmod u+x deploy.sh
+$ ls -l deploy.sh
+-rwxrw-r-- 1 ada ada 27 Nov 17 16:57 deploy.sh
+$ ./deploy.sh
+deploying
+```
+
+`chmod u+x` adds (`+`) execute (`x`) for the user who owns it (`u`). You'll also see numeric forms: each of r, w, x is worth 4, 2, 1, added per group. So `chmod 600 token.txt` means owner read and write (6), nobody else anything (0, 0):
+
+```text
+$ chmod 600 token.txt
+$ ls -l token.txt
+-rw------- 1 ada ada 7 Nov 17 16:57 token.txt
+```
+
+That's the right permission for any file holding a secret. SSH refuses to use a private key that others can read, for exactly this reason. System files are protected the same way:
+
+```text
+$ ls -ld /etc /root
+drwxr-xr-x 82 root root 4096 Nov 17 16:25 /etc
+drwx------ 17 root root 4096 Nov 17 16:23 /root
+```
+
+Everyone may read `/etc` (system settings); only root may enter `/root`. `chown user:group file` changes the owner.
+
+## sudo
+
+`sudo COMMAND` runs one command as root, after asking for your password. It's needed for installing software or changing system files, as in lesson 0.3's `sudo apt install git`.
+
+Use it only when necessary, one command at a time. Running everything as root means one typo, or one malicious package, can damage the whole system.
+
+## Installing software
+
+Ubuntu and Debian servers install software with **apt**:
+
+```bash
+sudo apt update           # refresh the list of available packages
+sudo apt install htop     # install one
+sudo apt upgrade          # install security updates for everything
+```
+
+Keeping servers updated is a security duty, not a chore: most break-ins use known holes that updates already fixed. In Part 7 you'll mostly avoid hand-managed servers by using containers and managed services, partly for this reason.
+
+## Services and logs
+
+A server runs long-lived programs called **services** (or **daemons**): a web server, a database, SSH itself. On most Linux servers they are managed by **systemd**, controlled with `systemctl`:
+
+| Command | Does |
+|---|---|
+| `systemctl status ssh` | is it running? since when? last log lines |
+| `sudo systemctl restart ssh` | restart it (it receives `SIGTERM` first, lesson 2.1) |
+| `sudo systemctl enable ssh` | start it automatically at boot |
+| `journalctl -u ssh --since "1 hour ago"` | its logs |
+| `journalctl -u ssh -f` | follow new log lines live (Ctrl + C to stop) |
+
+Older or simpler programs write logs as files under `/var/log`. `tail -f /var/log/syslog` follows one live. (WSL and containers often don't run systemd, so these commands may not work there; you'll use a real server in Part 7.)
+
+When something is wrong on a server, the order of investigation is nearly always: **is the process running** (`systemctl status`, `ps aux`), **what do the logs say** (`journalctl`), **is it listening on the expected port** (`ss -ltnp`, lesson 2.2), **is there disk space and memory** (`df -h`, `free -h`).
+
+## SSH: secure remote login
+
+**SSH** (Secure Shell) gives you a terminal on a remote machine over an encrypted connection (on port 22). You already created an SSH key pair in lesson 0.3 for GitHub. The same key logs you in to servers:
+
+```bash
+ssh ada@203.0.113.10
+```
+
+That means "log in as user `ada` on the machine at that IP address". (`203.0.113.x` addresses are reserved for documentation, so that exact command won't connect anywhere.)
+
+How key login works:
+
+```{mermaid}
+sequenceDiagram
+  participant Y as Your laptop (private key)
+  participant S as Server (~/.ssh/authorized_keys holds your public key)
+  Y->>S: connect, offer public key
+  S-->>Y: challenge: prove you hold the matching private key
+  Y->>Y: sign challenge with private key
+  Y->>S: signature
+  S->>S: check signature with the stored public key
+  S-->>Y: logged in (no password sent)
+```
+
+The private key never leaves your laptop, and no password crosses the network.
+
+- To allow a key on a server, its public key is appended to `~/.ssh/authorized_keys` on the server. Cloud providers do this for you when you create a machine (Part 7).
+- The first time you connect, SSH shows the server's fingerprint and asks whether to trust it. It remembers the answer in `~/.ssh/known_hosts`. If the fingerprint later changes unexpectedly, SSH warns loudly: someone may be impersonating the server.
+- `scp file.txt ada@203.0.113.10:/tmp/` copies a file over SSH.
+- A `~/.ssh/config` file saves typing:
+
+```text
+Host atlas-server
+    HostName 203.0.113.10
+    User ada
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Now `ssh atlas-server` is enough.
+
+### Hardening basics
+
+On any server reachable from the internet, bots try to log in within minutes of it starting. The standard minimum:
+
+- key login only, with password login disabled
+- no direct root login
+- a firewall allowing only the ports you need (22, 80, 443)
+- automatic security updates
+
+Part 7 mostly avoids open SSH entirely, using managed containers and AWS's own access tools, but these rules apply to every server you do manage.
+
+## Common mistakes
+
+- **`chmod 777`** to "fix" a permission error. It gives everyone full control. Find out which user needs which access, and grant only that.
+- **Private key files readable by others.** Keep `~/.ssh/id_ed25519` at `600`; SSH refuses keys that aren't.
+- **Working as root** for everyday tasks.
+- **Ignoring host-key warnings.** Investigate before typing `yes`.
+- **Editing a server by hand and forgetting what you changed.** Part 7 replaces hand-editing with Terraform and Dockerfiles, so every change is recorded in code.
+
+## Check yourself
+
+**1.** A file shows `-rw-r-----`. Who can read it?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The owner (read and write) and members of the file's group (read). Everyone else has no access.
+:::
+
+**2.** Why should the API you deploy run as a non-root user?
+
+::: {.callout-tip collapse="true" title="Answer"}
+If an attacker exploits a bug in it, they get only that user's limited permissions instead of control of the whole machine.
+:::
+
+**3.** What does SSH key login send over the network instead of a password?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A signature over a one-time challenge, made with your private key. The server verifies it with your public key. The private key itself never leaves your machine.
+:::
+
+## Exercise
+
+On your own machine:
+
+1. Create a file `secret.txt` with any text. Make it readable and writable only by you, and confirm with `ls -l`.
+2. Write a two-line script `hello.sh` (`#!/bin/bash` then `echo hello`), make it executable for you only, and run it.
+3. Check the permissions of `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub`. Why are they different?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+echo "token" > secret.txt
+chmod 600 secret.txt
+ls -l secret.txt
+printf '#!/bin/bash\necho hello\n' > hello.sh
+chmod u+x hello.sh
+./hello.sh
+ls -l ~/.ssh/
+```
+
+The private key is `-rw-------` (600): only you may read it. The public key is `-rw-r--r--` (644): it's meant to be shared, so readable by anyone. The first line of `hello.sh`, `#!/bin/bash`, called a **shebang**, tells the system which program runs the script.
+:::
+
+## Stretch: SSH into your own machine
+
+On Linux or WSL, install the SSH server (`sudo apt install openssh-server`), start it (`sudo service ssh start`), add your own public key to `~/.ssh/authorized_keys`, and log in with `ssh localhost`. Then make an entry in `~/.ssh/config` so `ssh me` works. Stop the server when you're done (`sudo service ssh stop`).
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+sudo apt install openssh-server
+sudo service ssh start
+cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+ssh localhost
+```
+
+`~/.ssh/config`:
+
+```text
+Host me
+    HostName localhost
+    User YOUR-USERNAME
+```
+
+`service` is an older command that works where systemd isn't running (as in WSL); on a full server you'd use `systemctl`. Using `>>` (append) instead of `>` matters: `>` would wipe any keys already authorised.
+:::
+
+## What changed in the project
+
+No code changes. You can now operate on a Linux server safely; you'll need it in Part 7.
