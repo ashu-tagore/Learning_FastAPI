@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["atlas/**", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["atlas/**", ".github/workflows/ci.yml"]
+
+jobs:
+  atlas:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: atlas
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Types
+        run: uv run mypy src tests
+      - name: Tests
+        run: uv run pytest -v

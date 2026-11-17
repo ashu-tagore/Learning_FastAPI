@@ -46,7 +46,7 @@ The code is written for human brains. A reader can hold about four things in wor
 
 ## Lesson template
 
-Every lesson file is `course/part-P-<slug>/NN-<slug>.qmd`:
+Every lesson file is `course/part-P-<slug>/NN-<slug>.qmd`. After adding one, run `python3 course/_tools/generate_part_pages.py` to update the part page and sidebar (never edit those by hand):
 
 ```markdown
 ---

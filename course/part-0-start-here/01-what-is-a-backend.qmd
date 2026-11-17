@@ -1,0 +1,162 @@
+---
+title: "0.1 What a backend is"
+description: "Understand what a backend does, what 'production' means, what you will build in this course, and how to study it."
+---
+
+::: {.lesson-meta}
+Part 0 · Lesson 1 · No setup needed
+:::
+
+::: {.callout-note title="Analogy: a restaurant"}
+When you eat at a restaurant, you see the dining room: the menu, the tables, the waiter. That is the **frontend**. Behind the swinging door is the kitchen. It keeps a pantry of ingredients, follows recipes, checks that an order is valid ("we don't serve breakfast after 11"), orders supplies from outside vendors, and has to keep working at full speed on a busy Friday night without poisoning anyone. That is the **backend**.
+
+You never see the kitchen, but it is where almost all of the real work happens.
+:::
+
+## Clients and servers
+
+Every time you use an app, two programs are talking:
+
+- A **client** is the program that asks for something. Your web browser and the apps on your phone are clients.
+- A **server** is a program, running on a computer somewhere else, that waits for requests and answers them.
+
+The client sends a **request** ("show me my messages") and the server sends back a **response** (the messages, or an error saying why not). You will learn the exact format of these messages in lesson 2.3. For now, picture two people passing notes.
+
+## Frontend and backend
+
+- The **frontend** is everything the user sees and touches: pages, buttons, forms. It runs on the user's device.
+- The **backend** is everything behind it: the servers, the data they store, and the rules they enforce. It runs on computers the user never sees.
+
+A backend engineer builds and runs the kitchen.
+
+## The five jobs of a backend
+
+| Job | Restaurant | Software example |
+|---|---|---|
+| **Store data** | The pantry and the order book | Saving your account, your posts, your files in a **database** |
+| **Enforce rules** | "No breakfast after 11", "only staff in the kitchen" | Only the owner of a post can delete it; passwords are checked |
+| **Do work** | Cooking | Searching, calculating a bill, calling an AI model |
+| **Talk to other systems** | Ordering from suppliers | Charging a card through a payment company, reading data from GitHub |
+| **Stay up** | Surviving the Friday rush, passing the health inspection | Staying fast, secure and available when thousands of people use it at once |
+
+The first four make something *work*. The fifth makes it *work for real people, every day*. That fifth job is what this course means by **production**.
+
+## Walking through one click
+
+What happens when you click the star button on a GitHub repository?
+
+```{mermaid}
+sequenceDiagram
+  participant B as Your browser (client)
+  participant S as GitHub's servers (backend)
+  participant D as GitHub's database
+  B->>S: Request: "star this repository, I am user X"
+  S->>S: Check: is user X really logged in?
+  S->>D: Save: user X starred repository Y
+  D-->>S: Saved
+  S-->>B: Response: "done, it now has 1,204 stars"
+  B->>B: Fill in the star icon
+```
+
+Every step in the middle is backend work: checking who you are, saving the change, and answering. By the end of Part 4 you will have built exactly this kind of flow yourself.
+
+## Prototype versus production
+
+A program that works on your laptop is a **prototype**. A **production** system is one that real people depend on. The difference is not the features, it is everything around them:
+
+| Question | Prototype | Production |
+|---|---|---|
+| What if two people click at the same moment? | Never tested | Handled correctly (Part 3) |
+| What if someone tries to see another user's data? | Probably works | Blocked and tested (Part 4) |
+| What if the server crashes at 3 a.m.? | You notice next week | An alert fires and it restarts itself (Part 7) |
+| What if ten thousand people arrive at once? | It falls over | It was load-tested (Part 7) |
+| How much does it cost to run? | Unknown | Measured, with a budget alarm (Part 7) |
+
+## Where AI engineering fits
+
+An AI model is just another system the backend talks to, like a payment company. Calling a model takes one line of code. Everything around that line is backend engineering: feeding it the right data, keeping costs under control, checking its answers are good, running it safely, and keeping it working when the model provider has an outage. That is why this course teaches backend first and AI on top of it.
+
+## What you will build
+
+One project, growing through the whole course:
+
+- **Atlas** answers questions about a real open-source project, [PyTorch-Ignite](https://github.com/pytorch/ignite), and cites the exact file and line behind each answer.
+- **Atlas Agents** finds beginner-friendly issues in that project and prepares an **Issue Brief** for each: what the problem is, where in the code it lives, how to run the tests, and a small script proving the bug exists. *You* then write the fix and contribute it.
+
+```{mermaid}
+flowchart LR
+  P1[Part 1<br/>search files<br/>on your laptop] --> P3[Part 3<br/>data in a<br/>database] --> P4[Part 4<br/>a web API<br/>with logins] --> P6[Part 6<br/>AI answers<br/>with citations] --> P7[Part 7<br/>live on AWS] --> P8[Part 8<br/>agents that<br/>prepare Issue Briefs]
+```
+
+Atlas never posts anything to GitHub and never writes your fix. Open-source maintainers want to work with people who understand their code, so the tool helps you understand; it does not pretend to be you.
+
+## How to use this course
+
+- **Parts and checkpoints.** The course has 10 parts. Each part ends at a **checkpoint**: a saved version of the project where everything works.
+- **Your code and the reference code.** You write your own code in the `workspace/` folder. The finished version of each step lives in `atlas/`. Compare only *after* you have tried.
+- **Every lesson has exercises.** Do them. Reading about swimming does not teach swimming.
+- **The 20-minute rule.** When stuck, struggle for 20 minutes before opening a solution. The struggle is where learning happens. After 20 minutes, look, then close it and redo the exercise from memory.
+- **Explain it back.** After each lesson, explain the main idea out loud in two sentences, as if to a friend. If you can't, reread the theory section.
+- **Review lessons are not optional.** The last lesson of each part has no step-by-step help. It is the closest thing to a real job, so it is the most valuable lesson in the part.
+
+## Common mistakes
+
+- **Tutorial hell.** Watching and reading without building. The fix: type every line of code yourself, then change it and see what breaks.
+- **Copy-pasting code.** Your hands learn by typing. Pasting skips the learning.
+- **Trying to learn everything at once.** You don't need to know Docker to learn Python. Each lesson only uses what earlier lessons taught.
+- **Skipping the boring parts.** Testing, security and monitoring feel less exciting than features. They are what separate a hobby project from a job.
+
+## Check yourself
+
+**1.** Your phone's weather app shows tomorrow's forecast. Which part is the client, and which part is the backend?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The app on your phone is the **client**: it asks for the forecast and displays it. The **backend** is the weather company's servers, which store forecast data, compute it, and send it to every phone that asks.
+:::
+
+**2.** An online shop lets any logged-in user cancel any other user's order. Which of the five backend jobs failed?
+
+::: {.callout-tip collapse="true" title="Answer"}
+**Enforce rules.** The backend must check that the person cancelling an order is the person who placed it. The frontend hiding the button is not enough, because anyone can send requests directly to the server. You will build this check yourself in lesson 4.9.
+:::
+
+**3.** Your project works perfectly on your laptop. Name two things that still need to happen before it is "in production".
+
+::: {.callout-tip collapse="true" title="Answer"}
+Any two of: it runs on a server other people can reach; it is protected so users can't see each other's data; it keeps working when many people use it at once; someone is alerted when it breaks; its costs are known and limited; its data is backed up.
+:::
+
+## Exercise: design a kitchen
+
+Pick an app you use often, for example food delivery. For the action **"place an order"**, write down:
+
+1. Three pieces of **data** the backend must store.
+2. Two **rules** it must enforce.
+3. One **other system** it must talk to.
+4. One thing that could go wrong on a busy evening, and what should happen instead.
+
+::: {.callout-tip collapse="true" title="Example solution"}
+1. **Data:** the order (items, prices, time), the customer's delivery address, the order's status (placed, cooking, on the way, delivered).
+2. **Rules:** the restaurant must be open; the customer can only see and change their own orders.
+3. **Other system:** a payment company to charge the card (also: maps for delivery time, SMS for notifications).
+4. **Busy evening:** the payment company is slow to answer. Instead of the app freezing, the order should wait in a "payment pending" state and be retried, and the customer should never be charged twice.
+
+There is no single right answer. If you named data, rules, an outside system and a failure, you are already thinking like a backend engineer.
+:::
+
+## Stretch: watch a real backend at work
+
+1. Open [github.com](https://github.com) in Chrome, Edge or Firefox.
+2. Open the developer tools (press `F12`, or right-click the page and choose **Inspect**) and select the **Network** tab.
+3. Reload the page. Every row that appears is one request your browser sent to a server.
+4. Click any row. Find the request's **method** (a word like `GET`) and its **status** (a number like `200`).
+
+What do you think `GET` and `200` mean?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`GET` means "please give me this". `200` means "OK, here it is". Requests and their status codes are the language of the web; you will learn them properly in lesson 2.3. The point for now: loading one page made dozens of requests to backends you never see.
+:::
+
+## What changed in the project
+
+Nothing yet. Next, in lesson 0.2 (listed on the [Part 0 page](index.qmd)), you set up your terminal: the tool you will use to build everything else.
