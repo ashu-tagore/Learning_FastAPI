@@ -55,7 +55,7 @@ Parts 1 to 8 end with a **Review and practice** lesson: mixed exercises without 
 | 3.2 | SQL I: create, insert, select, update, delete | |
 | 3.3 | SQL II: joins, aggregates, subqueries, CTEs, window functions | |
 | 3.4 | Data modelling: keys, constraints, normalisation; designing Atlas's schema | Schema v1 |
-| 3.5 | Common data patterns: timestamps, soft delete, audit history, enums, many-to-many, JSON columns | Audit columns |
+| 3.5 | Common data patterns: timestamps, soft delete, audit history, enums, many-to-many, JSON columns | Pattern toolbox (used in Parts 4 and 8) |
 | 3.6 | Indexes and query tuning: `EXPLAIN ANALYZE`, index types, reading query plans | Full-text index |
 | 3.7 | Transactions and concurrency: isolation levels, locks, deadlocks, optimistic locking | Safe concurrent writes |
 | 3.8 | Python and SQL: drivers, SQLAlchemy 2.0, sessions | Data layer |

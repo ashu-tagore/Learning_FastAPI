@@ -1,0 +1,153 @@
+---
+title: "3.12 Review and practice"
+description: "Consolidate Part 3 without step-by-step help: mixed SQL and Python exercises, building atlas issue-stats from a spec and its tests, and questions revisiting Parts 1 and 2."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 12 · Review · Plan 3 to 4 hours, spread over several sessions
+:::
+
+No new theory, no step-by-step instructions. Use the 20-minute rule, then the hints.
+
+## Recap
+
+| Lesson | Key idea | One-line reminder |
+|---|---|---|
+| [3.1](01-why-databases.qmd) | Databases and Docker | data in a volume survives `down`, not `down -v` |
+| [3.2](02-sql-basics.qmd) | SQL basics | check the `WHERE` with a `SELECT` before any `UPDATE` or `DELETE` |
+| [3.3](03-sql-joins-and-aggregates.qmd) | Joins and aggregates | left join for "every X, even with no Y"; `HAVING` filters groups |
+| [3.4](04-data-modelling.qmd) | Data modelling | surrogate keys plus `UNIQUE` for real-world rules; each fact once |
+| [3.5](05-data-patterns.qmd) | Data patterns | `CHECK` for code-owned values, tables for data-owned ones |
+| [3.6](06-indexes-and-query-plans.qmd) | Indexes | measure with `EXPLAIN ANALYZE`; column order matters |
+| [3.7](07-transactions-and-concurrency.qmd) | Transactions | do the arithmetic in SQL; lock in a consistent order |
+| [3.8](08-python-and-sql.qmd) | Python and SQL | placeholders always; one engine, one session per unit of work |
+| [3.9](09-choosing-a-data-store.qmd) | Choosing a store | start with Postgres; specialise when you can name the limit |
+| [3.10](10-schema-design-exercise.qmd) | Schema design | the product's questions decide the tables and indexes |
+| [3.11](11-testing-database-code.qmd) | Testing with a database | real Postgres, rollback per test, fixed dates |
+
+## Mixed practice
+
+Run the SQL ones in psql against the `atlas` database (after `atlas index` and `atlas issues --save`); write the Python ones as functions in `storage.py` with tests.
+
+1. **Biggest folders.** In SQL: the ten folders of Ignite with the most lines of code, using the part of `documents.path` before the last `/`. (Hint: `regexp_replace(path, '/[^/]*$', '')`.)
+2. **Docs-to-code ratio.** One query returning the number of `doc` files, the number of `code` files, and their ratio, using `count(*) FILTER (WHERE kind = 'doc')`.
+3. **Unlabelled issues.** `unlabelled_issues(session, repo)` returns stored issues with no labels, with a left join and `IS NULL`.
+4. **Explain a slow query.** Write a query over `chunks` that you expect to be slow, show its plan, then make it fast (an index, or a rewrite) and show the new plan.
+5. **Atomic re-index check.** Write a test proving that if `index_folder` raises halfway (simulate it by making a file unreadable in a way the code doesn't handle), the previously stored documents are still there after the rollback.
+
+::: {.callout-tip collapse="true" title="Hints"}
+1. `GROUP BY` the expression and `sum(line_count)`.
+2. `count(*) FILTER (WHERE ...)` counts only matching rows; divide using `::numeric` to avoid integer division.
+3. `select(Issue).outerjoin(Issue.labels).where(Label.id.is_(None))`. (`is_(None)` is SQLAlchemy's `IS NULL`.)
+4. A condition on `lower(text)` or `text LIKE '%...%'` can't use any index Atlas has.
+5. Use `monkeypatch` to replace `storage.split_into_chunks` with a function that raises on the second file, wrap the call in `pytest.raises` inside a `with session.begin_nested():` block, then count documents.
+:::
+
+## Build it alone: `atlas issue-stats`
+
+### The spec
+
+A command summarising the open issues stored by `atlas issues --save`:
+
+```text
+$ atlas issue-stats
+By label:
+    2  good first issue
+    2  help wanted
+
+By age:
+    3  under 30 days
+    0  30 to 180 days
+    0  over 180 days
+```
+
+(That output comes from the course's sample issues, lesson 2.6.)
+
+Requirements:
+
+- Option `--repo` (default `pytorch/ignite`). Uses `DATABASE_URL` like the other database commands, with the same error when it's missing.
+- **By label**: every label used by at least one stored issue, with its issue count, most common first, ties alphabetical. Computed in SQL with a join and `GROUP BY`, not in Python.
+- **By age**: exactly three buckets in this order, **including empty ones**: under 30 days, 30 to 180 days, over 180 days, measured from "now". Computed in SQL with `CASE`.
+- Two functions in `storage.py`: `label_counts(session, repo_full_name)` and `age_buckets(session, repo_full_name, now)`. `now` is a parameter so tests don't depend on the clock (lesson 3.11).
+
+### The acceptance tests
+
+```python
+def test_label_counts_most_common_first(session: Session) -> None:
+    issues = [
+        make_issue(1, ("good first issue",)),
+        make_issue(2, ("good first issue", "docs")),
+        make_issue(3, ("help wanted",)),
+    ]
+    storage.save_issues(session, "pytorch/ignite", issues)
+
+    assert storage.label_counts(session, "pytorch/ignite") == [
+        ("good first issue", 2),
+        ("docs", 1),
+        ("help wanted", 1),
+    ]
+
+
+def test_age_buckets_include_empty_buckets(session: Session) -> None:
+    issues = [make_issue(1, (), days_old=3), make_issue(2, (), days_old=400)]
+    storage.save_issues(session, "pytorch/ignite", issues)
+
+    now = datetime(2026, 11, 17, tzinfo=UTC)
+    assert storage.age_buckets(session, "pytorch/ignite", now) == [
+        ("under 30 days", 1),
+        ("30 to 180 days", 0),
+        ("over 180 days", 1),
+    ]
+```
+
+::: {.callout-tip collapse="true" title="Hint 1: counting labels"}
+Start from `Label`, join the `issue_labels` link table, filter by repository, group by `Label.name`, and order by the count descending then the name. In SQLAlchemy, `issue_labels.c.label_id` refers to a column of a `Table` defined without a class (`.c` is for "columns").
+:::
+
+::: {.callout-tip collapse="true" title="Hint 2: buckets in SQL"}
+`func.extract("epoch", now - Issue.created_at)` gives an age in seconds; divide by 86400 for days. `case((condition, "label"), ..., else_="label")` builds a SQL `CASE`. Group by the `case` expression itself.
+:::
+
+::: {.callout-tip collapse="true" title="Hint 3: empty buckets"}
+`GROUP BY` can't produce a group for rows that don't exist. Get the counts that do exist into a dict, then build the final list from the fixed list of bucket names with `.get(name, 0)`.
+:::
+
+When your tests pass, compare with the reference: `label_counts`, `age_buckets` and `run_issue_stats` in `atlas/src/atlas/storage.py` and `cli.py`.
+
+## From earlier parts
+
+**1.** (1.9) `index_folder` skips files that contain the NUL character. Why can't it simply store them?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Postgres `text` columns can't hold the NUL character (byte zero). Such a file is effectively binary anyway, so skipping it (and counting it as skipped) is the right plan B, like skipping non-UTF-8 files in lesson 1.9.
+:::
+
+**2.** (2.1) `atlas index` runs in one transaction. What happens to the database if you press Ctrl + C halfway through?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Ctrl + C sends `SIGINT`, Python raises `KeyboardInterrupt`, the `with session.begin()` block exits with an exception and rolls back, and the connection closes. The old index is untouched. Even a `SIGKILL` leaves no half-index: Postgres rolls back any transaction whose connection disappears before committing.
+:::
+
+**3.** (2.5) Why does `save_issues` delete stored issues that aren't in the fetched list, and what assumption does that make?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The table is meant to mirror the currently open issues, and an issue missing from GitHub's open list has been closed. The assumption: the fetched list is *complete* for those labels. If pagination were cut short (by `max_pages`), issues on later pages would be wrongly deleted. Lesson 5.3 revisits syncing.
+:::
+
+## Self-check
+
+You're ready for Part 4 when you can, **without notes**:
+
+- [ ] Start Postgres with Docker Compose and connect with psql.
+- [ ] Write `SELECT` queries with `WHERE`, `ORDER BY`, joins (inner and left), `GROUP BY` and `HAVING`.
+- [ ] Use a CTE and a window function such as `row_number()`.
+- [ ] Design tables with primary keys, foreign keys, unique and check constraints, and explain each choice.
+- [ ] Read an `EXPLAIN ANALYZE` plan and add an index that changes it.
+- [ ] Explain the lost-update problem and two ways to prevent it.
+- [ ] Use parameters instead of string formatting, and say why.
+- [ ] Define SQLAlchemy models, and explain `flush` versus `commit`.
+- [ ] Write a database test that leaves no data behind.
+
+## What changed in the project
+
+`atlas` stores repositories, documents, chunks and issues in Postgres; `atlas find` searches with ranking; `atlas issue-stats` summarises issues. **Checkpoint 3 is complete.** Commit, push, and compare with the reference at tag `checkpoint-03`. Next, Part 4: putting a web API in front of all of this with FastAPI.

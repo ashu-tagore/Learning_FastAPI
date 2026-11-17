@@ -1,0 +1,269 @@
+---
+title: "3.11 Testing code that touches a database"
+description: "Test database code against a real Postgres, give every test a clean slate with transaction rollback, build test data with small factory functions, and run it all in CI."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 11 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: a rehearsal stage that resets itself"}
+Actors rehearse on a stage set that looks exactly like the real one, because a cardboard prop behaves differently from the real thing. After each scene a crew puts every object back in place, so the next scene starts identically. Database tests need the same two things: the **real** database (not a stand-in that behaves differently), and an automatic **reset** after every test.
+:::
+
+## Why a real Postgres
+
+In lesson 2.6 you faked GitHub with `httpx.MockTransport`. Why not fake the database too? Because Atlas's database code *is* its behaviour: the `tsvector` column, `websearch_to_tsquery`, unique constraints and cascading deletes all happen inside Postgres. A fake would test your fake, not Atlas. And SQLite (lesson 3.9's stretch) lacks the features Atlas uses.
+
+The rule this course follows: **fake what you don't own and can't control (GitHub, AI models), use the real thing for what you do own (your database)**.
+
+## A separate test database
+
+Tests must never touch your development data. Create a database just for them:
+
+```text
+$ docker compose exec db psql -U atlas -d atlas -c "create database atlas_test;"
+CREATE DATABASE
+```
+
+and tell the tests where it is through an environment variable:
+
+```bash
+export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
+```
+
+## The fixtures
+
+Two fixtures in `tests/conftest.py` do all the work:
+
+```python
+@pytest.fixture(scope="session")
+def engine() -> Iterator[Engine]:
+    """One engine for the whole test run, on a database used only by tests."""
+    url = os.environ.get("TEST_DATABASE_URL")
+    if url is None:
+        pytest.skip("set TEST_DATABASE_URL to run database tests (see lesson 3.11)")
+
+    engine = create_engine(url)
+    # Start from empty tables every run, whatever a previous run left behind.
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def session(engine: Engine) -> Iterator[Session]:
+    """A session whose changes are rolled back after each test.
+
+    The test's own commits become savepoints inside one outer transaction,
+    so every test starts from the same empty tables and tests never interfere.
+    """
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        session = Session(bind=connection, join_transaction_mode="create_savepoint")
+        try:
+            yield session
+        finally:
+            session.close()
+            transaction.rollback()
+```
+
+- `scope="session"` makes the `engine` fixture run **once per test run**, not once per test: creating the tables once is much faster. (Here "session" is pytest's word for the whole test run, unrelated to a SQLAlchemy session.)
+- A fixture that `yield`s runs the code after `yield` when the test finishes, like a `finally` (lesson 1.11 used `tmp_path`, which works the same way internally).
+- `pytest.skip(...)` turns a missing database into skipped tests with a clear reason, instead of a crash. The other tests still run.
+
+### The rollback trick
+
+Each test gets a session bound to a connection whose **outer transaction is never committed**. When the test ends, `transaction.rollback()` undoes everything the test did.
+
+But the code under test may itself commit (or call `session.begin()`). `join_transaction_mode="create_savepoint"` handles that: inside the test, a commit only releases a **savepoint** (a bookmark inside the outer transaction) instead of really committing.
+
+```{mermaid}
+sequenceDiagram
+  participant F as session fixture
+  participant DB as Postgres (atlas_test)
+  participant T as test
+  F->>DB: BEGIN (outer transaction)
+  F->>T: session
+  T->>DB: INSERT documents, chunks ... (inside a savepoint)
+  T->>DB: SELECT ... (sees its own rows)
+  T-->>F: test finished (pass or fail)
+  F->>DB: ROLLBACK (everything the test did disappears)
+```
+
+After the whole suite, the test database is empty again:
+
+```text
+ repos | documents | issues
+-------+-----------+--------
+     0 |         0 |      0
+```
+
+Rolling back is far faster than deleting rows or recreating tables for each test, and it means test order never matters.
+
+## Small factory functions
+
+Tests need realistic objects with sensible defaults. A tiny **factory function** keeps each test focused on what matters to *it*:
+
+```python
+def make_issue(number: int, labels: tuple[str, ...], days_old: int = 1) -> github.Issue:
+    return github.Issue(
+        number=number,
+        title=f"Issue {number}",
+        url=f"https://github.com/pytorch/ignite/issues/{number}",
+        author="contributor",
+        labels=labels,
+        comments=0,
+        created_at=datetime(2026, 11, 17, tzinfo=UTC) - timedelta(days=days_old),
+    )
+```
+
+A test then reads like the behaviour it checks:
+
+```python
+def test_save_issues_inserts_updates_and_removes_closed(session: Session) -> None:
+    storage.save_issues(session, "pytorch/ignite", [make_issue(1, ("bug",)), make_issue(2, ())])
+
+    storage.save_issues(session, "pytorch/ignite", [make_issue(2, ("docs",))])
+
+    stored = session.scalars(select(Issue)).all()
+    assert [issue.number for issue in stored] == [2]
+    assert [label.name for label in stored[0].labels] == ["docs"]
+```
+
+The dates are fixed (17 November 2026), not `datetime.now()`, so the test gives the same result on any day (lesson 1.11: no dependence on the outside world).
+
+## What the storage tests cover
+
+The `sample_repo` fixture from lesson 1.11 (a tiny fake codebase in `tmp_path`) feeds the indexing tests, so they don't depend on your Ignite clone:
+
+```text
+tests/test_storage.py::test_split_into_chunks_covers_every_line_once PASSED
+tests/test_storage.py::test_index_stores_documents_and_chunks PASSED
+tests/test_storage.py::test_reindexing_replaces_instead_of_duplicating PASSED
+tests/test_storage.py::test_documents_are_classified_as_code_or_doc PASSED
+tests/test_storage.py::test_find_ranks_matching_chunks_with_line_ranges PASSED
+tests/test_storage.py::test_find_uses_word_stems PASSED
+tests/test_storage.py::test_find_only_searches_the_named_repo PASSED
+tests/test_storage.py::test_chunk_text_is_searchable_through_generated_column PASSED
+tests/test_storage.py::test_save_issues_inserts_updates_and_removes_closed PASSED
+tests/test_storage.py::test_labels_are_shared_not_duplicated PASSED
+tests/test_storage.py::test_label_counts_most_common_first PASSED
+tests/test_storage.py::test_age_buckets_include_empty_buckets PASSED
+============================== 12 passed in 0.38s ==============================
+```
+
+Twelve database tests in under half a second. Two of these tests failed when first written, and both failures taught something:
+
+- **Ordering.** A test expected paths in Python's order (`README.md` first), but this Postgres sorts text ignoring case (`ignite/...` first). The test now compares sets, because the order of those rows wasn't the behaviour under test.
+- **Code search.** "fire event" found nothing, which led to the punctuation fix in lesson 3.6. A test found a real product bug before any user did.
+
+Without `TEST_DATABASE_URL`, the database tests are skipped with their reason, and everything else still runs:
+
+```text
+SKIPPED [1] tests/test_storage.py:103: set TEST_DATABASE_URL to run database tests (see lesson 3.11)
+36 passed, 11 skipped in 0.27s
+```
+
+## Running it in CI
+
+A skipped test protects nothing. In CI the database tests must always run, so `.github/workflows/ci.yml` starts a Postgres **service container** next to the test job:
+
+```yaml
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas-test-password
+          POSTGRES_DB: atlas_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atlas -d atlas_test"
+          --health-interval 2s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://atlas:atlas-test-password@localhost:5432/atlas_test
+```
+
+It's the same idea as `compose.yml` (lesson 3.1), in GitHub Actions' format: start Postgres 17, wait until it's healthy, then run the job with `TEST_DATABASE_URL` set. CI is covered properly in lesson 7.2.
+
+## Common mistakes
+
+- **Tests sharing a database with development**: one `drop_all` and your data is gone.
+- **Tests that pass alone but fail together**, because one test's rows leak into another. Rollback per test prevents it.
+- **Tests asserting on row order without `ORDER BY`**, or on an order the database's text sorting decides.
+- **`datetime.now()` in test data**, making results depend on the day.
+- **Silently skipping in CI.** Make CI provide the database so the skip never happens there.
+
+## Check yourself
+
+**1.** Why doesn't Atlas fake the database in tests the way it fakes GitHub?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Much of Atlas's behaviour (full-text search, constraints, cascades) happens inside Postgres, so a fake would only test the fake. GitHub is external, rate-limited and changes; Atlas's own database is fully under its control and fast to run locally.
+:::
+
+**2.** What does `join_transaction_mode="create_savepoint"` solve?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Code under test may commit. With this mode, those commits only release savepoints inside the fixture's outer transaction, so the final rollback still undoes everything the test did.
+:::
+
+**3.** A test uses `datetime.now()` to create an issue "3 days old" and checks it's in the "under 30 days" bucket. What could go wrong?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Probably nothing on most days, but the test now depends on the clock: if the code and the test compute "now" slightly differently, or the boundaries change, it can fail unpredictably. Fixed dates, with "now" passed in as a parameter (as `age_buckets` does), make it deterministic.
+:::
+
+## Exercise
+
+Write a test proving that deleting a repo deletes its documents **and their chunks** (the `ON DELETE CASCADE` chain from lesson 3.4). Index `sample_repo`, delete the `Repo` row, flush, and count chunks.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from sqlalchemy import delete
+
+
+def test_deleting_a_repo_cascades_to_documents_and_chunks(
+    session: Session, sample_repo: Path
+) -> None:
+    storage.index_folder(session, "pytorch/ignite", sample_repo)
+
+    session.execute(delete(Repo).where(Repo.full_name == "pytorch/ignite"))
+    session.flush()
+
+    assert session.scalar(select(func.count()).select_from(Document)) == 0
+    assert session.scalar(select(func.count()).select_from(Chunk)) == 0
+```
+
+A bulk `delete()` statement goes straight to the database, so it's Postgres's foreign-key cascade that removes the children: exactly what the test is meant to prove.
+:::
+
+## Stretch
+
+Add a test that the database **rejects** a chunk whose `start_line` is after its `end_line`. Use `pytest.raises(IntegrityError)` (from `sqlalchemy.exc`) around a `session.flush()`. Why must the test flush?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from sqlalchemy.exc import IntegrityError
+
+
+def test_chunk_line_range_is_enforced(session: Session, sample_repo: Path) -> None:
+    storage.index_folder(session, "pytorch/ignite", sample_repo)
+    document = session.scalars(select(Document)).first()
+    assert document is not None
+
+    session.add(Chunk(document_id=document.id, start_line=10, end_line=5, text="x"))
+    with pytest.raises(IntegrityError):
+        session.flush()
+```
+
+`session.add` alone sends nothing to the database; the `CHECK` constraint only fires when the `INSERT` runs, which is at flush (or commit). After a database error, the session must be rolled back before it's usable again; the fixture's final rollback takes care of that.
+:::
+
+## What changed in the project
+
+`my-atlas` has database fixtures in `conftest.py`, a `test_storage.py` suite, and a CI job that runs it against a real Postgres. Commit: `test: Covered storage against a real Postgres`.

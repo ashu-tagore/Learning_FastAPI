@@ -1,0 +1,303 @@
+---
+title: "3.6 Indexes, query plans and full-text search"
+description: "Read EXPLAIN ANALYZE, make slow queries fast with the right index, understand when indexes don't help, and build Atlas's full-text search on a GIN index."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 6 · About 80 minutes
+:::
+
+::: {.callout-note title="Analogy: the index at the back of a book"}
+To find every page mentioning "checkpoint" in a 900-page book, you can read every page (slow, but always works), or turn to the index at the back, which lists the word with its page numbers (fast, but someone had to build it, and it makes the book thicker). A database **index** is the same trade: extra storage and slightly slower writes, in exchange for finding rows without reading the whole table. **EXPLAIN** shows you which method the database chose.
+:::
+
+## A table big enough to be slow
+
+Indexes don't matter on five rows. In the `practice` database, create a million rows of fake page views:
+
+```sql
+CREATE TABLE page_views (
+    id         bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id    integer     NOT NULL,
+    path       text        NOT NULL,
+    viewed_at  timestamptz NOT NULL
+);
+
+INSERT INTO page_views (user_id, path, viewed_at)
+SELECT (random() * 50000)::int,
+       '/lessons/' || (random() * 96)::int,
+       now() - random() * interval '365 days'
+FROM generate_series(1, 1000000);
+
+ANALYZE page_views;
+```
+
+`generate_series(1, 1000000)` produces a million rows to select from; `random()` fills them with varied values. `ANALYZE` updates the statistics Postgres uses to plan queries.
+
+## Reading a query plan
+
+`EXPLAIN ANALYZE` runs a query and reports **how** it was executed and how long each step took:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM page_views WHERE user_id = 4242;
+```
+```text
+ Gather  (cost=1000.00..13563.43 rows=21 width=31) (actual time=1.612..26.933 rows=15 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   ->  Parallel Seq Scan on page_views  (cost=0.00..12561.33 rows=9 width=31) (actual time=0.763..20.615 rows=5 loops=3)
+         Filter: (user_id = 4242)
+         Rows Removed by Filter: 333328
+ Planning Time: 0.161 ms
+ Execution Time: 26.956 ms
+```
+
+Read a plan from the most indented line outwards:
+
+- **Seq Scan** ("sequential scan") means reading every row. Postgres split it across 3 processes (2 workers plus the main one), and each read about a third of the table.
+- **Rows Removed by Filter: 333328** (per process): almost every row read was thrown away to find 15.
+- `cost` is Postgres's estimate in abstract units; `actual time` is milliseconds. `rows=21` (estimated) versus `rows=15` (actual) shows how good the statistics are.
+- **Execution Time: 26.956 ms.** Fine once; terrible if every API request does it.
+
+Later plans in this lesson leave out lines that don't matter for the point being made.
+
+## Adding an index
+
+```sql
+CREATE INDEX page_views_user_idx ON page_views (user_id);
+EXPLAIN ANALYZE SELECT * FROM page_views WHERE user_id = 4242;
+```
+```text
+ Bitmap Heap Scan on page_views  (cost=4.59..85.48 rows=21 width=31) (actual time=0.074..0.095 rows=15 loops=1)
+   Recheck Cond: (user_id = 4242)
+   Heap Blocks: exact=15
+   ->  Bitmap Index Scan on page_views_user_idx  (cost=0.00..4.58 rows=21 width=0) (actual time=0.066..0.066 rows=15 loops=1)
+         Index Cond: (user_id = 4242)
+ Planning Time: 0.319 ms
+ Execution Time: 0.114 ms
+```
+
+From 27 ms to 0.11 ms, over two hundred times faster, with the same query text: SQL says *what*, the database chose *how* (lesson 3.2). Postgres looked up `4242` in the index, got the locations of 15 rows, and read only those.
+
+The default index type is a **B-tree**: a sorted tree structure. Finding a value takes a few steps even among millions of rows (O(log n), lesson 1.5), and because it's sorted, it also serves ranges (`>`, `BETWEEN`) and `ORDER BY`.
+
+## Composite indexes and column order
+
+An index can cover several columns. This one serves "a user's most recent views":
+
+```sql
+CREATE INDEX page_views_user_time_idx ON page_views (user_id, viewed_at DESC);
+EXPLAIN ANALYZE SELECT * FROM page_views WHERE user_id = 4242 ORDER BY viewed_at DESC LIMIT 5;
+```
+```text
+ Limit  (cost=0.42..21.46 rows=5 width=31) (actual time=0.059..0.067 rows=5 loops=1)
+   ->  Index Scan using page_views_user_time_idx on page_views  (cost=0.42..88.79 rows=21 width=31) (actual time=0.057..0.063 rows=5 loops=1)
+         Index Cond: (user_id = 4242)
+ Execution Time: 0.087 ms
+```
+
+No sorting step at all: the index already holds each user's rows in time order, so Postgres reads the first five and stops.
+
+Column order matters. Think of a phone book sorted by surname, then first name: it helps you find "Smith, Ada", and every Smith, but not everyone called Ada. This index helps queries on `user_id`, or on `user_id` and `viewed_at` together, but not on `viewed_at` alone:
+
+```sql
+EXPLAIN SELECT * FROM page_views WHERE viewed_at > now() - interval '1 hour';
+```
+```text
+ Gather  (cost=1000.00..15655.47 rows=108 width=31)
+   Workers Planned: 2
+   ->  Parallel Seq Scan on page_views  (cost=0.00..14644.67 rows=45 width=31)
+         Filter: (viewed_at > (now() - '01:00:00'::interval))
+```
+
+(`EXPLAIN` without `ANALYZE` shows the plan without running the query.)
+
+## When indexes don't help
+
+**Wrapping the column in an expression hides it from the index:**
+
+```sql
+EXPLAIN SELECT * FROM page_views WHERE user_id + 0 = 4242;
+```
+```text
+ Gather  (cost=1000.00..15103.00 rows=5000 width=31)
+   Workers Planned: 2
+   ->  Parallel Seq Scan on page_views  (cost=0.00..13603.00 rows=5000 width=31)
+         Filter: ((user_id + 0) = 4242)
+```
+
+The index stores `user_id` values, not `user_id + 0`. The same happens with `lower(title) = ...` or `created_at::date = ...`. Rewrite the condition to leave the column alone, or create an index on the expression itself (`CREATE INDEX ... ON issues (lower(title))`).
+
+Other cases where Postgres rightly ignores an index:
+
+- **Small tables**: reading a few pages directly is faster than consulting an index.
+- **Conditions matching most rows**: if 90% of rows match, reading the whole table is cheaper than jumping around.
+- **`LIKE '%word%'`**: a B-tree can't search inside text. Full-text search (below) can.
+
+## The cost of indexes
+
+```sql
+SELECT pg_size_pretty(pg_relation_size('page_views')) AS table_size,
+       pg_size_pretty(pg_relation_size('page_views_user_idx')) AS user_index_size;
+```
+```text
+ table_size | user_index_size
+------------+-----------------
+ 57 MB      | 7808 kB
+```
+
+Every index takes space and must be updated on every insert, update and delete. Add indexes for the queries you actually run, check with `EXPLAIN ANALYZE` that they're used, and remove ones that aren't. Primary keys and unique constraints create their own indexes automatically, which is why Atlas's `(repo_id, path)` lookups are already fast.
+
+## Full-text search
+
+`ILIKE '%checkpoint%'` (lesson 3.2) reads every row and matches only exact substrings. **Full-text search** understands words:
+
+- It splits text into **tokens**, drops common **stop words** ("the", "to") and reduces words to their **stem**: "saving" and "saves" both become `save`, "checkpoints" becomes `checkpoint`.
+- A **`tsvector`** is a document's list of stems with their positions; a **`tsquery`** is a search.
+- `@@` means "matches".
+
+`websearch_to_tsquery` turns what people type into a tsquery, including quoted phrases and excluded words:
+
+```sql
+SELECT websearch_to_tsquery('english', 'saving checkpoints'),
+       websearch_to_tsquery('english', '"good first issue"'),
+       websearch_to_tsquery('english', 'checkpoint -test');
+```
+```text
+ 'save' & 'checkpoint' | 'good' <-> 'first' <-> 'issu' | 'checkpoint' & !'test'
+```
+
+`&` means "and", `<->` means "followed by", `!` means "not". The stems look odd (`issu`), but the same stemming is applied to the documents, so they match.
+
+### The code problem
+
+Postgres's parser was designed for prose. Here's what it makes of a line of Ignite's code:
+
+```sql
+SELECT alias, token, lexemes FROM ts_debug('english', 'self.fire_event(Events.STARTED)');
+```
+```text
+   alias   |     token      |     lexemes
+-----------+----------------+------------------
+ host      | self.fire      | {self.fire}
+ blank     | _              |
+ asciiword | event          | {event}
+ blank     | (              |
+ host      | Events.STARTED | {events.started}
+ blank     | )              |
+```
+
+It thinks `self.fire` and `Events.STARTED` are web addresses (`host`), so a search for "fire" would never find this line. This was a real bug found while building Atlas: a test searching for "fire event" returned nothing. The fix is to turn punctuation into spaces before indexing:
+
+```sql
+SELECT to_tsvector('english', regexp_replace('self.fire_event(Events.STARTED)', '[^[:alnum:]]+', ' ', 'g'));
+```
+```text
+ 'event':3,4 'fire':2 'self':1 'start':5
+```
+
+`regexp_replace` with the pattern `[^[:alnum:]]+` (one or more characters that aren't letters or digits, lesson 1.7) replaces each run with a space, and the `'g'` flag means every occurrence. Now `fire`, `event` and `start` are words.
+
+### Atlas's search column and index
+
+Atlas stores the searchable form in a **generated column**, which Postgres computes from `text` and keeps up to date by itself, and indexes it with **GIN**, an index type built for "which rows contain this word?":
+
+```sql
+ALTER TABLE chunks ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
+    to_tsvector('english', regexp_replace(text, '[^[:alnum:]]+', ' ', 'g'))
+) STORED;
+
+CREATE INDEX ix_chunks_tsv ON chunks USING gin (tsv);
+```
+
+On Ignite's 2,437 chunks, the index is used:
+
+```text
+ Aggregate  (cost=83.45..83.46 rows=1 width=8) (actual time=0.227..0.228 rows=1 loops=1)
+   ->  Bitmap Heap Scan on chunks  (cost=21.60..83.41 rows=18 width=0) (actual time=0.100..0.218 rows=51 loops=1)
+         Recheck Cond: (tsv @@ '''fire'' & ''event'''::tsquery)
+         ->  Bitmap Index Scan on ix_chunks_tsv  (cost=0.00..21.60 rows=18 width=0) (actual time=0.082..0.083 rows=51 loops=1)
+               Index Cond: (tsv @@ '''fire'' & ''event'''::tsquery)
+ Execution Time: 0.272 ms
+```
+
+With the index disabled for comparison (`SET enable_bitmapscan = off; SET enable_indexscan = off;`), the same query scans everything:
+
+```text
+ Aggregate  (cost=513.51..513.52 rows=1 width=8) (actual time=3.705..3.706 rows=1 loops=1)
+   ->  Seq Scan on chunks  (cost=0.00..513.46 rows=18 width=0) (actual time=0.155..3.695 rows=51 loops=1)
+         Filter: (tsv @@ '''fire'' & ''event'''::tsquery)
+         Rows Removed by Filter: 2386
+ Execution Time: 3.737 ms
+```
+
+Fourteen times slower on a small table, and the gap grows with the table. Ranking (`ts_rank`, how well a chunk matches) and highlighted snippets (`ts_headline`) complete the search; lesson 3.8 puts them into `atlas find`.
+
+One quirk to know: a query with an excluded word (`checkpoint -test`) produces meaningless ranks (Postgres gives all such matches a near-zero score), so results are effectively ordered by Atlas's tie-breakers, path and line.
+
+## Common mistakes
+
+- **Guessing instead of measuring.** Always confirm with `EXPLAIN ANALYZE` on realistic data.
+- **Indexing every column** "just in case": slower writes, wasted space.
+- **Functions on indexed columns** in `WHERE`.
+- **Wrong column order** in a composite index.
+- **`LIKE '%text%'` for search.** Use full-text search (or, in Part 6, semantic search).
+- **Running `EXPLAIN ANALYZE` on a `DELETE` in production.** It really runs the statement.
+
+## Check yourself
+
+**1.** In a plan, what does `Rows Removed by Filter` being huge tell you?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The database read many rows only to discard them: a sign that an index on the filtered column (or a better one) could avoid reading them at all.
+:::
+
+**2.** Will an index on `(repo_id, created_at)` help `WHERE created_at > '2026-01-01'`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Not efficiently: the index is ordered by `repo_id` first, so rows by date are scattered across it. It helps queries filtering on `repo_id`, or `repo_id` and `created_at` together.
+:::
+
+**3.** Why does Atlas replace punctuation before building the `tsvector`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Postgres's English parser treats code like `self.fire_event` as host names and file names, so the words inside are never indexed. Replacing punctuation with spaces turns code into plain words the parser handles correctly.
+:::
+
+## Exercise
+
+1. In `practice`, query the 10 most recent views of path `/lessons/42` and look at the plan. Add an index that makes it fast, and show the new plan.
+2. Find out how many rows Postgres estimated versus actually returned for your query.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM page_views WHERE path = '/lessons/42' ORDER BY viewed_at DESC LIMIT 10;
+
+CREATE INDEX page_views_path_time_idx ON page_views (path, viewed_at DESC);
+
+EXPLAIN ANALYZE
+SELECT * FROM page_views WHERE path = '/lessons/42' ORDER BY viewed_at DESC LIMIT 10;
+```
+
+The first plan scans the table and sorts; the second reads ten entries from the index and stops. The estimate is the `rows=` inside `cost=(...)`; the actual count is the `rows=` inside `actual time=(...)`.
+:::
+
+## Stretch
+
+Make case-insensitive title search on the practice `issues` table use an index: create an **expression index** on `lower(title)` and confirm with `EXPLAIN` (set `SET enable_seqscan = off;` first, since the table is tiny and Postgres would otherwise rightly prefer a scan).
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+CREATE INDEX issues_lower_title_idx ON issues (lower(title));
+SET enable_seqscan = off;
+EXPLAIN SELECT * FROM issues WHERE lower(title) = 'clarify transforms docs';
+RESET enable_seqscan;
+```
+
+The plan shows `Index Scan using issues_lower_title_idx`. The query must use exactly the indexed expression, `lower(title)`. `enable_seqscan` is for experiments only, never production.
+:::
+
+## What changed in the project
+
+You know how Atlas's search column and its GIN index work, and why the punctuation step exists. They're part of the `chunks` model in lesson 3.8.

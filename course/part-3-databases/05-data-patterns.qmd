@@ -1,0 +1,267 @@
+---
+title: "3.5 Common data patterns"
+description: "Reusable solutions for recurring needs: generated ids, timestamps, soft delete, audit history, allowed values, and JSON columns, with when to use each."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 5 · About 60 minutes
+:::
+
+::: {.callout-note title="Analogy: a carpenter's standard joints"}
+Carpenters don't invent a new way to join two boards for every cupboard. They reach for a handful of standard joints, each suited to a situation, each with known strengths and weaknesses. Database design has standard joints too. Knowing them saves you from reinventing them badly, and lets you recognise them in every codebase you join.
+:::
+
+This lesson builds a `notes` table in the `practice` database (lesson 3.1) to try each pattern. Part 4 uses several of them for real.
+
+## Generated ids and defaults
+
+```sql
+CREATE TABLE notes (
+    id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    issue_ref   text        NOT NULL,
+    body        text        NOT NULL,
+    status      text        NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'final')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    deleted_at  timestamptz
+);
+
+INSERT INTO notes (issue_ref, body)
+VALUES ('pytorch/ignite#101', 'Typo is on line 42'), ('pytorch/ignite#102', 'Needs a test first')
+RETURNING id, status, created_at;
+```
+```text
+ id | status |          created_at
+----+--------+-------------------------------
+  1 | draft  | 2026-11-17 17:21:09.977014+00
+  2 | draft  | 2026-11-17 17:21:09.977014+00
+(2 rows)
+```
+
+- `GENERATED ALWAYS AS IDENTITY` is the modern, standard way to auto-number rows (the `SERIAL` in lesson 3.4 is Postgres's older shorthand for the same idea).
+- `DEFAULT now()` fills in the time the row was written. Both rows share a timestamp because `now()` is the start time of the transaction (lesson 3.7), not the moment each row was inserted.
+
+## Allowed values: CHECK versus lookup tables
+
+`status` may only be `draft` or `final`:
+
+```sql
+INSERT INTO notes (issue_ref, body, status) VALUES ('x', 'y', 'published');
+```
+```text
+ERROR:  new row for relation "notes" violates check constraint "notes_status_check"
+DETAIL:  Failing row contains (3, x, y, published, 2026-11-17 17:21:09.978362+00, 2026-11-17 17:21:09.978362+00, null).
+```
+
+Three ways to restrict a column to a set of values:
+
+| Approach | Good for | Changing the set |
+|---|---|---|
+| `CHECK (status IN (...))` | small, stable sets owned by the code (Atlas's `kind IN ('code', 'doc')`) | a migration |
+| Postgres `ENUM` type | the same, with a named type | adding is easy; removing or renaming is awkward |
+| A lookup table + foreign key | sets that users or admins change, or that carry extra data (a label's colour) | just insert a row |
+
+Atlas's labels are a lookup table because they come from GitHub and change; document kinds are a `CHECK` because only Atlas's code defines them.
+
+## Timestamps: created and updated
+
+Almost every table benefits from `created_at` and `updated_at`. `DEFAULT now()` handles creation; keeping `updated_at` current needs a **trigger**: a function the database runs automatically on certain events.
+
+```sql
+CREATE FUNCTION touch_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER notes_touch BEFORE UPDATE ON notes
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+UPDATE notes SET body = 'Typo is on line 43' WHERE id = 1;
+SELECT id, updated_at > created_at AS was_updated FROM notes WHERE id = 1;
+```
+```text
+ id | was_updated
+----+-------------
+  1 | t
+(1 row)
+```
+
+The function is written in PL/pgSQL, Postgres's own small programming language; `NEW` is the row about to be saved. Triggers are powerful but invisible when you read application code, so use them sparingly and document them. Many projects set `updated_at` in application code instead (the ORM can do it, lesson 3.8). Pick one place and stick to it.
+
+## Soft delete
+
+A **hard delete** (`DELETE`) removes the row forever. A **soft delete** marks it deleted and keeps it:
+
+```sql
+UPDATE notes SET deleted_at = now() WHERE id = 2;
+SELECT id, issue_ref, deleted_at IS NOT NULL AS is_deleted FROM notes ORDER BY id;
+```
+```text
+ id |     issue_ref      | is_deleted
+----+--------------------+------------
+  1 | pytorch/ignite#101 | f
+  2 | pytorch/ignite#102 | t
+(2 rows)
+```
+
+Every normal query must then filter out deleted rows:
+
+```sql
+SELECT id, issue_ref FROM notes WHERE deleted_at IS NULL;
+```
+```text
+ id |     issue_ref
+----+--------------------
+  1 | pytorch/ignite#101
+(1 row)
+```
+
+A **partial index** (lesson 3.6) can cover only the live rows, keeping lookups fast:
+
+```sql
+CREATE INDEX notes_live_issue_idx ON notes (issue_ref) WHERE deleted_at IS NULL;
+```
+
+| | Hard delete | Soft delete |
+|---|---|---|
+| Undo | impossible (without backups) | set `deleted_at` back to `NULL` |
+| Every query | simple | must remember `WHERE deleted_at IS NULL` |
+| Unique constraints | simple | a deleted row still blocks a new one with the same value, unless the constraint is partial too |
+| Privacy laws ("delete my data") | satisfied | not satisfied: the data is still there (lesson 7.11) |
+
+Use soft delete when users need undo or you need history for business reasons; use hard delete by default. Atlas hard-deletes closed issues, because GitHub remains the source of truth.
+
+## Audit history
+
+When you need to know **who changed what, and when**, keep a history table. Here a trigger copies the old body on every change:
+
+```sql
+CREATE TABLE notes_history (
+    id         bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    note_id    bigint      NOT NULL,
+    old_body   text        NOT NULL,
+    changed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION record_note_change() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO notes_history (note_id, old_body) VALUES (OLD.id, OLD.body);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER notes_audit AFTER UPDATE OF body ON notes
+FOR EACH ROW EXECUTE FUNCTION record_note_change();
+
+UPDATE notes SET body = 'Typo is on line 44' WHERE id = 1;
+SELECT note_id, old_body FROM notes_history;
+```
+```text
+ note_id |      old_body
+---------+--------------------
+       1 | Typo is on line 43
+(1 row)
+```
+
+The history table is **append-only**: rows are added, never changed. Part 8 keeps exactly this kind of record for every step an agent takes, because "what did the agent do, and why?" must always be answerable.
+
+## JSON columns
+
+Postgres's `jsonb` type stores JSON (lesson 1.9) in a column, and can query inside it:
+
+```sql
+CREATE TABLE github_payloads (issue_ref text PRIMARY KEY, payload jsonb NOT NULL);
+INSERT INTO github_payloads VALUES ('pytorch/ignite#101',
+  '{"title": "Fix typo", "user": {"login": "contributor"}, "labels": [{"name": "docs"}], "comments": 2}');
+
+SELECT payload->>'title' AS title,
+       payload->'user'->>'login' AS author,
+       (payload->>'comments')::int + 1 AS next_comment
+FROM github_payloads;
+```
+```text
+  title   |   author    | next_comment
+----------+-------------+--------------
+ Fix typo | contributor |            3
+(1 row)
+```
+
+```sql
+SELECT issue_ref FROM github_payloads WHERE payload @> '{"labels": [{"name": "docs"}]}';
+```
+```text
+     issue_ref
+--------------------
+ pytorch/ignite#101
+(1 row)
+```
+
+`->` gets a JSON value, `->>` gets it as text, and `@>` means "contains this JSON". A GIN index (lesson 3.6) makes `@>` fast.
+
+JSON columns are right for data whose shape you don't control or don't query much: a raw API response kept for debugging, user preferences, an agent tool's arguments (Part 8). They're wrong for data you filter, join or constrain regularly: you lose types, foreign keys and `NOT NULL`. A good rule: if you query a field often, give it a real column.
+
+## Common mistakes
+
+- **Soft delete everywhere by default**, then a query forgets the filter and shows "deleted" data to users.
+- **`updated_at` set in two places** (a trigger *and* the code), each with different rules.
+- **JSON columns as a way to avoid designing a schema.** You'll pay for it in every query.
+- **Editing history rows.** An audit trail that can be changed proves nothing.
+- **`ENUM` for values that change often.** Removing a value later is awkward.
+
+## Check yourself
+
+**1.** Atlas stores document kinds (`code`, `doc`) with a `CHECK`, but labels in their own table. Why the difference?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Document kinds are a tiny set defined by Atlas's own code; changing them is a code change anyway. Labels come from GitHub, change without warning, and need their own identity to be linked to many issues. Fixed and code-owned: `CHECK`. Data-driven and changing: a table.
+:::
+
+**2.** What's the main risk of soft delete?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Any query that forgets `WHERE deleted_at IS NULL` treats deleted rows as live, which can show users data they deleted. It also keeps personal data that privacy rules may require you to remove.
+:::
+
+**3.** When is a `jsonb` column the right choice?
+
+::: {.callout-tip collapse="true" title="Answer"}
+For data whose structure you don't control or rarely query: raw API payloads, flexible settings, tool arguments. Not for fields you filter, join or need to constrain; those deserve real columns.
+:::
+
+## Exercise
+
+Add an `archived_at` soft-delete column to the practice `issues` table from lesson 3.2. Archive issue 103, then write a query showing only non-archived open issues, and create a partial index that makes that query's filter fast.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+ALTER TABLE issues ADD COLUMN archived_at timestamptz;
+UPDATE issues SET archived_at = now() WHERE number = 103;
+
+SELECT number, title
+FROM issues
+WHERE archived_at IS NULL AND state = 'open';
+
+CREATE INDEX issues_active_open_idx ON issues (repo_id)
+WHERE archived_at IS NULL AND state = 'open';
+```
+
+The index's `WHERE` must match the query's filter for Postgres to use it.
+:::
+
+## Stretch
+
+Extend the audit trigger so `notes_history` also records **who** made the change. Postgres knows the connected user as `current_user`; add a `changed_by text NOT NULL DEFAULT current_user` column. Why is the database user usually *not* the right "who" for a web application?
+
+::: {.callout-tip collapse="true" title="Answer"}
+```sql
+ALTER TABLE notes_history ADD COLUMN changed_by text NOT NULL DEFAULT current_user;
+```
+
+A web API connects to the database as one shared user (`atlas`) for every request, so `current_user` is always `atlas`, not the person who clicked the button. Real applications record their own logged-in user's id in the history row, from the application code (Part 4 has users).
+:::
+
+## What changed in the project
+
+Nothing in `my-atlas`: these patterns are your toolbox. Atlas already uses timestamps (`indexed_at`), allowed values (`kind`), lookup tables (labels) and cascading deletes; Part 4 adds created and updated times on user data, and Part 8 adds an append-only audit trail.

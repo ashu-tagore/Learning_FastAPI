@@ -8,15 +8,15 @@ title: "Part 3: Databases"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 3.1 | Why databases; Docker basics; running Postgres *(coming soon)* | `compose.yml` with Postgres |
-| 3.2 | SQL I: create, insert, select, update, delete *(coming soon)* |  |
-| 3.3 | SQL II: joins, aggregates, subqueries, CTEs, window functions *(coming soon)* |  |
-| 3.4 | Data modelling: keys, constraints, normalisation; designing Atlas's schema *(coming soon)* | Schema v1 |
-| 3.5 | Common data patterns: timestamps, soft delete, audit history, enums, many-to-many, JSON columns *(coming soon)* | Audit columns |
-| 3.6 | Indexes and query tuning: `EXPLAIN ANALYZE`, index types, reading query plans *(coming soon)* | Full-text index |
-| 3.7 | Transactions and concurrency: isolation levels, locks, deadlocks, optimistic locking *(coming soon)* | Safe concurrent writes |
-| 3.8 | Python and SQL: drivers, SQLAlchemy 2.0, sessions *(coming soon)* | Data layer |
-| 3.9 | Choosing a data store: relational, key-value, document, search, time-series, vector *(coming soon)* | Comparison notes |
-| 3.10 | Schema design exercise from a written spec, without guidance *(coming soon)* |  |
-| 3.11 | Testing code that touches a database *(coming soon)* | DB test fixtures |
-| 3.12 | Review and practice *(coming soon)* | Unguided: issue statistics queries |
+| 3.1 | [Why databases; Docker basics; running Postgres](01-why-databases.qmd) | `compose.yml` with Postgres |
+| 3.2 | [SQL I: create, insert, select, update, delete](02-sql-basics.qmd) |  |
+| 3.3 | [SQL II: joins, aggregates, subqueries, CTEs, window functions](03-sql-joins-and-aggregates.qmd) |  |
+| 3.4 | [Data modelling: keys, constraints, normalisation; designing Atlas's schema](04-data-modelling.qmd) | Schema v1 |
+| 3.5 | [Common data patterns: timestamps, soft delete, audit history, enums, many-to-many, JSON columns](05-data-patterns.qmd) | Pattern toolbox (used in Parts 4 and 8) |
+| 3.6 | [Indexes and query tuning: `EXPLAIN ANALYZE`, index types, reading query plans](06-indexes-and-query-plans.qmd) | Full-text index |
+| 3.7 | [Transactions and concurrency: isolation levels, locks, deadlocks, optimistic locking](07-transactions-and-concurrency.qmd) | Safe concurrent writes |
+| 3.8 | [Python and SQL: drivers, SQLAlchemy 2.0, sessions](08-python-and-sql.qmd) | Data layer |
+| 3.9 | [Choosing a data store: relational, key-value, document, search, time-series, vector](09-choosing-a-data-store.qmd) | Comparison notes |
+| 3.10 | [Schema design exercise from a written spec, without guidance](10-schema-design-exercise.qmd) |  |
+| 3.11 | [Testing code that touches a database](11-testing-database-code.qmd) | DB test fixtures |
+| 3.12 | [Review and practice](12-review-and-practice.qmd) | Unguided: issue statistics queries |

@@ -1,0 +1,131 @@
+---
+title: "3.9 Choosing a data store"
+description: "Know the main kinds of database (relational, key-value, document, search, time-series, vector, graph), what each is good at, and how to choose."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 9 · About 45 minutes
+:::
+
+::: {.callout-note title="Analogy: containers in a kitchen"}
+A kitchen has a fridge, a freezer, a spice rack, a bread bin and a pantry. Each is good at one kind of storage, and you could force everything into one (bread in the freezer works, spices in the fridge sort of work), but the right container makes the job easier. Databases are the same: several kinds, each designed around a particular way of storing and finding data. The skill is knowing when one general-purpose container is enough, and when a specialised one earns its place.
+:::
+
+## The main kinds
+
+| Kind | Stores | Shines at | Examples |
+|---|---|---|---|
+| **Relational** | tables with types, keys and constraints | correctness, relationships, flexible queries, transactions | PostgreSQL, MySQL, SQLite |
+| **Key-value** | values looked up by a single key | extremely fast reads and writes of simple items: caches, sessions, rate limits, queues | Redis, Memcached, DynamoDB |
+| **Document** | JSON-like documents, flexible shape | data that's naturally a self-contained document, with a varying structure | MongoDB, Firestore |
+| **Search engine** | text with inverted indexes | relevance-ranked full-text search, typo tolerance, facets, at large scale | Elasticsearch, OpenSearch |
+| **Time-series** | timestamped measurements | huge volumes of metrics over time, aggregating by time window | Prometheus, TimescaleDB, InfluxDB |
+| **Vector** | lists of numbers representing meaning | "find things *similar* to this" (semantic search, Part 6) | pgvector, Qdrant, Pinecone |
+| **Graph** | nodes and the connections between them | many-hop relationship questions ("friends of friends who...") | Neo4j |
+| **Object storage** | files (blobs) of any size | large files cheaply, at massive scale | Amazon S3, MinIO (lesson 5.4) |
+
+Most of these trade something away. Key-value stores give up queries ("find all sessions for user 42" is hard if the key is the session id). Document stores usually give up joins and some guarantees. Search engines are typically updated a little after the main database and are not the place where truth lives.
+
+## What "relational" gives you
+
+Relational databases, and Postgres in particular, cover a remarkable amount of ground:
+
+- **Transactions and constraints** (lessons 3.4 and 3.7): the data can't become contradictory.
+- **Ad-hoc queries**: questions you didn't plan for can still be answered with SQL.
+- **Postgres extras** that overlap with the specialised kinds: `jsonb` for document-style data (lesson 3.5), full-text search with GIN indexes (lesson 3.6), and, through the **pgvector** extension, vector search (lesson 6.4).
+
+That's why a common piece of advice is: **start with Postgres**, and add a specialised store when you can name the specific limit you've hit.
+
+## How to choose
+
+Ask, in order:
+
+1. **What questions will you ask the data?** Lookup by one key only (key-value)? Arbitrary filters and joins (relational)? "Similar to this" (vector)? Ranked text relevance at scale (search engine)?
+2. **How much correctness do you need?** Money, orders and anything users would be harmed by losing or duplicating need transactions and constraints.
+3. **How big and how fast?** Millions of rows is small for Postgres. Billions of metrics per day, or a million cache reads per second, may not be.
+4. **What can your team operate?** Every additional database is another thing to deploy, back up, monitor, upgrade and secure (Part 7). That cost is real and permanent.
+
+```{mermaid}
+flowchart TD
+  Q[New data need] --> R{Need transactions,<br/>relationships or ad-hoc queries?}
+  R -->|yes| PG[Postgres]
+  R -->|no| K{Simple lookups by key,<br/>very high speed, can expire?}
+  K -->|yes| RD[Redis]
+  K -->|no| F{Large files?}
+  F -->|yes| S3[Object storage]
+  F -->|no| PG
+  PG --> L{Hit a specific limit?<br/>measured, not imagined}
+  L -->|no| PG2[Stay with Postgres]
+  L -->|yes| SP[Add a specialised store<br/>for that one job]
+```
+
+## Atlas's choices
+
+| Data | Store | Why |
+|---|---|---|
+| repos, documents, chunks, issues, labels | Postgres | relationships, constraints, transactions (lesson 3.4) |
+| keyword search | Postgres full-text | data volume is modest; one less system (lesson 3.6) |
+| semantic search (Part 6) | Postgres with pgvector | vectors sit next to the chunks they describe, in the same transaction |
+| cache, rate limits, job queue (Part 5) | Redis | tiny items, very fast access, automatic expiry |
+| repository snapshots (Part 5) | object storage (S3) | large files, cheap |
+
+This is recorded in the course's decision log (decision D8): "Postgres for everything, including vectors", rejecting a separate vector database because one database is simpler to learn, operate and keep consistent. A dedicated vector database would make sense with hundreds of millions of vectors, or when vector search latency becomes the bottleneck: problems Atlas doesn't have.
+
+## Common mistakes
+
+- **Picking a database because it's fashionable**, not because of the questions you'll ask.
+- **Several databases from day one**, each needing backups, monitoring and upgrades, for an app with a few thousand rows.
+- **Treating a cache or search index as the source of truth.** They can always be rebuilt from the main database; that's what makes them safe.
+- **Document stores to "avoid designing a schema".** The schema still exists, just hidden in your code and enforced nowhere.
+
+## Check yourself
+
+**1.** Why does Atlas keep vectors in Postgres rather than a dedicated vector database?
+
+::: {.callout-tip collapse="true" title="Answer"}
+At Atlas's scale, pgvector is fast enough, and keeping vectors next to their chunks means one system to run and back up, plus vector and text updates in a single transaction. A dedicated store adds operational cost without solving a problem Atlas has.
+:::
+
+**2.** A feature needs "number of API requests per user in the last minute", checked on every request. Which store, and why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Redis: a tiny counter per user, read and incremented on every request, expiring automatically after a minute. Writing that to Postgres on every request would be wasteful, and nothing bad happens if it's lost. You'll build exactly this in lesson 5.5.
+:::
+
+**3.** What makes it safe to use a search engine or cache alongside a main database?
+
+::: {.callout-tip collapse="true" title="Answer"}
+They hold copies, not the truth. If they're lost or wrong, they can be rebuilt from the main database.
+:::
+
+## Exercise
+
+For each scenario, choose a store and give one sentence of reasoning:
+
+1. User accounts and their saved searches.
+2. The last 30 seconds of "who is online" for a chat app.
+3. CPU and memory measurements from 500 servers every 10 seconds, kept for a year.
+4. PDF uploads up to 50 MB each.
+5. "Find code chunks that mean the same as this question, even with different words."
+
+::: {.callout-tip collapse="true" title="Suggested answers"}
+1. Postgres: relational data with ownership rules and constraints.
+2. Redis: short-lived, frequently changing, fine to lose, needs expiry.
+3. A time-series database (or Postgres with the TimescaleDB extension): huge volumes of timestamped measurements, queried by time window.
+4. Object storage, with only the file's key and metadata in Postgres.
+5. Vector search, which in Atlas means Postgres with pgvector (Part 6).
+
+Other answers can be right if the reasoning names the questions, the correctness needs and the scale.
+:::
+
+## Stretch
+
+Read about SQLite (it ships with Python as the `sqlite3` module). It's a relational database stored in a single file, with no server. Name one situation where it's a better choice than Postgres, and one reason Atlas's tests (lesson 3.11) don't use it.
+
+::: {.callout-tip collapse="true" title="Answer"}
+SQLite is excellent for single-user or embedded apps (a phone app, a desktop tool, a small CLI's local data) where running a server is overkill. Atlas's tests don't use it because Atlas depends on Postgres-only features (full-text search with `tsvector`, generated columns using Postgres functions, and later pgvector); tests on a different database would test different behaviour.
+:::
+
+## What changed in the project
+
+No code changes. Atlas's storage choices for the rest of the course are now explained.

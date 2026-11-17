@@ -24,7 +24,9 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 ## Commands
 
 ```bash
-cd atlas && uv sync && uv run pytest                       # reference tests
+cd atlas && docker compose up -d                           # local Postgres (Part 3 onward)
+export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
+cd atlas && uv sync && uv run pytest                       # reference tests (DB tests skip without TEST_DATABASE_URL)
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)

@@ -1,0 +1,276 @@
+---
+title: "3.7 Transactions and concurrency"
+description: "Make several changes succeed or fail together, see what goes wrong when two clients change the same data, and fix it with atomic updates, row locks and optimistic locking."
+---
+
+::: {.lesson-meta}
+Part 3 · Lesson 7 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: a bank transfer and a shared whiteboard"}
+Moving money between two accounts is two steps: subtract here, add there. If the power fails between them, money has vanished. A bank makes both steps one indivisible **transaction**: both happen, or neither does.
+
+Now picture two people updating a number on a shared whiteboard. Both read "10", both walk to their desks, both come back and write "11". One increase is lost, and neither person did anything wrong. That's a **concurrency** bug, and databases give you tools to prevent it.
+:::
+
+## Transactions and ACID
+
+A **transaction** groups statements into one unit. In SQL:
+
+```sql
+BEGIN;
+UPDATE repo_stars SET stars = stars + 100 WHERE name = 'ignite';
+UPDATE repo_stars SET stars = stars - 100 WHERE name = 'vision';
+COMMIT;      -- or ROLLBACK; to undo everything since BEGIN
+```
+
+Transactions give four guarantees, remembered as **ACID**:
+
+| Letter | Guarantee | Means |
+|---|---|---|
+| A | **Atomicity** | all statements take effect, or none do |
+| C | **Consistency** | constraints hold before and after |
+| I | **Isolation** | concurrent transactions don't see each other's half-finished work |
+| D | **Durability** | once committed, it survives a crash |
+
+Every statement in Postgres runs in a transaction; without `BEGIN`, each statement is its own one-statement transaction.
+
+## Atomicity in action
+
+This lesson's examples use Python with **psycopg**, the Postgres driver Atlas uses (lesson 3.8 explains it properly), because demonstrating concurrency needs two connections at once. Install it in `my-atlas` with `uv add "psycopg[binary]"`. The table, in the `practice` database:
+
+```sql
+CREATE TABLE repo_stars (name text PRIMARY KEY, stars integer NOT NULL, version integer NOT NULL);
+INSERT INTO repo_stars VALUES ('ignite', 10, 1), ('vision', 20, 1);
+```
+
+A transaction where the second statement fails:
+
+```python
+import psycopg
+
+URL = "postgresql://atlas:atlas-dev-password@localhost:5432/practice"
+
+with psycopg.connect(URL) as conn:
+    try:
+        with conn.transaction():
+            conn.execute("UPDATE repo_stars SET stars = stars + 100 WHERE name = 'ignite'")
+            conn.execute("UPDATE repo_stars SET stars = 'many' WHERE name = 'vision'")
+    except psycopg.errors.InvalidTextRepresentation as error:
+        print("error:", error.diag.message_primary)
+    print(conn.execute("SELECT name, stars FROM repo_stars ORDER BY name").fetchall())
+```
+```text
+error: invalid input syntax for type integer: "many"
+[('ignite', 10), ('vision', 20)]
+```
+
+The first update ran, the second failed, and `ignite` is still 10: the whole transaction was rolled back. `with conn.transaction():` commits when the block ends normally and rolls back if an exception escapes it.
+
+Atlas relies on this when indexing (lesson 3.8): it deletes the old index and inserts the new one in one transaction, so a crash halfway leaves the old index intact, and searches never see half an index.
+
+## The lost update
+
+Two connections, `alice` and `bob`, each read the star count, add one in Python, and write it back:
+
+```python
+alice = psycopg.connect(URL)
+bob = psycopg.connect(URL)
+
+alice_sees = alice.execute("SELECT stars FROM repo_stars WHERE name = 'ignite'").fetchone()[0]
+bob_sees = bob.execute("SELECT stars FROM repo_stars WHERE name = 'ignite'").fetchone()[0]
+
+alice.execute("UPDATE repo_stars SET stars = %s WHERE name = 'ignite'", (alice_sees + 1,))
+alice.commit()
+bob.execute("UPDATE repo_stars SET stars = %s WHERE name = 'ignite'", (bob_sees + 1,))
+bob.commit()
+```
+```text
+both read 10 -> final 11
+```
+
+Two increments, one result. Both transactions were individually correct; their interleaving lost an update. (`%s` is a placeholder for a value passed separately; lesson 3.8 explains why you must always use it.)
+
+```{mermaid}
+sequenceDiagram
+  participant A as alice
+  participant DB as Postgres
+  participant B as bob
+  A->>DB: SELECT stars (10)
+  B->>DB: SELECT stars (10)
+  A->>DB: UPDATE stars = 11, COMMIT
+  B->>DB: UPDATE stars = 11, COMMIT
+  Note over DB: final value 11, not 12
+```
+
+This happens in real web APIs constantly: two users click "like" at once, two workers process the same job. It never shows up when you test alone.
+
+## Fix 1: do the arithmetic in the database
+
+```python
+alice.execute("UPDATE repo_stars SET stars = stars + 1 WHERE name = 'ignite'")
+alice.commit()
+bob.execute("UPDATE repo_stars SET stars = stars + 1 WHERE name = 'ignite'")
+bob.commit()
+```
+```text
+final 13
+```
+
+`stars = stars + 1` is read-and-write in one statement, and Postgres makes each row update wait for any other update to that row to finish. Both increments count (11 to 13). **Whenever a change can be expressed as one statement, do that.**
+
+## Fix 2: lock the row with SELECT ... FOR UPDATE
+
+Sometimes you must read a value, decide something in Python, then write. `SELECT ... FOR UPDATE` locks the row: other transactions that try to lock or change it wait until you commit.
+
+```python
+start = time.perf_counter()
+alice.execute("SELECT stars FROM repo_stars WHERE name = 'ignite' FOR UPDATE")
+print(f"{time.perf_counter() - start:.2f}s alice locked the row")
+
+
+def bob_waits() -> None:
+    stars = bob.execute("SELECT stars FROM repo_stars WHERE name = 'ignite' FOR UPDATE").fetchone()[0]
+    print(f"{time.perf_counter() - start:.2f}s bob got the lock and sees {stars}")
+    bob.execute("UPDATE repo_stars SET stars = %s WHERE name = 'ignite'", (stars + 1,))
+    bob.commit()
+
+
+thread = threading.Thread(target=bob_waits)
+thread.start()
+time.sleep(1)
+alice.execute("UPDATE repo_stars SET stars = stars + 1 WHERE name = 'ignite'")
+alice.commit()
+print(f"{time.perf_counter() - start:.2f}s alice committed")
+thread.join()
+```
+```text
+0.00s alice locked the row
+1.00s alice committed
+1.01s bob got the lock and sees 14
+final 15
+```
+
+Bob's `SELECT ... FOR UPDATE` waited a full second, until Alice committed, then saw her value (14) and built on it. (A **thread** is used here only so Bob can wait while Alice continues; lesson 2.6 covered threads.)
+
+Locks make others wait, so hold them briefly: never lock a row and then make a slow network call before committing.
+
+## Fix 3: optimistic locking
+
+Locking assumes conflicts are likely. **Optimistic locking** assumes they're rare: read freely, and at write time check that nobody changed the row in between, using a `version` column:
+
+```python
+version = alice.execute("SELECT version FROM repo_stars WHERE name = 'vision'").fetchone()[0]
+alice.commit()
+
+bob.execute("UPDATE repo_stars SET stars = 25, version = version + 1 WHERE name = 'vision'")
+bob.commit()
+
+result = alice.execute(
+    "UPDATE repo_stars SET stars = 30, version = version + 1 WHERE name = 'vision' AND version = %s",
+    (version,),
+)
+print("rows updated:", result.rowcount)
+```
+```text
+rows updated: 0
+```
+
+Bob changed the row first and bumped its version, so Alice's update matched nothing. Her code sees `0` and can reload and retry, or tell the user "someone else edited this; please review their changes". This is the standard approach for things people edit in a browser, where a lock held for minutes would be unacceptable.
+
+## Deadlocks
+
+If two transactions each lock a row and then wait for the other's row, neither can proceed: a **deadlock**.
+
+```python
+def lock_in_order(conn, first: str, second: str, label: str) -> None:
+    try:
+        conn.execute("UPDATE repo_stars SET stars = stars + 1 WHERE name = %s", (first,))
+        time.sleep(0.5)
+        conn.execute("UPDATE repo_stars SET stars = stars + 1 WHERE name = %s", (second,))
+        conn.commit()
+        print(label, "committed")
+    except psycopg.errors.DeadlockDetected as error:
+        conn.rollback()
+        print(label, "error:", error.diag.message_primary)
+
+# alice locks ignite then vision; bob locks vision then ignite, at the same time
+```
+```text
+alice error: deadlock detected
+bob committed
+```
+
+Postgres detects the cycle after about a second and kills one transaction so the other can finish. The standard prevention: **always lock rows in the same order** (for example, by id). The victim should retry.
+
+## Isolation levels
+
+How much can concurrent transactions see of each other? Postgres's default level, **READ COMMITTED**, means each statement sees all data committed before it began. That's why the lost update above was possible: nothing stopped two transactions from reading the same old value.
+
+Stricter levels exist. With `SERIALIZABLE`, Postgres guarantees the result is as if transactions ran one at a time, and aborts one with a "could not serialize" error when that's impossible; your code must then retry. It's the safest choice for complex logic, at the cost of retries. For most cases, the three fixes above are simpler and clearer.
+
+## Common mistakes
+
+- **Read in Python, modify, write back** without an atomic update, a lock or a version check.
+- **Holding a lock during slow work**, like a network request.
+- **Locking rows in different orders** in different code paths, inviting deadlocks.
+- **Swallowing database errors** inside a transaction and carrying on: after an error, Postgres refuses further statements until you roll back.
+- **Assuming tests prove it's safe.** Concurrency bugs appear only under simultaneous load.
+
+## Check yourself
+
+**1.** Why didn't `stars = stars + 1` lose an update while read-then-write did?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`stars = stars + 1` reads and writes in one statement, and Postgres serialises updates to the same row: the second update waits for the first to commit and then reads its new value. Read-then-write in Python lets both read the old value before either writes.
+:::
+
+**2.** When would you choose optimistic locking over `SELECT ... FOR UPDATE`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+When conflicts are rare and the time between reading and writing is long, such as a user editing a form in a browser. A lock would block everyone for that whole time; a version check just detects the rare conflict.
+:::
+
+**3.** Postgres kills one transaction in a deadlock. What should the application do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Roll back and retry the whole transaction (usually after a short wait). And fix the cause: make every code path lock rows in the same order.
+:::
+
+## Exercise
+
+Write a function `transfer_stars(conn, source, target, amount)` that moves stars between two repos in one transaction, refusing (with `ValueError`) if the source would go below zero. Use `SELECT ... FOR UPDATE` on both rows, locking them **in alphabetical order by name** to avoid deadlocks.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def transfer_stars(conn: psycopg.Connection, source: str, target: str, amount: int) -> None:
+    first, second = sorted([source, target])
+    with conn.transaction():
+        conn.execute("SELECT 1 FROM repo_stars WHERE name = %s FOR UPDATE", (first,))
+        conn.execute("SELECT 1 FROM repo_stars WHERE name = %s FOR UPDATE", (second,))
+
+        source_stars = conn.execute(
+            "SELECT stars FROM repo_stars WHERE name = %s", (source,)
+        ).fetchone()[0]
+        would_go_negative = source_stars < amount
+        if would_go_negative:
+            raise ValueError(f"{source} has only {source_stars} stars")
+
+        conn.execute("UPDATE repo_stars SET stars = stars - %s WHERE name = %s", (amount, source))
+        conn.execute("UPDATE repo_stars SET stars = stars + %s WHERE name = %s", (amount, target))
+```
+
+Raising inside `conn.transaction()` rolls everything back. A `CHECK (stars >= 0)` constraint on the table would be a second, database-level guarantee.
+:::
+
+## Stretch
+
+Reproduce the lost update with the isolation level set to `SERIALIZABLE` on both connections (`psycopg.connect(URL)` then `conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE`). What happens to Bob's commit, and what would your code need to do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Bob's update fails with `could not serialize access due to concurrent update` (a `SerializationFailure` error). Postgres detects that the result couldn't have happened with one-at-a-time execution and refuses it. Bob's code must roll back and retry the whole transaction, reading the new value. Serializable trades a retry loop for not having to reason about every interleaving yourself.
+:::
+
+## What changed in the project
+
+Atlas indexes inside a single transaction (lesson 3.8), so a failed or interrupted index never leaves half-written data. The concurrency fixes return in Part 5, when several workers process jobs at once.
