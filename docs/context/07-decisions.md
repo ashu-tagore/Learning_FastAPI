@@ -4,6 +4,19 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D17. GitHub sign-in with identity scopes only (2026-11-17)
+**Decision:** lesson 4.8 adds "Sign in with GitHub" (OAuth2), refresh tokens and an `admin` role. The OAuth app requests identity scopes only.
+**Why:** real products rarely stop at password login, and the learner will meet OAuth everywhere. Identity-only scopes keep the rule that Atlas can never write to GitHub.
+
+### D16. The API becomes async in lesson 4.13 (2026-11-17)
+**Decision:** Part 4 builds the API with synchronous SQLAlchemy first, then converts it to async FastAPI with async SQLAlchemy in 4.13. The reference API is async from Checkpoint 4 onward.
+**Why:** sync code is easier to learn first; most production FastAPI code is async, and converting a working API shows exactly what changes and why.
+
+### D15. Curriculum expanded from 68 to 96 lessons (2026-11-17)
+**Decision:** add operating-system and Linux server basics, more Python practice, a deeper database part (query tuning, concurrency and locking, data patterns, choosing data stores, an unguided design exercise), async APIs, OAuth and roles, API styles, event streams, database operations, a security thread, privacy, incident response, distributed systems, a review-and-practice lesson closing each of Parts 1 to 8, and an unguided capstone.
+**Why:** a review against the "zero to production" promise found thin coverage (Python practice, databases, security) and missing topics (OS, async data access, OAuth, event streams, incidents, distributed systems). Guided projects alone create an illusion of competence, so unguided practice is built in.
+**Cost:** roughly 40% more lessons.
+
 ### D14. Own agent loop on the Messages API, not a hosted agent service (2026-11-17)
 **Decision:** Atlas Agents runs its own agent loop and its own sandbox.
 **Why:** the provider must be swappable, including local models through Ollama, and building the loop, tools, state machine and sandbox is the core learning goal of Part 8.

@@ -16,6 +16,7 @@
 - **Analogy, then theory, then real code.** Every lesson opens with an analogy for intuition, then the precise theory, then the project code.
 - **One project that keeps growing.** No throwaway toy apps. Every lesson adds something real to the same product.
 - **Learn by doing.** Every lesson has a quiz, a guided exercise and a stretch challenge, with hidden solutions.
+- **Practice without hand-holding.** Each part ends with a review lesson of unguided tasks, and the course ends with an unguided capstone, because following along is not the same as building alone.
 
 ## The product we build
 
@@ -35,10 +36,11 @@ Details are in [02-product.md](02-product.md).
 
 ## What "done" looks like
 
-- A public Quarto course site on GitHub Pages, about 68 lessons in 10 parts, every lesson complete with exercises.
+- A public Quarto course site on GitHub Pages, 96 lessons in 10 parts, every lesson complete with exercises, and a review-and-practice lesson closing each part.
 - Atlas and Atlas Agents running on AWS, deployed by CI/CD from this repo with Terraform.
 - A reference implementation in this repo whose tests pass in CI at every checkpoint tag.
 - Measured quality: retrieval and agent evaluations run in CI with scores tracked over time.
+- The learner has built one service (the Part 9 capstone) from a spec without guidance.
 - The learner can explain every line, and has made real contributions to the target project **by hand**.
 
 ## A note on the GSoC timeline

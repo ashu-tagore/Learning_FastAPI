@@ -7,15 +7,15 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 | # | Milestone | Delivers | Status |
 |---|---|---|---|
 | M0 | Foundation | Context docs, repo restructure, Quarto site skeleton on GitHub Pages, CI, `atlas/` package skeleton with tooling, lesson template | In progress (context docs done) |
-| M1 | Parts 0-1 | 11 lessons; `atlas` CLI v0 keyword search | Not started |
-| M2 | Part 2 | 4 lessons; GitHub client, concurrent issue fetch | Not started |
-| M3 | Part 3 | 6 lessons; Postgres schema, SQL search | Not started |
-| M4 | Part 4 | 12 lessons ported from the original tutorial; API v1; web UI v1 | Not started |
-| M5 | Part 5 | 5 lessons; worker, queue, webhooks, storage, cache | Not started |
-| M6 | Part 6 | 8 lessons; providers, ingestion, hybrid search, `/ask`, evals | Not started |
-| M7 | Part 7 | 9 lessons; Terraform, ECS deploy, CI/CD, observability | Not started |
-| M8 | Part 8 | 9 lessons; agent runs, sandbox, Issue Briefs, web UI v2 | Not started |
-| M9 | Part 9 | 4 lessons; design docs, outbox, career material | Not started |
+| M1 | Parts 0-1 | 15 lessons; `atlas` CLI v0 keyword search | Not started |
+| M2 | Part 2 | 7 lessons; OS and network basics, GitHub client, concurrent issue fetch | Not started |
+| M3 | Part 3 | 12 lessons; Postgres schema, query tuning, concurrency, SQL search | Not started |
+| M4 | Part 4 | 16 lessons (12 ported from the original tutorial); GitHub sign-in; async API v1; web UI v1 | Not started |
+| M5 | Part 5 | 7 lessons; worker, queue, webhooks, storage, cache, event streams | Not started |
+| M6 | Part 6 | 9 lessons; providers, ingestion, hybrid search, `/ask`, evals | Not started |
+| M7 | Part 7 | 14 lessons; Terraform, ECS deploy, CI/CD, database operations, observability, security, privacy, incident response | Not started |
+| M8 | Part 8 | 10 lessons; agent runs, sandbox, Issue Briefs, web UI v2 | Not started |
+| M9 | Part 9 | 6 lessons; distributed systems, design docs, outbox, unguided capstone, career material | Not started |
 
 ## Definition of done (every milestone)
 

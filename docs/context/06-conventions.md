@@ -68,6 +68,16 @@ description: "One sentence on what the learner can do after this lesson."
 ## What changed     (files, link to diff between checkpoints)
 ```
 
+Review and practice lessons (the last lesson of Parts 1 to 8) use this template instead:
+
+```markdown
+## Recap            (the part's key ideas on one page, with links back)
+## Mixed practice   (exercises from across the part, no step-by-step hints)
+## Build it alone   (a small feature defined only by acceptance tests and a short spec)
+## From earlier parts (quiz questions revisiting older parts, for spaced repetition)
+## Self-check       (a rubric: what you should now be able to do without notes)
+```
+
 Writing rules for lessons:
 
 - Plain, direct sentences. Define every term the first time it appears.

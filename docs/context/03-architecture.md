@@ -26,7 +26,7 @@ flowchart LR
 
 | Component | Responsibility | Why separate |
 |---|---|---|
-| API service | HTTP, auth, validation, search, Q&A streaming, run control | Must answer in well under a second |
+| API service | HTTP, auth, validation, search, Q&A streaming, run control. Async (FastAPI + async SQLAlchemy) from lesson 4.13 | Must answer in well under a second |
 | Worker | GitHub sync, cloning, parsing, chunking, embedding | Jobs take seconds to minutes and must retry safely |
 | Agent worker | Executes agent runs step by step | Runs take minutes, pause for approval, and need sandbox access the API must never have |
 | Sandbox | Runs untrusted generated code | Isolation: no network, no secrets, hard resource limits |
@@ -190,6 +190,6 @@ flowchart LR
 
 - GitHub token: fine-grained, read-only, public repositories only.
 - Issue and repository text is untrusted. It is delimited in prompts, and the agent's tools have no outward side effects, so injected instructions cannot cause harm beyond a bad brief.
-- JWT auth with short-lived access tokens; Argon2 password hashing.
+- Short-lived JWT access tokens plus rotating refresh tokens; Argon2 password hashing; optional GitHub sign-in with identity scopes only; `admin` role for repository management.
 - Per-user rate limits and LLM spend limits.
 - Every agent step and approval is in an append-only audit trail.

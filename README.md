@@ -10,7 +10,7 @@ A course that takes you from never having written code to building, deploying an
 
 **Atlas Agents** watches the project for new good-first issues and prepares an **Issue Brief** for each: a summary, the relevant code, the project's conventions, the commands to run, and a reproduction script verified to fail. You then write the fix yourself. Atlas never posts to GitHub and never writes your code.
 
-Along the way you learn the whole backend stack: Python, Git, HTTP, SQL and Postgres, FastAPI, authentication, background jobs, caching, retrieval (RAG), agents and sandboxing, Docker, CI/CD, Terraform, AWS, observability, security and system design.
+Along the way you learn the whole backend stack: Python, Git, operating systems and Linux, HTTP, SQL and Postgres in depth, FastAPI (sync and async), authentication and OAuth, background jobs, event streams, caching, retrieval (RAG), agents and sandboxing, Docker, CI/CD, Terraform, AWS, observability, security, incident response, distributed systems and system design. 96 lessons in 10 parts.
 
 ## Course map
 
@@ -18,14 +18,14 @@ Along the way you learn the whole backend stack: Python, Git, HTTP, SQL and Post
 |---|---|---|
 | 0 | Start here: terminal, Git, GitHub | Your fork |
 | 1 | Programming with Python | `atlas search` CLI |
-| 2 | How the internet works | Fetch issues from GitHub |
+| 2 | Computers and the internet | Fetch issues from GitHub |
 | 3 | Databases and SQL | Data in Postgres |
 | 4 | Building APIs with FastAPI | Atlas API v1 + web UI |
 | 5 | Background work and integrations | Automatic syncing and indexing |
 | 6 | AI engineering: Atlas (RAG) | Cited answers, measured quality |
 | 7 | Production on AWS | Atlas live on AWS |
 | 8 | AI engineering: Atlas Agents | Verified Issue Briefs |
-| 9 | Scale and career | Portfolio-ready project |
+| 9 | Scale and career | Unguided capstone, portfolio |
 
 Full lesson list: [docs/context/04-curriculum.md](docs/context/04-curriculum.md).
 

@@ -18,6 +18,8 @@ Re-read both files before each milestone that touches the target; they can chang
 - **Learner** (primary): a contributor-in-training who wants to understand the target project and find issues they can genuinely solve.
 - **Admin**: manages which repositories are tracked. In practice the same person.
 
+Users sign in with email and password or with GitHub (OAuth2). GitHub sign-in requests identity scopes only, never repository write access.
+
 ## Stage A: Atlas (question answering)
 
 ### User stories
@@ -74,7 +76,7 @@ All JSON unless noted. Auth is a bearer JWT except where marked public.
 
 | Area | Endpoints |
 |---|---|
-| Auth | `POST /auth/register`, `POST /auth/login`, `GET /users/me`, `PATCH /users/me` (skills profile) |
+| Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `GET /auth/github/login`, `GET /auth/github/callback`, `GET /users/me`, `PATCH /users/me` (skills profile) |
 | Repositories | `GET /repos`, `POST /repos` (admin), `GET /repos/{id}`, `POST /repos/{id}/sync` (admin) |
 | Issues | `GET /issues?repo=&label=&state=&sort=fit`, `GET /issues/{id}`, `PUT /issues/{id}/saved`, `DELETE /issues/{id}/saved` |
 | Search | `GET /search?q=&repo=&mode=keyword\|semantic\|hybrid&limit=` |
