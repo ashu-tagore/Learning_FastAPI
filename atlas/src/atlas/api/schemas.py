@@ -52,9 +52,14 @@ class UserOut(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """PATCH body: every field optional, so a client can change just one."""
+    """PATCH body: a client sends only the fields it wants to change.
 
-    skills_profile: str | None = Field(default=None, max_length=2000)
+    Each field has a default so it may be left out, but its type doesn't allow null:
+    "absent" means "leave it alone", while null would mean "store nothing", which the
+    column forbids. Routes read model_dump(exclude_unset=True), so defaults never apply.
+    """
+
+    skills_profile: str = Field(default="", max_length=2000)
 
 
 class TokenPair(BaseModel):
