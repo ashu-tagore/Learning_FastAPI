@@ -11,7 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Settings every part of Atlas may need, including the command line."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a startup error would otherwise print every value it read,
+    # secrets included, into logs (lesson 4.2 shows the leak).
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     database_url: str | None = None
     # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
