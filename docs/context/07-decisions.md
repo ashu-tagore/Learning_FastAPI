@@ -4,6 +4,22 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D21. Migrations live inside the package and start from Part 3's schema (2026-11-18)
+**Decision:** Alembic's scripts live in `src/atlas/migrations/`. Revision 0001 is the Part 3 schema, 0002 the Part 4 tables, 0003 indexes; `atlas init-db` runs `upgrade head`. Existing Part 3 databases adopt migrations with `alembic stamp 0001`. Revision ids are renamed to sequential numbers. CI runs upgrade, downgrade, upgrade and `alembic check` on an empty database.
+**Why:** the CLI and the Docker image can find the migrations wherever Atlas is installed; learners keep the data they indexed in Part 3; sequential ids read in order.
+**Rejected:** a top-level `alembic/` folder (not shipped with the package); one squashed initial migration (would break learners' existing databases).
+
+### D20. GitHub sign-in uses PKCE as well as state, and asks for no scopes (2026-11-18)
+**Decision:** the OAuth flow sends an S256 PKCE challenge and a random state, both kept in one short-lived HttpOnly cookie. No `scope` parameter is sent, which grants read-only access to public information.
+**Why:** GitHub's documentation strongly recommends PKCE for OAuth apps; no scope is the narrowest grant and keeps the rule that Atlas never writes to GitHub. Refines D17.
+
+### D19. Ready-made web UI is plain HTML, CSS and JavaScript served by the API at /app (2026-11-18)
+**Decision:** `web/` holds three static files with no build step, served by FastAPI's `StaticFiles` when `WEB_DIR` is set. Tokens are kept in `sessionStorage`; the page loads no third-party scripts. GitHub sign-in hands tokens to the page in the URL fragment.
+**Why:** same origin as the API (no CORS needed locally), nothing to install, and every line is readable by a learner even though the course doesn't teach frontend (D10).
+**Rejected:** HttpOnly cookie sessions for the UI (needs CSRF protection, taught later in 7.10).
+
+---
+
 ### D18. Learners keep their code in their own `my-atlas` repository (2026-11-17)
 **Decision:** each learner creates a separate repository, `my-atlas`, in lesson 1.1. The course repo is cloned only for reading lessons and the reference code.
 **Why:** the planned git-ignored `workspace/` folder inside the course repo meant learners could never commit their own work, which defeats Part 0's Git lessons. A repository of their own also becomes their portfolio.

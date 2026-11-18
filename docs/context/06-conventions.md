@@ -101,7 +101,7 @@ Writing rules for lessons:
 
 ## Configuration
 
-- All settings come from environment variables through one `Settings` class (pydantic-settings). Nothing reads `os.environ` directly. (Exception by course order: Parts 1 to 3 predate lesson 4.2, so `cli.py` reads `GITHUB_TOKEN` and `DATABASE_URL` with `os.environ.get` until Part 4 replaces it.)
+- All settings come from environment variables through one `Settings` class (pydantic-settings). Nothing reads `os.environ` directly. (Parts 1 to 3 predate lesson 4.2, so their checkpoints read `os.environ` in `cli.py`; from Checkpoint 4 everything goes through `atlas.config`.) `.env.example` documents every variable.
 - Secrets have no defaults, so a missing secret fails at startup.
 
 ## Interaction with the target project

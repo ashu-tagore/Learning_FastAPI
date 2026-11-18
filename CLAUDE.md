@@ -27,6 +27,9 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 cd atlas && docker compose up -d                           # local Postgres (Part 3 onward)
 export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
 cd atlas && uv sync && uv run pytest                       # reference tests (DB tests skip without TEST_DATABASE_URL)
+cd atlas && uv run atlas init-db                           # run migrations (needs DATABASE_URL)
+cd atlas && uv run alembic revision --autogenerate -m "..."  # new migration; review it, rename the revision to the next number
+cd atlas && SECRET_KEY=dev WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload  # API + web UI at /app
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)
