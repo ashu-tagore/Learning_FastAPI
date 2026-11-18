@@ -37,7 +37,7 @@ async def search(
 
 @router.websocket("/live")
 async def search_as_you_type(websocket: WebSocket, repo: str = "pytorch/ignite") -> None:
-    """One open connection; each message is a query, each reply the top five hits (lesson 4.14).
+    """One open connection; each message is a query, each reply the top five hits (lesson 4.18).
 
     Compared with calling GET /search on every keystroke, the connection (and its TCP and
     TLS handshakes) is set up once, and the server could push updates without being asked.

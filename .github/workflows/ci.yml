@@ -43,7 +43,7 @@ jobs:
       - name: Tests
         run: uv run pytest -v
       # Migrations run from empty on their own database, then `alembic check` fails the build
-      # if a model changed without a migration (lesson 4.11).
+      # if a model changed without a migration (lesson 4.13).
       - name: Migrations
         env:
           PGPASSWORD: atlas-test-password

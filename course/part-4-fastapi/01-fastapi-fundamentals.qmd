@@ -121,7 +121,7 @@ Notice three things:
 
 1. The returned `dict` became JSON automatically.
 2. `details=true` in the URL arrived as the Python boolean `True`.
-3. The bad number was rejected with status 422 and a precise location (`["path", "number"]`). Lesson 4.12 reshapes this error into Atlas's own format.
+3. The bad number was rejected with status 422 and a precise location (`["path", "number"]`). Lesson 4.14 reshapes this error into Atlas's own format.
 
 ### Interactive documentation
 
@@ -129,7 +129,7 @@ Open `http://localhost:8000/docs` in a browser. FastAPI generated a page listing
 
 ### The Atlas API skeleton
 
-Atlas's real API lives in `src/atlas/api/`. Instead of a global `app`, it uses a **factory**: a function that builds and returns the app. That lets tests build an app with their own settings (lesson 4.15):
+Atlas's real API lives in `src/atlas/api/`. Instead of a global `app`, it uses a **factory**: a function that builds and returns the app. That lets tests build an app with their own settings (lesson 4.5):
 
 ```python
 def create_app(settings: ApiSettings | None = None) -> FastAPI:
@@ -193,7 +193,7 @@ $ time (for i in 1 2 3 4 5; do curl -s -o /dev/null http://localhost:8000/thread
 real 1.0s
 ```
 
-The blocking `async def` served the five requests one after another. The rule: **use `async def` only if everything slow inside it is awaited; otherwise use `def`.** Atlas's database code in Part 3 is synchronous, so lessons 4.1 to 4.12 use `def`. Lesson 4.13 switches the whole API to async database access and `async def`.
+The blocking `async def` served the five requests one after another. The rule: **use `async def` only if everything slow inside it is awaited; otherwise use `def`.** Atlas's database code in Part 3 is synchronous, so lessons 4.1 to 4.16 use `def`. Lesson 4.17 switches the whole API to async database access and `async def`.
 
 ## Common mistakes
 

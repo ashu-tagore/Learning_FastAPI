@@ -100,7 +100,7 @@ class SearchPage(BaseModel):
     next_offset: int | None
 
 
-# ---------- Notes (review lesson 4.16) ----------
+# ---------- Notes (review lesson 4.20) ----------
 
 
 class NoteCreate(BaseModel):

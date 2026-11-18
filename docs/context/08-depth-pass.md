@@ -1,6 +1,6 @@
 # 08. Depth pass: Parts 4 and 7
 
-Status: **proposed** (2026-11-18). Becomes decision D22 once approved.
+Status: **approved** (2026-11-18), decision D22. Progress is tracked in [05-roadmap.md](05-roadmap.md) as milestone D1.
 
 ## Why
 

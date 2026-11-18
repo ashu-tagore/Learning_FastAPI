@@ -1,5 +1,5 @@
 ---
-title: "4.5 Routers and project structure"
+title: "4.6 Routers and project structure"
 description: "Split the API into routers by resource, choose resource-shaped URLs, and lay out the project so each file has one clear job."
 ---
 
@@ -19,7 +19,7 @@ With every route in `app.py`, the file grows to thousands of lines and every cha
 
 ### Resource-shaped URLs
 
-**REST** (Representational State Transfer, more in lesson 4.14) is the dominant style for HTTP APIs. Its core habit: URLs name **resources** (nouns), and HTTP methods say what to do with them (verbs).
+**REST** (Representational State Transfer, more in lesson 4.18) is the dominant style for HTTP APIs. Its core habit: URLs name **resources** (nouns), and HTTP methods say what to do with them (verbs).
 
 | Method and path | Meaning |
 |---|---|
@@ -37,22 +37,22 @@ Not `/getIssues` or `/saveIssue?id=42`: the method already says "get" or "save".
 ```text
 src/atlas/
   config.py          settings (lesson 4.2)
-  models.py          tables (Part 3, plus users in 4.6)
+  models.py          tables (Part 3, plus users in 4.7)
   storage.py         database queries shared by CLI and API (Part 3)
-  security.py        hashing and tokens, no FastAPI imports (4.6, 4.7)
-  github_oauth.py    GitHub sign-in (4.8)
+  security.py        hashing and tokens, no FastAPI imports (4.7, 4.8)
+  github_oauth.py    GitHub sign-in (4.9)
   api/
     app.py           create_app: middleware, error handlers, routers
     deps.py          dependencies: settings, session, current user
     schemas.py       request and response shapes
-    idempotency.py   safe retries (4.12)
+    idempotency.py   safe retries (4.16)
     routes/
       auth.py        /auth/...
       users.py       /users/me...
       repos.py       /repos
       issues.py      /issues...
       search.py      /search
-      notes.py       notes (4.16)
+      notes.py       notes (4.20)
 ```
 
 The rule behind it: **code that knows about HTTP lives in `api/`; code that doesn't, lives outside.** `security.py` and `storage.py` can be used by the CLI, the API and the background worker (Part 5) alike.
@@ -74,7 +74,7 @@ flowchart TB
 
 ## In the project
 
-A router module, `src/atlas/api/routes/search.py` (lesson 4.10 fills in the query):
+A router module, `src/atlas/api/routes/search.py` (lesson 4.12 fills in the query):
 
 ```python
 """Keyword search over an indexed codebase (the same query as `atlas find`)."""
@@ -132,7 +132,7 @@ It knows nothing about HTTP: hashing a password or signing a token is the same f
 **3.** Design the URL and method for "list the notes I wrote on issue 42".
 
 ::: {.callout-tip collapse="true" title="Answer"}
-`GET /issues/42/notes`: notes are a sub-resource of the issue, and GET reads. This is exactly what Atlas builds in lesson 4.16.
+`GET /issues/42/notes`: notes are a sub-resource of the issue, and GET reads. This is exactly what Atlas builds in lesson 4.20.
 :::
 
 ## Exercise

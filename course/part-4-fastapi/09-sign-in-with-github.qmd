@@ -1,10 +1,14 @@
 ---
-title: "4.8 Sign in with GitHub, refresh tokens and roles"
+title: "4.9 Sign in with GitHub, refresh tokens and roles"
 description: "Add GitHub sign-in with the OAuth2 authorization code flow (state and PKCE), keep users signed in with rotating refresh tokens, and give accounts roles."
 ---
 
 ::: {.lesson-meta}
 Part 4 · Lesson 8 · About 120 minutes
+:::
+
+::: {.callout-warning title="Being restructured"}
+This lesson is being split by the [depth pass](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/08-depth-pass.md). Until then it also covers lesson 4.10 (refresh tokens, logout and roles).
 :::
 
 ::: {.callout-note title="Analogy: a hotel key card from the front desk"}
@@ -25,7 +29,7 @@ A conference venue doesn't check your passport itself. It sends you to the hotel
 4. Atlas's server sends the `code` plus its **client secret** to GitHub directly (not through the browser) and gets an access token.
 5. Atlas calls GitHub's `GET /user` with that token to learn the user's id and login.
 
-**OIDC** (OpenID Connect) is a layer on top of OAuth2 that standardises step 5: the server returns a signed **ID token** (a JWT, lesson 4.7) saying who the user is. Google and Microsoft sign-in use it. GitHub's sign-in for apps is plain OAuth2, so Atlas asks the `/user` endpoint instead. The ideas carry over.
+**OIDC** (OpenID Connect) is a layer on top of OAuth2 that standardises step 5: the server returns a signed **ID token** (a JWT, lesson 4.8) saying who the user is. Google and Microsoft sign-in use it. GitHub's sign-in for apps is plain OAuth2, so Atlas asks the `/user` endpoint instead. The ideas carry over.
 
 ### Two protections
 
@@ -54,13 +58,13 @@ sequenceDiagram
 
 ### Refresh tokens
 
-Access tokens last 15 minutes (lesson 4.7). A **refresh token** is a long-lived (30 days) random string the client trades for a new access token. Unlike a JWT it means nothing on its own: it is looked up in a table, so it **can be revoked** (logout).
+Access tokens last 15 minutes (lesson 4.8). A **refresh token** is a long-lived (30 days) random string the client trades for a new access token. Unlike a JWT it means nothing on its own: it is looked up in a table, so it **can be revoked** (logout).
 
 Atlas uses **rotation**: each refresh token works once and is replaced by a new one. If a used token ever comes back, either the user or a thief is replaying an old copy. Atlas can't tell which, so it revokes every token that user has: **reuse detection**. Refresh tokens are long and random, so a fast SHA-256 hash is safe for storing them (unlike passwords).
 
 ### Roles
 
-**Authorisation** answers "what may you do?" (authentication answered "who are you?"). The simplest model is a **role** per user: Atlas has `user` and `admin`. Admins may add repositories; lesson 4.9 enforces it.
+**Authorisation** answers "what may you do?" (authentication answered "who are you?"). The simplest model is a **role** per user: Atlas has `user` and `admin`. Admins may add repositories; lesson 4.11 enforces it.
 
 ## In the project
 
@@ -96,7 +100,7 @@ def authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge:
     return f"{AUTHORIZE_URL}?{query}"
 ```
 
-`exchange_code(...)` does steps 4 and 5 with `httpx` (lesson 2.5). GitHub reports problems like an expired code in the JSON body (`"error": "bad_verification_code"`) rather than only the status, so it checks the body. Its `transport` parameter lets tests replace GitHub with a fake (lesson 4.15).
+`exchange_code(...)` does steps 4 and 5 with `httpx` (lesson 2.5). GitHub reports problems like an expired code in the JSON body (`"error": "bad_verification_code"`) rather than only the status, so it checks the body. Its `transport` parameter lets tests replace GitHub with a fake (lesson 4.19).
 
 ### The two routes: `routes/auth.py`
 

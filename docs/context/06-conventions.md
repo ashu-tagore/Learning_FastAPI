@@ -49,7 +49,7 @@ Every lesson file is `course/part-P-<slug>/NN-<slug>.qmd`. After adding one, run
 
 ```markdown
 ---
-title: "4.7 Authentication with JWT"
+title: "4.8 Authentication with JWT"
 description: "One sentence on what the learner can do after this lesson."
 ---
 

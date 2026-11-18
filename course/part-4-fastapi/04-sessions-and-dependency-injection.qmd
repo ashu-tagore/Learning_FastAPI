@@ -21,7 +21,7 @@ Why bother?
 
 - **No repeated setup**: twenty routes need a session; the code to open and close it is written once.
 - **Guaranteed cleanup**: the session is closed after the response, error or not.
-- **Swappable in tests**: a test tells FastAPI "when a route asks for a session, give it this one instead" (lesson 4.15).
+- **Swappable in tests**: a test tells FastAPI "when a route asks for a session, give it this one instead" (lesson 4.5).
 
 ### Declaring a dependency
 
@@ -142,11 +142,11 @@ $ curl -s http://localhost:8000/ready
 $ docker compose start db
 ```
 
-(The status code is 500; lesson 4.12 builds this error format.)
+(The status code is 500; lesson 4.14 builds this error format.)
 
 ### Creating the tables
 
-The API expects the tables to exist. Until lesson 4.11 replaces it with migrations, `atlas init-db` from Part 3 creates them.
+The API expects the tables to exist. Until lesson 4.13 replaces it with migrations, `atlas init-db` from Part 3 creates them.
 
 ## Common mistakes
 
@@ -208,7 +208,7 @@ def get_page_size(limit: int = 20) -> int:
 
 PageSize = Annotated[int, Depends(get_page_size)]
 ```
-A dependency's own parameters become the route's parameters, so `limit` shows up as a query parameter of every route that uses `PageSize`. (Atlas uses `Query(ge=1, le=100)` instead, lesson 4.10, which rejects bad values rather than quietly changing them.)
+A dependency's own parameters become the route's parameters, so `limit` shows up as a query parameter of every route that uses `PageSize`. (Atlas uses `Query(ge=1, le=100)` instead, lesson 4.12, which rejects bad values rather than quietly changing them.)
 :::
 
 ## What changed in the project

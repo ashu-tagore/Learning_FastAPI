@@ -68,7 +68,7 @@ def session(engine: Engine) -> Iterator[Session]:
             transaction.rollback()
 
 
-# ---------- Web API fixtures (lesson 4.15) ----------
+# ---------- Web API fixtures (lessons 4.5 and 4.17) ----------
 
 from collections.abc import AsyncIterator  # noqa: E402
 

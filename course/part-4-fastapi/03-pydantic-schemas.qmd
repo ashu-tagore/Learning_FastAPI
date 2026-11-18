@@ -86,9 +86,9 @@ class UserUpdate(BaseModel):
     skills_profile: str | None = Field(default=None, max_length=2000)
 ```
 
-`EmailStr` needs the `email-validator` package: `uv add email-validator`. Why a maximum password length? Hashing (lesson 4.6) is deliberately slow; a megabyte-long "password" would make every login attempt expensive for the server.
+`EmailStr` needs the `email-validator` package: `uv add email-validator`. Why a maximum password length? Hashing (lesson 4.7) is deliberately slow; a megabyte-long "password" would make every login attempt expensive for the server.
 
-Using them in routes (lesson 4.6 fills in the bodies):
+Using them in routes (lesson 4.7 fills in the bodies):
 
 ```python
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
@@ -108,7 +108,7 @@ def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> Us
 
 The function returns a `User` table object; `response_model=UserOut` turns it into the safe shape. `status_code=201` is HTTP's "Created". `setattr(user, field, value)` sets the attribute named by the string `field`, so the loop works for any field the schema adds later.
 
-Real output once lessons 4.6 and 4.7 are done:
+Real output once lessons 4.7 and 4.8 are done:
 
 ```text
 $ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "ada@example.com", "password": "correct-horse-battery"}'
@@ -125,9 +125,9 @@ $ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: applicat
 {"error":{"code":"validation_error","message":"The request is not valid","request_id":"bc087dbefa5b4a35a92873271d9edac0","details":[{"location":["body","email"],"message":"value is not a valid email address: An email address must have an @-sign."},{"location":["body","password"],"message":"String should have at least 10 characters"}]}}
 ```
 
-(The `{"error": ...}` shape is Atlas's own, from lesson 4.12.)
+(The `{"error": ...}` shape is Atlas's own, from lesson 4.14.)
 
-The rest of `schemas.py` follows the same pattern: `RepoCreate` (with `pattern=r"^[\w.-]+/[\w.-]+$"` so only `owner/name` is accepted), `IssueOut`, `SearchHit`, and page wrappers used in lesson 4.10.
+The rest of `schemas.py` follows the same pattern: `RepoCreate` (with `pattern=r"^[\w.-]+/[\w.-]+$"` so only `owner/name` is accepted), `IssueOut`, `SearchHit`, and page wrappers used in lesson 4.12.
 
 ## Common mistakes
 
@@ -154,7 +154,7 @@ Nothing. `exclude_unset=True` returns an empty dict, so the loop sets no attribu
 **3.** Is `POST /auth/register` idempotent? Is `PUT`?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-POST isn't: a second identical request tries to create a second account (Atlas answers 409). PUT is: replacing a resource with the same content twice leaves it the same. Lesson 4.12 shows how to make POSTs safe to retry with idempotency keys.
+POST isn't: a second identical request tries to create a second account (Atlas answers 409). PUT is: replacing a resource with the same content twice leaves it the same. Lesson 4.16 shows how to make POSTs safe to retry with idempotency keys.
 :::
 
 ## Exercise
@@ -165,7 +165,7 @@ Add an optional `display_name` to `UserUpdate` (1 to 50 characters). Without cha
 ```python
 display_name: str | None = Field(default=None, min_length=1, max_length=50)
 ```
-`UserUpdate(display_name="")` raises a `ValidationError`: "String should have at least 1 character". `UserUpdate().model_dump(exclude_unset=True)` returns `{}`. (To store it you'd also add a column and a migration, lesson 4.11.)
+`UserUpdate(display_name="")` raises a `ValidationError`: "String should have at least 1 character". `UserUpdate().model_dump(exclude_unset=True)` returns `{}`. (To store it you'd also add a column and a migration, lesson 4.13.)
 :::
 
 ## Stretch

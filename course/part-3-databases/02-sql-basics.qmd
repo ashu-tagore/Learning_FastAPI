@@ -117,7 +117,7 @@ SELECT title FROM issues WHERE title ILIKE '%doc%';
 SELECT number, title FROM issues ORDER BY created_at DESC LIMIT 2;
 ```
 
-returns the two newest. `LIMIT` with `OFFSET` gives pages, like GitHub's (lesson 4.10 does this properly).
+returns the two newest. `LIMIT` with `OFFSET` gives pages, like GitHub's (lesson 4.12 does this properly).
 
 ### Counting and summarising
 

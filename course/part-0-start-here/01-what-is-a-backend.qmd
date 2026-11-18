@@ -117,7 +117,7 @@ The app on your phone is the **client**: it asks for the forecast and displays i
 **2.** An online shop lets any logged-in user cancel any other user's order. Which of the five backend jobs failed?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-**Enforce rules.** The backend must check that the person cancelling an order is the person who placed it. The frontend hiding the button is not enough, because anyone can send requests directly to the server. You will build this check yourself in lesson 4.9.
+**Enforce rules.** The backend must check that the person cancelling an order is the person who placed it. The frontend hiding the button is not enough, because anyone can send requests directly to the server. You will build this check yourself in lesson 4.11.
 :::
 
 **3.** Your project works perfectly on your laptop. Name two things that still need to happen before it is "in production".

@@ -216,7 +216,7 @@ CREATE TABLE issue_labels (
 - **Copying the same fact into several tables** "for convenience", then updating only one.
 - **Skipping constraints** because "the code checks it". The code changes; constraints stay.
 - **Timestamps without time zones.**
-- **Designing for imagined future features.** Model what the product needs now; migrations (lesson 4.11) handle change.
+- **Designing for imagined future features.** Model what the product needs now; migrations (lesson 4.13) handle change.
 
 ## Check yourself
 

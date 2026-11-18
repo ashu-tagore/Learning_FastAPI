@@ -204,7 +204,7 @@ async def test_search_needs_a_query(client: httpx.AsyncClient) -> None:
     assert response.json()["error"]["details"][0]["location"] == ["query", "q"]
 
 
-# ---------- Notes (review lesson 4.16) ----------
+# ---------- Notes (review lesson 4.20) ----------
 
 
 async def test_notes_are_created_listed_edited_and_deleted(

@@ -57,7 +57,7 @@ async def issue_tokens(session: AsyncSession, user: User, settings: ApiSettings)
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
 async def register(body: UserCreate, session: SessionDep) -> User:
     # Argon2 is deliberately slow CPU work. Run it in a worker thread so the event loop
-    # keeps serving other requests meanwhile (lesson 4.13).
+    # keeps serving other requests meanwhile (lesson 4.17).
     password_hash = await run_in_threadpool(hash_password, body.password)
     user = User(email=body.email.lower(), password_hash=password_hash)
     session.add(user)

@@ -59,18 +59,18 @@ website:
           - part-4-fastapi/02-configuration-and-secrets.qmd
           - part-4-fastapi/03-pydantic-schemas.qmd
           - part-4-fastapi/04-sessions-and-dependency-injection.qmd
-          - part-4-fastapi/05-routers-and-project-structure.qmd
-          - part-4-fastapi/06-users-and-password-hashing.qmd
-          - part-4-fastapi/07-authentication-with-jwt.qmd
-          - part-4-fastapi/08-github-sign-in-refresh-tokens-roles.qmd
-          - part-4-fastapi/09-relationships-and-authorisation.qmd
-          - part-4-fastapi/10-pagination-filtering-search.qmd
-          - part-4-fastapi/11-migrations-with-alembic.qmd
-          - part-4-fastapi/12-errors-middleware-cors-conventions.qmd
-          - part-4-fastapi/13-async-fastapi.qmd
-          - part-4-fastapi/14-api-styles.qmd
-          - part-4-fastapi/15-testing-apis.qmd
-          - part-4-fastapi/16-review-and-practice.qmd
+          - part-4-fastapi/06-routers-and-project-structure.qmd
+          - part-4-fastapi/07-users-and-password-hashing.qmd
+          - part-4-fastapi/08-authentication-with-jwt.qmd
+          - part-4-fastapi/09-sign-in-with-github.qmd
+          - part-4-fastapi/11-relationships-and-authorisation.qmd
+          - part-4-fastapi/12-pagination-filtering-search.qmd
+          - part-4-fastapi/13-migrations-with-alembic.qmd
+          - part-4-fastapi/14-error-handling.qmd
+          - part-4-fastapi/17-async-fastapi.qmd
+          - part-4-fastapi/18-api-styles.qmd
+          - part-4-fastapi/19-testing-strategy.qmd
+          - part-4-fastapi/20-review-and-practice.qmd
       - section: "Part 5: Background work and integrations"
         href: part-5-background-work/index.qmd
         contents:

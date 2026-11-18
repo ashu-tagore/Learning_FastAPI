@@ -146,7 +146,7 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str | None] = mapped_column(String(320), unique=True)
-    # Never the password itself: an Argon2 hash (lesson 4.6).
+    # Never the password itself: an Argon2 hash (lesson 4.7).
     password_hash: Mapped[str | None] = mapped_column(String(200))
     github_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     github_login: Mapped[str | None] = mapped_column(String(100))
@@ -159,12 +159,12 @@ class User(Base):
 
 
 class RefreshToken(Base):
-    """A long-lived token that can be exchanged for a new access token (lesson 4.8)."""
+    """A long-lived token that can be exchanged for a new access token (lesson 4.10)."""
 
     __tablename__ = "refresh_tokens"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    # Indexed: signing a user out everywhere updates all their tokens by user_id (lesson 4.11).
+    # Indexed: signing a user out everywhere updates all their tokens by user_id (lesson 4.13).
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     # Only a hash is stored: a leaked table can't be used to sign in.
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
@@ -183,7 +183,7 @@ saved_issues = Table(
 
 
 class IssueNote(Base):
-    """A learner's private note about an issue (built in the review lesson, 4.16)."""
+    """A learner's private note about an issue (built in the review lesson, 4.20)."""
 
     __tablename__ = "issue_notes"
     __table_args__ = (
@@ -204,7 +204,7 @@ class IssueNote(Base):
 
 
 class IdempotencyKey(Base):
-    """Remembers the response to a POST so a retried request isn't applied twice (lesson 4.12)."""
+    """Remembers the response to a POST so a retried request isn't applied twice (lesson 4.16)."""
 
     __tablename__ = "idempotency_keys"
     __table_args__ = (UniqueConstraint("user_id", "key"),)

@@ -1,5 +1,5 @@
 ---
-title: "4.13 Async FastAPI with async SQLAlchemy"
+title: "4.17 Async FastAPI with async SQLAlchemy"
 description: "Convert Atlas's API to async database access, keep CPU-heavy work off the event loop, and avoid the lazy-loading trap of async ORMs."
 ---
 
@@ -18,7 +18,7 @@ Lesson 2.6 introduced `async`/`await` and the **event loop**; lesson 4.1 measure
 That works. Why change?
 
 - A thread pool has a fixed size (Starlette's default allows 40 threads at once). Each request waiting on the database holds a thread. Async code waits without holding a thread, so one process can keep many more requests in flight.
-- Part 6 streams LLM answers that take many seconds each, and the WebSocket in lesson 4.14 holds a connection open indefinitely. Both are long *waits*, exactly what async is good at.
+- Part 6 streams LLM answers that take many seconds each, and the WebSocket in lesson 4.18 holds a connection open indefinitely. Both are long *waits*, exactly what async is good at.
 
 The cost: everything slow must be awaited, and a single blocking call stalls everyone.
 
@@ -26,7 +26,7 @@ The cost: everything slow must be awaited, and a single blocking call stalls eve
 
 SQLAlchemy has an async layer with the same ideas and new names:
 
-| Synchronous (4.1 to 4.12) | Async (4.13 on) |
+| Synchronous (4.1 to 4.16) | Async (4.17 on) |
 |---|---|
 | `create_engine(url)` | `create_async_engine(url)` |
 | `sessionmaker(engine)` | `async_sessionmaker(engine)` |
@@ -47,11 +47,11 @@ With a synchronous session, touching `issue.repo` on an issue whose repository i
 sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place? (Background on this error at: https://sqlalche.me/e/21/xd2s)
 ```
 
-That's what you get running `issue = await session.get(Issue, 1)` and then `issue.repo.full_name`. The fix is to say up front what to load: `selectinload(Issue.repo)` (lesson 4.10). It also kills N+1 queries, so async forces a good habit. And `expire_on_commit=False` matters more now: after a commit, expired attributes would also need a reload.
+That's what you get running `issue = await session.get(Issue, 1)` and then `issue.repo.full_name`. The fix is to say up front what to load: `selectinload(Issue.repo)` (lesson 4.12). It also kills N+1 queries, so async forces a good habit. And `expire_on_commit=False` matters more now: after a commit, expired attributes would also need a reload.
 
 ### CPU-heavy work
 
-Argon2 (lesson 4.6) takes about 0.06 s of pure computation. Nothing to await, so in an `async def` route it would block the loop for every login. Starlette's `run_in_threadpool(func, *args)` runs a blocking function in the thread pool and lets you await the result.
+Argon2 (lesson 4.7) takes about 0.06 s of pure computation. Nothing to await, so in an `async def` route it would block the loop for every login. Starlette's `run_in_threadpool(func, *args)` runs a blocking function in the thread pool and lets you await the result.
 
 ```{mermaid}
 flowchart LR
@@ -147,11 +147,11 @@ async def register(body: UserCreate, session: SessionDep) -> User:
 
 ### Loading relationships explicitly
 
-`get_issue_or_404` gained `selectinload(Issue.repo)` because `issue_out` reads `issue.repo.full_name`. In the synchronous version that was a silent lazy load; without the option, the async version answers 500 with the `MissingGreenlet` error above. The tests happen not to catch this one; lesson 4.16's practice asks you why.
+`get_issue_or_404` gained `selectinload(Issue.repo)` because `issue_out` reads `issue.repo.full_name`. In the synchronous version that was a silent lazy load; without the option, the async version answers 500 with the `MissingGreenlet` error above. The tests happen not to catch this one; lesson 4.20's practice asks you why.
 
 ### Results
 
-The behaviour is identical, so every test from the synchronous version passes unchanged in meaning (lesson 4.15 shows the async test setup). All the curl output in lessons 4.1 to 4.12 was in fact captured from the async version.
+The behaviour is identical, so every test from the synchronous version passes unchanged in meaning (lesson 4.19 shows the async test setup). All the curl output in lessons 4.1 to 4.16 was in fact captured from the async version.
 
 ## Common mistakes
 

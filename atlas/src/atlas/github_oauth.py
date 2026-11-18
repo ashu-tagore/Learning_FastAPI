@@ -40,7 +40,7 @@ def authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge:
         {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            # Echoed back to the callback; proves the callback answers our own request (lesson 4.8).
+            # Echoed back to the callback; proves the callback answers our own request (lesson 4.9).
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",

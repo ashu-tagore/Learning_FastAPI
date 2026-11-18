@@ -36,7 +36,7 @@ Details are in [02-product.md](02-product.md).
 
 ## What "done" looks like
 
-- A public Quarto course site on GitHub Pages, 96 lessons in 10 parts, every lesson complete with exercises, and a review-and-practice lesson closing each part.
+- A public Quarto course site on GitHub Pages, 100 lessons in 10 parts, every lesson complete with exercises, and a review-and-practice lesson closing each part.
 - Atlas and Atlas Agents running on AWS, deployed by CI/CD from this repo with Terraform.
 - A reference implementation in this repo whose tests pass in CI at every checkpoint tag.
 - Measured quality: retrieval and agent evaluations run in CI with scores tracked over time.

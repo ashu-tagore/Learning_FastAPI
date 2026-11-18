@@ -25,9 +25,9 @@ class ApiSettings(Settings):
     secret_key: SecretStr
     access_token_minutes: int = 15
     refresh_token_days: int = 30
-    # Browser origins allowed to call the API (lesson 4.12).
+    # Browser origins allowed to call the API (lesson 4.16).
     cors_origins: list[str] = ["http://localhost:8000"]
-    # GitHub sign-in (lesson 4.8). Leave unset to disable it.
+    # GitHub sign-in (lesson 4.9). Leave unset to disable it.
     github_client_id: str | None = None
     github_client_secret: SecretStr | None = None
     # Where the ready-made web interface lives on disk; unset to serve the API only.

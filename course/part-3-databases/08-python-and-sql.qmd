@@ -129,7 +129,7 @@ How to read it:
 - `relationship(...)` isn't a column: it lets you write `repo.documents` and `chunk.document` in Python, and SQLAlchemy runs the join. `back_populates` links the two directions.
 - `__table_args__` holds table-level rules: constraints and indexes.
 
-From these classes SQLAlchemy generates exactly the SQL from lessons 3.4 and 3.6. `Base.metadata.create_all(engine)` creates every table that doesn't exist yet. It can't *change* existing tables; lesson 4.11 adds migrations for that.
+From these classes SQLAlchemy generates exactly the SQL from lessons 3.4 and 3.6. `Base.metadata.create_all(engine)` creates every table that doesn't exist yet. It can't *change* existing tables; lesson 4.13 adds migrations for that.
 
 ```{mermaid}
 flowchart LR
@@ -326,8 +326,8 @@ atlas: set DATABASE_URL, for example postgresql+psycopg://atlas:atlas-dev-passwo
 - **Forgetting to commit**: everything is rolled back when the session closes.
 - **One global session shared by everything**: sessions aren't safe to share between threads or concurrent requests. One per unit of work (Part 4 creates one per web request).
 - **Creating an engine per query**: you lose the connection pool. One engine per program.
-- **Expecting `create_all` to update tables** after you change a model. It only creates missing tables; drop and recreate in development, or use migrations (lesson 4.11).
-- **The N+1 problem**: looping over 100 documents and touching `document.chunks` on each runs 101 queries. Lesson 4.10 shows how to load related rows in one go.
+- **Expecting `create_all` to update tables** after you change a model. It only creates missing tables; drop and recreate in development, or use migrations (lesson 4.13).
+- **The N+1 problem**: looping over 100 documents and touching `document.chunks` on each runs 101 queries. Lesson 4.12 shows how to load related rows in one go.
 
 ## Check yourself
 
