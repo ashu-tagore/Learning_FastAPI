@@ -11,17 +11,19 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from atlas import __version__
 from atlas.api.deps import SessionDep
 from atlas.api.routes import auth, issues, notes, repos, search, users
+from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
 
 logger = logging.getLogger("atlas.api")
@@ -118,10 +120,17 @@ def create_app(
         """Liveness: the process is up and answering."""
         return {"status": "ok"}
 
-    @app.get("/ready", tags=["operations"])
+    @app.get("/ready", tags=["operations"], responses={503: {"model": ErrorResponse}})
     async def ready(session: SessionDep) -> dict[str, str]:
         """Readiness: the process can reach its database, so it can do real work."""
-        await session.execute(text("SELECT 1"))
+        try:
+            await session.execute(text("SELECT 1"))
+        except OperationalError:
+            # 503, not 500: nothing is broken in this process, it just can't serve yet.
+            # Load balancers stop sending traffic on 503 and retry later (lesson 7.9).
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "The database is unreachable"
+            ) from None
         return {"status": "ready"}
 
     for module in (auth, users, repos, issues, notes, search):

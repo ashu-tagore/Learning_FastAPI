@@ -278,3 +278,13 @@ async def test_note_creation_honours_idempotency_keys(
     assert retry.json() == first.json()
     assert len((await client.get(path, headers=ada)).json()) == 1
     assert other_path.status_code == 422
+
+
+async def test_repository_query_parameters_are_parsed_at_the_edge(
+    client: httpx.AsyncClient,
+) -> None:
+    issues = await client.get("/issues", params={"repo": "not a repo"})
+    search = await client.get("/search", params={"q": "event", "repo": "ignite"})
+
+    assert issues.status_code == search.status_code == 422
+    assert issues.json()["error"]["details"][0]["location"] == ["query", "repo"]

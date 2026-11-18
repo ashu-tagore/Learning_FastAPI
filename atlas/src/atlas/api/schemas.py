@@ -5,16 +5,38 @@ separate is what keeps fields like password_hash out of every response.
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+
+# ---------- Domain types (lesson 4.3) ----------
+# Each type is parsed once, at the edge. Code that receives an Email or a RepoFullName
+# never re-checks it: an invalid value can't get that far.
+
+
+def normalise_email(address: str) -> str:
+    # Atlas treats addresses as case-insensitive and stores one form, so
+    # "Ada@Example.com" and "ada@example.com" can't become two accounts.
+    return address.lower()
+
+
+Email = Annotated[EmailStr, AfterValidator(normalise_email)]
+
+# The upper bound matters too: hashing is slow on purpose (lesson 4.7), so a megabyte
+# "password" would make each login attempt expensive for the server.
+Password = Annotated[str, Field(min_length=10, max_length=128)]
+
+# "owner/name", as GitHub writes it; at most the 200 characters the repos column holds.
+RepoFullName = Annotated[
+    str, Field(pattern=r"^[\w.-]+/[\w.-]+$", max_length=200, examples=["pytorch/ignite"])
+]
 
 # ---------- Users and authentication ----------
 
 
 class UserCreate(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=10, max_length=128)
+    email: Email
+    password: Password
 
 
 class UserOut(BaseModel):
@@ -50,7 +72,7 @@ class RefreshRequest(BaseModel):
 
 
 class RepoCreate(BaseModel):
-    full_name: str = Field(pattern=r"^[\w.-]+/[\w.-]+$", examples=["pytorch/ignite"])
+    full_name: RepoFullName
 
 
 class RepoOut(BaseModel):

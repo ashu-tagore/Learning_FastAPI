@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from atlas import github_oauth
 from atlas.api.deps import SessionDep, SettingsDep
-from atlas.api.schemas import RefreshRequest, TokenPair, UserCreate, UserOut
+from atlas.api.schemas import RefreshRequest, TokenPair, UserCreate, UserOut, normalise_email
 from atlas.config import ApiSettings
 from atlas.github import GitHubError
 from atlas.models import RefreshToken, User
@@ -59,7 +59,7 @@ async def register(body: UserCreate, session: SessionDep) -> User:
     # Argon2 is deliberately slow CPU work. Run it in a worker thread so the event loop
     # keeps serving other requests meanwhile (lesson 4.17).
     password_hash = await run_in_threadpool(hash_password, body.password)
-    user = User(email=body.email.lower(), password_hash=password_hash)
+    user = User(email=body.email, password_hash=password_hash)
     session.add(user)
     try:
         await session.commit()
@@ -78,7 +78,7 @@ async def login(
     settings: SettingsDep,
 ) -> TokenPair:
     # OAuth2's password flow calls the field "username"; Atlas uses the email address.
-    user = await session.scalar(select(User).where(User.email == form.username.lower()))
+    user = await session.scalar(select(User).where(User.email == normalise_email(form.username)))
 
     # Same message whether the email is unknown or the password is wrong,
     # so the endpoint can't be used to discover who has an account.
