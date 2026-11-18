@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atlas</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Atlas</h1>
+    <p class="tagline">Find your way around a codebase and its issues.</p>
+    <div id="account" hidden>
+      <span id="who"></span>
+      <button id="logout" type="button">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="signin" class="panel">
+      <h2>Sign in</h2>
+      <form id="auth-form">
+        <label>Email <input id="email" type="email" autocomplete="username" required></label>
+        <label>Password <input id="password" type="password" autocomplete="current-password" minlength="10" required></label>
+        <div class="row">
+          <button type="submit" data-action="login">Log in</button>
+          <button type="submit" data-action="register" class="secondary">Create account</button>
+        </div>
+      </form>
+      <p class="or">or</p>
+      <a class="button secondary" href="/auth/github/login">Sign in with GitHub</a>
+      <p id="auth-message" class="message" role="status"></p>
+    </section>
+
+    <section id="app" hidden>
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="search" aria-selected="true">Search</button>
+        <button role="tab" data-tab="issues">Issues</button>
+        <button role="tab" data-tab="saved">Saved</button>
+        <button role="tab" data-tab="profile">Profile</button>
+      </nav>
+
+      <div data-panel="search" class="panel">
+        <form id="search-form" class="row">
+          <input id="query" type="search" placeholder="e.g. event handler" aria-label="Search the codebase" required>
+          <button type="submit">Search</button>
+        </form>
+        <label class="inline"><input id="live" type="checkbox"> Search as I type (WebSocket)</label>
+        <ol id="hits" class="results"></ol>
+        <button id="more-hits" type="button" class="secondary" hidden>More results</button>
+      </div>
+
+      <div data-panel="issues" class="panel" hidden>
+        <label>Label <input id="label" value="good first issue"></label>
+        <ul id="issues" class="results"></ul>
+        <button id="more-issues" type="button" class="secondary" hidden>More issues</button>
+      </div>
+
+      <div data-panel="saved" class="panel" hidden>
+        <ul id="saved" class="results"></ul>
+      </div>
+
+      <div data-panel="profile" class="panel" hidden>
+        <form id="profile-form">
+          <label>What are you comfortable with? Atlas uses this to rank issues for you (Part 6).
+            <textarea id="skills" rows="4" maxlength="2000"></textarea>
+          </label>
+          <button type="submit">Save profile</button>
+        </form>
+        <p id="profile-message" class="message" role="status"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

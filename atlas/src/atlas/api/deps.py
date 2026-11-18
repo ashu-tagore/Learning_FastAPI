@@ -1,17 +1,17 @@
 """Dependencies: things a route asks for by declaring a parameter, and FastAPI provides.
 
-    def read_me(user: CurrentUser) -> ...
+    async def read_me(user: CurrentUser) -> ...
 
 FastAPI sees CurrentUser, runs get_current_user (which itself needs a session and the
 settings), and passes the result in. Tests replace any of these with app.dependency_overrides.
 """
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from atlas.config import ApiSettings
 from atlas.models import User
@@ -26,17 +26,17 @@ def get_settings(request: Request) -> ApiSettings:
     return settings
 
 
-def get_session(request: Request) -> Iterator[Session]:
+async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     """One database session per request, always closed, even if the route raises."""
-    with request.app.state.session_factory() as session:
+    async with request.app.state.session_factory() as session:
         yield session
 
 
 SettingsDep = Annotated[ApiSettings, Depends(get_settings)]
-SessionDep = Annotated[Session, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
-def get_current_user(
+async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     session: SessionDep,
     settings: SettingsDep,
@@ -52,7 +52,7 @@ def get_current_user(
     except InvalidToken:
         raise not_authenticated from None
 
-    user = session.get(User, user_id)
+    user = await session.get(User, user_id)
     if user is None:
         raise not_authenticated
     return user
@@ -61,7 +61,7 @@ def get_current_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def require_admin(user: CurrentUser) -> User:
+async def require_admin(user: CurrentUser) -> User:
     is_admin = user.role == "admin"
     if not is_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Administrators only")

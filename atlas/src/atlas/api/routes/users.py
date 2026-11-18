@@ -13,22 +13,22 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.get("/me", response_model=UserOut)
-def read_me(user: CurrentUser) -> User:
+async def read_me(user: CurrentUser) -> User:
     return user
 
 
 @router.patch("/me", response_model=UserOut)
-def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> User:
+async def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> User:
     # exclude_unset: only the fields the client actually sent, so PATCH changes just those.
     for field, value in changes.model_dump(exclude_unset=True).items():
         setattr(user, field, value)
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
     return user
 
 
 @router.get("/me/saved-issues", response_model=list[IssueOut])
-def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
+async def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
     statement = (
         select(Issue)
         .join(saved_issues, saved_issues.c.issue_id == Issue.id)
@@ -37,4 +37,4 @@ def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
         # Load every issue's labels and repo in one extra query each, not one per issue (N+1).
         .options(selectinload(Issue.labels), selectinload(Issue.repo))
     )
-    return [issue_out(issue) for issue in session.scalars(statement)]
+    return [issue_out(issue) for issue in await session.scalars(statement)]

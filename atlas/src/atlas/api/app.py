@@ -16,8 +16,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from atlas import __version__
 from atlas.api.deps import SessionDep
@@ -48,7 +48,7 @@ def status_code_name(status_code: int) -> str:
 
 def create_app(
     settings: ApiSettings | None = None,
-    github_transport: httpx.BaseTransport | None = None,
+    github_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     """Build the application. Tests pass their own settings and a fake GitHub."""
     settings = settings or ApiSettings()  # type: ignore[call-arg]  # values come from the environment
@@ -56,11 +56,13 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Runs once at startup: one engine (and its connection pool) for the whole process.
-        engine = create_engine(settings.database_url, pool_pre_ping=True)
-        app.state.session_factory = sessionmaker(engine, expire_on_commit=False)
+        engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+        # expire_on_commit=False: objects stay readable after commit without a surprise reload,
+        # which in async code would be an implicit (and forbidden) database call.
+        app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
-        engine.dispose()
+        await engine.dispose()
 
     app = FastAPI(
         title="Atlas API",
@@ -112,14 +114,14 @@ def create_app(
         return JSONResponse(body, status_code=500)
 
     @app.get("/health", tags=["operations"])
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         """Liveness: the process is up and answering."""
         return {"status": "ok"}
 
     @app.get("/ready", tags=["operations"])
-    def ready(session: SessionDep) -> dict[str, str]:
+    async def ready(session: SessionDep) -> dict[str, str]:
         """Readiness: the process can reach its database, so it can do real work."""
-        session.execute(text("SELECT 1"))
+        await session.execute(text("SELECT 1"))
         return {"status": "ready"}
 
     for module in (auth, users, repos, issues, notes, search):

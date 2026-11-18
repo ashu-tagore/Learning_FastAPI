@@ -51,17 +51,17 @@ def authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge:
     return f"{AUTHORIZE_URL}?{query}"
 
 
-def exchange_code(
+async def exchange_code(
     code: str,
     client_id: str,
     client_secret: str,
     redirect_uri: str,
     code_verifier: str,
-    transport: httpx.BaseTransport | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> GitHubIdentity:
     """Swap the one-time code for an access token, then ask GitHub who it belongs to."""
-    with httpx.Client(timeout=10.0, transport=transport) as client:
-        token_response = client.post(
+    async with httpx.AsyncClient(timeout=10.0, transport=transport) as client:
+        token_response = await client.post(
             TOKEN_URL,
             data={
                 "client_id": client_id,
@@ -80,7 +80,7 @@ def exchange_code(
             reason = token_body.get("error_description") or token_body.get("error") or "unknown"
             raise GitHubError(f"GitHub sign-in failed: {reason}")
 
-        user_response = client.get(
+        user_response = await client.get(
             f"{GITHUB_API}/user",
             headers={
                 "Authorization": f"Bearer {github_token}",

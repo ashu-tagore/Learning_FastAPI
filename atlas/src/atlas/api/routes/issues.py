@@ -46,7 +46,7 @@ def decode_cursor(cursor: str) -> int:
 
 
 @router.get("", response_model=IssuePage)
-def list_issues(
+async def list_issues(
     session: SessionDep,
     repo: str = "pytorch/ignite",
     label: str | None = None,
@@ -68,44 +68,47 @@ def list_issues(
     if cursor is not None:
         statement = statement.where(Issue.number < decode_cursor(cursor))
 
-    issues = list(session.scalars(statement))
+    issues = list(await session.scalars(statement))
     has_next_page = len(issues) > limit
     page = issues[:limit]
     next_cursor = encode_cursor(page[-1].number) if has_next_page else None
     return IssuePage(items=[issue_out(issue) for issue in page], next_cursor=next_cursor)
 
 
-def get_issue_or_404(session: SessionDep, issue_id: int) -> Issue:
-    issue = session.get(Issue, issue_id, options=[selectinload(Issue.labels)])
+async def get_issue_or_404(session: SessionDep, issue_id: int) -> Issue:
+    # Load what issue_out reads now: in async code a lazy load later would be an error.
+    issue = await session.get(
+        Issue, issue_id, options=[selectinload(Issue.labels), selectinload(Issue.repo)]
+    )
     if issue is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Issue {issue_id} not found")
     return issue
 
 
 @router.get("/{issue_id}", response_model=IssueOut)
-def read_issue(issue_id: int, session: SessionDep) -> IssueOut:
-    return issue_out(get_issue_or_404(session, issue_id))
+async def read_issue(issue_id: int, session: SessionDep) -> IssueOut:
+    return issue_out(await get_issue_or_404(session, issue_id))
 
 
 @router.put("/{issue_id}/saved", status_code=status.HTTP_204_NO_CONTENT)
-def save_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
+async def save_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
     """PUT is idempotent: saving an already-saved issue changes nothing and still succeeds."""
-    get_issue_or_404(session, issue_id)
-    session.execute(
+    await get_issue_or_404(session, issue_id)
+    await session.execute(
         insert(saved_issues)
         .values(user_id=user.id, issue_id=issue_id)
         .on_conflict_do_nothing(index_elements=["user_id", "issue_id"])
     )
-    session.commit()
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.delete("/{issue_id}/saved", status_code=status.HTTP_204_NO_CONTENT)
-def unsave_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
-    session.execute(
+async def unsave_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
+    await session.execute(
         delete(saved_issues).where(
             saved_issues.c.user_id == user.id, saved_issues.c.issue_id == issue_id
         )
     )
-    session.commit()
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

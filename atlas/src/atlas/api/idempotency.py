@@ -11,16 +11,18 @@ from typing import Any
 from fastapi import HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from atlas.models import IdempotencyKey, User
 
 
-def replay(session: Session, user: User, key: str | None, path: str) -> JSONResponse | None:
+async def replay(
+    session: AsyncSession, user: User, key: str | None, path: str
+) -> JSONResponse | None:
     """The stored response for this key, or None if the request is new."""
     if key is None:
         return None
-    stored = session.scalar(
+    stored = await session.scalar(
         select(IdempotencyKey).where(IdempotencyKey.user_id == user.id, IdempotencyKey.key == key)
     )
     if stored is None:
@@ -36,7 +38,7 @@ def replay(session: Session, user: User, key: str | None, path: str) -> JSONResp
 
 
 def remember(
-    session: Session, user: User, key: str | None, path: str, status_code: int, body: Any
+    session: AsyncSession, user: User, key: str | None, path: str, status_code: int, body: Any
 ) -> None:
     """Store the response in the same transaction as the change it describes."""
     if key is None:

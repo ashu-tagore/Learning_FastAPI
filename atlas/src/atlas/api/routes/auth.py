@@ -9,7 +9,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from atlas import github_oauth
 from atlas.api.deps import SessionDep, SettingsDep
@@ -32,7 +33,7 @@ OAUTH_COOKIE_SECONDS = 600  # GitHub's codes expire after 10 minutes anyway
 TIMING_DUMMY_HASH = hash_password("not-a-real-password")
 
 
-def issue_tokens(session: Session, user: User, settings: ApiSettings) -> TokenPair:
+async def issue_tokens(session: AsyncSession, user: User, settings: ApiSettings) -> TokenPair:
     """A short-lived access token, and a long-lived refresh token stored as a hash."""
     lifetime = timedelta(minutes=settings.access_token_minutes)
     access_token = create_access_token(user.id, settings.secret_key.get_secret_value(), lifetime)
@@ -45,7 +46,7 @@ def issue_tokens(session: Session, user: User, settings: ApiSettings) -> TokenPa
             expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_days),
         )
     )
-    session.commit()
+    await session.commit()
     return TokenPair(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -54,27 +55,30 @@ def issue_tokens(session: Session, user: User, settings: ApiSettings) -> TokenPa
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
-def register(body: UserCreate, session: SessionDep) -> User:
-    user = User(email=body.email.lower(), password_hash=hash_password(body.password))
+async def register(body: UserCreate, session: SessionDep) -> User:
+    # Argon2 is deliberately slow CPU work. Run it in a worker thread so the event loop
+    # keeps serving other requests meanwhile (lesson 4.13).
+    password_hash = await run_in_threadpool(hash_password, body.password)
+    user = User(email=body.email.lower(), password_hash=password_hash)
     session.add(user)
     try:
-        session.commit()
+        await session.commit()
     except IntegrityError:
         # The unique constraint on email decides, so two simultaneous sign-ups can't both win.
-        session.rollback()
+        await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email exists") from None
-    session.refresh(user)
+    await session.refresh(user)
     return user
 
 
 @router.post("/login", response_model=TokenPair)
-def login(
+async def login(
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
     session: SessionDep,
     settings: SettingsDep,
 ) -> TokenPair:
     # OAuth2's password flow calls the field "username"; Atlas uses the email address.
-    user = session.scalar(select(User).where(User.email == form.username.lower()))
+    user = await session.scalar(select(User).where(User.email == form.username.lower()))
 
     # Same message whether the email is unknown or the password is wrong,
     # so the endpoint can't be used to discover who has an account.
@@ -86,18 +90,19 @@ def login(
     if user is None or user.password_hash is None:
         # Hash anyway, so an unknown email takes as long as a wrong password:
         # otherwise response times would reveal which emails have accounts.
-        verify_password(form.password, TIMING_DUMMY_HASH)
+        await run_in_threadpool(verify_password, form.password, TIMING_DUMMY_HASH)
         raise wrong_credentials
-    if not verify_password(form.password, user.password_hash):
+    password_matches = await run_in_threadpool(verify_password, form.password, user.password_hash)
+    if not password_matches:
         raise wrong_credentials
 
-    return issue_tokens(session, user, settings)
+    return await issue_tokens(session, user, settings)
 
 
 @router.post("/refresh", response_model=TokenPair)
-def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) -> TokenPair:
+async def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) -> TokenPair:
     """Trade a refresh token for a new pair. Each refresh token works exactly once."""
-    stored = session.scalar(
+    stored = await session.scalar(
         select(RefreshToken).where(
             RefreshToken.token_hash == hash_refresh_token(body.refresh_token)
         )
@@ -110,12 +115,12 @@ def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) ->
     was_already_used = stored.revoked_at is not None
     if was_already_used:
         # A used token coming back means it was probably stolen. Sign the user out everywhere.
-        session.execute(
+        await session.execute(
             update(RefreshToken)
             .where(RefreshToken.user_id == stored.user_id, RefreshToken.revoked_at.is_(None))
             .values(revoked_at=now)
         )
-        session.commit()
+        await session.commit()
         raise rejected
 
     has_expired = stored.expires_at <= now
@@ -123,16 +128,16 @@ def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) ->
         raise rejected
 
     stored.revoked_at = now
-    user = session.get(User, stored.user_id)
+    user = await session.get(User, stored.user_id)
     if user is None:
         raise rejected
-    return issue_tokens(session, user, settings)
+    return await issue_tokens(session, user, settings)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(body: RefreshRequest, session: SessionDep) -> Response:
+async def logout(body: RefreshRequest, session: SessionDep) -> Response:
     """Revoke a refresh token. The current access token stays valid until it expires."""
-    session.execute(
+    await session.execute(
         update(RefreshToken)
         .where(
             RefreshToken.token_hash == hash_refresh_token(body.refresh_token),
@@ -140,7 +145,7 @@ def logout(body: RefreshRequest, session: SessionDep) -> Response:
         )
         .values(revoked_at=datetime.now(UTC))
     )
-    session.commit()
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -151,7 +156,7 @@ def github_client_id(settings: ApiSettings) -> str:
 
 
 @router.get("/github/login", include_in_schema=False)
-def github_login(request: Request, settings: SettingsDep) -> RedirectResponse:
+async def github_login(request: Request, settings: SettingsDep) -> RedirectResponse:
     client_id = github_client_id(settings)
     state = secrets.token_urlsafe(24)
     verifier, challenge = github_oauth.new_pkce_pair()
@@ -174,7 +179,7 @@ def github_login(request: Request, settings: SettingsDep) -> RedirectResponse:
 
 
 @router.get("/github/callback", name="github_callback", include_in_schema=False)
-def github_callback(
+async def github_callback(
     request: Request, code: str, state: str, session: SessionDep, settings: SettingsDep
 ) -> Response:
     client_id = github_client_id(settings)
@@ -188,7 +193,7 @@ def github_callback(
 
     assert settings.github_client_secret is not None  # checked by github_client_id
     try:
-        identity = github_oauth.exchange_code(
+        identity = await github_oauth.exchange_code(
             code,
             client_id,
             settings.github_client_secret.get_secret_value(),
@@ -199,17 +204,17 @@ def github_callback(
     except GitHubError as error:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from None
 
-    user = session.scalar(select(User).where(User.github_id == identity.github_id))
+    user = await session.scalar(select(User).where(User.github_id == identity.github_id))
     if user is None:
         user = User(github_id=identity.github_id, github_login=identity.login)
         session.add(user)
     else:
         # Logins can be renamed on GitHub; the numeric id never changes.
         user.github_login = identity.login
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
 
-    tokens = issue_tokens(session, user, settings)
+    tokens = await issue_tokens(session, user, settings)
     serves_web_interface = settings.web_dir is not None
     response: Response
     if serves_web_interface:
