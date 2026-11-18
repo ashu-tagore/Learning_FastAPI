@@ -14,7 +14,7 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 | 4.2 | [Configuration and secrets with pydantic-settings](02-configuration-and-secrets.qmd) | `Settings` |
 | 4.3 | [Schemas and domain types: parse, don't validate](03-pydantic-schemas.qmd) | Schemas, domain types |
 | 4.4 | [Database sessions and dependency injection](04-sessions-and-dependency-injection.qmd) | `get_session`, `/ready` |
-| 4.5 | Testing the API from the start *(coming soon)* | Test client, rolled-back sessions, `/ready` returns 503 |
+| 4.5 | [Testing the API from the start](05-testing-the-api.qmd) | Test client, rolled-back sessions, `/ready` returns 503 |
 | 4.6 | [Routers and project structure](06-routers-and-project-structure.qmd) | Routers |
 | 4.7 | [Users and password hashing](07-users-and-password-hashing.qmd) | Users |
 | 4.8 | [Authentication with JWT](08-authentication-with-jwt.qmd) | Login, `get_current_user` |

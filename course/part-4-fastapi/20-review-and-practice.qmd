@@ -23,8 +23,9 @@ and open `http://localhost:8000/app/`: create an account, search the codebase (o
 |---|---|---|
 | FastAPI, ASGI, Uvicorn | Functions become routes; types become validation and docs | [4.1](01-fastapi-fundamentals.qmd) |
 | Settings | One typed class reads the environment; secrets have no defaults | [4.2](02-configuration-and-secrets.qmd) |
-| Schemas | Separate request and response shapes; PATCH uses `exclude_unset` | [4.3](03-pydantic-schemas.qmd) |
+| Schemas and domain types | Parse once at the edge; response schemas are whitelists; PATCH uses `exclude_unset` | [4.3](03-pydantic-schemas.qmd) |
 | Dependency injection | Routes declare what they need; one session per request | [4.4](04-sessions-and-dependency-injection.qmd) |
+| Testing from the start | Red, green, refactor; in-process client; overrides stage failures | [4.5](05-testing-the-api.qmd) |
 | Routers | One module per resource; nouns in URLs, verbs in methods | [4.6](06-routers-and-project-structure.qmd) |
 | Password hashing | Argon2 with salt; uniform login errors | [4.7](07-users-and-password-hashing.qmd) |
 | JWT | Signed, readable, short-lived access tokens | [4.8](08-authentication-with-jwt.qmd) |

@@ -27,7 +27,7 @@ These apply to Part 4 now and to every lesson written from now on:
 |---|---|---|---|
 | 4.1 | FastAPI fundamentals | 4.1 | Opens with the blocking-server failure; more on ASGI and the request lifecycle |
 | 4.2 | Configuration and secrets | 4.2 | Opens with a leaked secret in a traceback |
-| 4.3 | Schemas and domain types: parse, don't validate | 4.3 | **Deepened.** Domain types (`RepoFullName`, normalised `Email`, `Password`, `IssueCursor`) so routes receive values that are already valid |
+| 4.3 | Schemas and domain types: parse, don't validate | 4.3 | **Deepened.** Domain types (`RepoFullName`, normalised `Email`, `Password`) so routes receive values that are already valid; the cursor type follows in 4.12, where cursors are taught |
 | 4.4 | Database sessions and dependency injection | 4.4 | Opens with a leaked connection pool |
 | 4.5 | Testing the API from the start | **new** | Sync test client, rolled-back session, dependency overrides. Every later lesson is test-first |
 | 4.6 | Routers and project structure | 4.5 | Adds the trade-off discussion (layers vs deep modules) with a worked counter-example |
@@ -50,7 +50,7 @@ The curriculum grows from 96 to 100 lessons. Parts 5, 6, 8 and 9 keep their numb
 
 ### Reference code changes (ship with the lessons)
 
-- `api/schemas.py`: domain types as `Annotated` Pydantic types; email normalised in the type, not in routes.
+- `api/schemas.py`: domain types as `Annotated` Pydantic types; email normalised in the type, not in routes. (Done in block 1, which also found and fixed two real bugs: startup errors printed secrets, and `PATCH /users/me` with `null` answered 500.)
 - Error handling: a small set of domain exceptions with a stable code and status, mapped once in `app.py`. Kept as one module; no per-resource exception classes.
 - New `atlas/logging.py`: JSON log formatter and a request-id context variable; request log line with method, path, status and duration.
 - Tests: synchronous API fixtures shown in 4.5 (kept in the lesson, converted in 4.17); new tests for every "Attack it" (alg none, mass assignment, IDOR, foreign origin, replayed refresh token); a lazy-load regression test using a fresh session.

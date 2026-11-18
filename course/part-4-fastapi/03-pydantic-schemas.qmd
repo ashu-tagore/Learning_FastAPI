@@ -1,23 +1,73 @@
 ---
-title: "4.3 Pydantic schemas: requests, responses, PATCH vs PUT"
-description: "Describe what clients may send and what they get back with Pydantic models, keep secrets out of responses, and update resources correctly with PATCH and PUT."
+title: "4.3 Schemas and domain types: parse, don't validate"
+description: "Describe what clients may send and get back with Pydantic schemas, turn raw input into domain types once at the edge, keep secrets out of responses, and update resources correctly with PATCH and PUT."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 3 · About 75 minutes
+Part 4 · Lesson 3 · About 2 hours
 :::
 
-::: {.callout-note title="Analogy: forms at a bank counter"}
-To open an account you fill in a form with fixed boxes: name, address, a signature of a certain kind. The clerk rejects a form with an empty box or a date in the wrong format before doing anything. When you ask for a statement, you get a different, printed form: your balance and transactions, never the bank's internal notes or your PIN.
-
-A **schema** is one of those forms. The *request* schema says what a client may send; the *response* schema says exactly what goes back. They are separate forms on purpose.
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" up to "PUT versus PATCH", and "In the project". The trade-offs section *(deep dive)* is for when you design your own types.
 :::
+
+::: {.callout-note title="Analogy: passport control"}
+At an airport, your passport is checked once, at the border. After that, nobody inside the country asks again: being inside *is* the proof that you were checked. Imagine instead an airport with no border, where every shop, café and gate does its own spot check. Some would check carefully, some loosely, and one would forget.
+
+A **domain type** is a border check for data. Raw text from a request is checked and converted once, at the edge of the program, into a value of a specific type (an `Email`, a `RepoFullName`). Code inside receives only values that already passed.
+:::
+
+## The problem
+
+Three bugs, all real, all from the same root: data checked in the wrong place, or not at all.
+
+**Bug 1: a check in one place but not another.** Emails should be case-insensitive: `Ada@Example.com` and `ada@example.com` are the same person. Suppose registration lower-cases the address before storing it, and login, written later by someone else, forgets to:
+
+```python
+accounts: dict[str, str] = {}
+
+
+def register(email: str) -> None:
+    accounts[email.lower()] = "account"
+
+
+def login(email: str) -> bool:
+    return email in accounts  # the .lower() was forgotten here
+
+
+register("Ada@Example.com")
+print("validate in each place:", login("Ada@Example.com"))
+```
+```text
+validate in each place: False
+```
+
+Ada registered, typed the same address to log in, and was turned away. Nothing crashed; the bug is silent. Every new function that handles emails is a new chance to forget.
+
+**Bug 2: "absent" and "null" confused.** Atlas lets a user update their skills profile with `PATCH /users/me`. Its first version accepted `{"skills_profile": null}`, passed `None` to the database, and the database refused, because the column may not be empty. The test that found it:
+
+```text
+E           sqlalchemy.exc.IntegrityError: (psycopg.errors.NotNullViolation) null value in column "skills_profile" of relation "users" violates not-null constraint
+```
+
+The client made a mistake and got a 500, "the server is broken". It should have been told what it did wrong, with a 4xx.
+
+**Bug 3: a response that says too much.** A route that returns a table row as-is sends every column. Here's a preview with the `users` table that lesson 4.7 builds (`password_hash` holds a scrambled form of the password, explained there):
+
+```text
+$ curl -s http://localhost:8000/users/3
+{"id":3,"email":"ada@example.com","password_hash":"$argon2id$v=19$m=65536,t=3,p=4$AbkPZBhFGnAfFguqgxawgQ$gWuyLFZakN1pdy2ZVYQBIlqajdyPP/bH8/vP11YSuaY","github_id":null,"github_login":null,"role":"admin","skills_profile":"metrics, handlers","created_at":"2026-11-18T03:10:48.623999+00:00"}
+```
+
+Anyone who can call that route gets material for attacking the password offline (lesson 4.7 shows how). All three bugs are fixed by the same tool: **schemas**.
 
 ## Theory
 
+### Schemas
+
 A **schema** is a description of the shape of some data: which fields, of which types, with which rules. In FastAPI you write schemas as **Pydantic models**: classes that inherit from `BaseModel`, with one type-hinted attribute per field.
 
-When a route has a parameter whose type is a Pydantic model, FastAPI reads the **JSON request body** into it. If the body doesn't match, the client gets 422 and your function never runs. When a route has a **response model**, FastAPI filters and converts whatever the function returns into that shape.
+When a route has a parameter whose type is a Pydantic model, FastAPI reads the **JSON request body** into it. If the body doesn't match, the client gets **422 Unprocessable Content** listing every problem, and your function never runs. When a route has a **response model**, FastAPI filters and converts whatever the function returns into exactly that shape.
 
 ### Models versus schemas
 
@@ -29,11 +79,24 @@ Atlas already has *models* (`models.py`, lesson 3.8): classes mapped to database
 | `email` | yes | yes |
 | purpose | storage | what clients may see |
 
-If a route returned the table object directly, every column, including `password_hash`, would leak. The response model is a whitelist.
+The response schema is a **whitelist**: only the fields it names leave the server. A new secret column added to the table later can't leak by accident. That fixes bug 3.
 
-### Validation rules
+### Parse, don't validate
 
-`Field(...)` adds rules to a field: `min_length`, `max_length`, `ge` (greater or equal), `le`, `pattern` (a regular expression, lesson 1.7). Special types validate formats: `EmailStr` checks an email address. `Literal["user", "admin"]` allows only those exact values.
+"Parse, don't validate" is the title of a 2019 essay by Alexis King that names bug 1's cure:
+
+- **Validating** means checking data and keeping it in its raw form: `if "@" in email: ...`, then passing the same plain `str` along. Every later function must trust that someone, somewhere, checked it, or check again.
+- **Parsing** means checking *and converting* into a type that can only hold valid values. The conversion happens once, at the **edge** of the program (where the request arrives). From then on, the type itself is the evidence.
+
+In Pydantic, a **domain type** is a reusable type with its rules attached. Atlas builds them with `Annotated` (from Python's `typing` module), which attaches extra information to a type:
+
+```python
+Email = Annotated[EmailStr, AfterValidator(normalise_email)]
+```
+
+reads: "an `Email` is a valid email address (`EmailStr`), and after checking it, pass it through `normalise_email`". Any schema field declared as `Email` gets both, everywhere, with nothing to remember.
+
+`Field(...)` attaches simple rules: `min_length`, `max_length`, `ge` (greater or equal), `le`, `pattern` (a regular expression, lesson 1.7). `Literal["user", "admin"]` allows only those exact values.
 
 ### PUT versus PATCH
 
@@ -42,30 +105,107 @@ Both change an existing resource, but they mean different things in HTTP (lesson
 - **PUT** replaces the resource with what you send. Fields you leave out are reset. Sending the same PUT twice gives the same result: PUT is **idempotent**.
 - **PATCH** changes only the fields you send. Everything else stays.
 
-For PATCH, every field in the schema is optional, and the route must tell "not sent" apart from "sent as null". Pydantic remembers which fields were actually set: `model_dump(exclude_unset=True)` returns only those.
+For PATCH, three states of a field must be told apart: **absent** (leave it alone), **a value** (change it), and **null** (store "nothing", only allowed if the column allows it). Pydantic remembers which fields the client actually sent: `model_dump(exclude_unset=True)` returns only those. Bug 2 came from a type that allowed null for a column that doesn't.
 
 ```{mermaid}
 flowchart LR
-  B["JSON body"] -->|validate| I[UserCreate<br/>email, password]
-  I --> R[route function]
-  R -->|"User (ORM object)"| O[UserOut<br/>whitelist]
+  B["raw JSON body<br/>Ada@Example.com"] -->|"parse once (422 if invalid)"| I["UserCreate<br/>email: Email = ada@example.com<br/>password: Password"]
+  I --> R[route function<br/>trusts its inputs]
+  R -->|"User (table row)"| O["UserOut<br/>(whitelist)"]
   O -->|JSON without password_hash| C[client]
 ```
 
 ## In the project
 
-`src/atlas/api/schemas.py` holds every request and response shape. The user schemas:
+### Domain types first, with their tests
+
+The types are plain Pydantic, so they can be tested with pytest (lesson 1.11) before any route exists. `tests/test_schemas.py`, in part:
 
 ```python
-from datetime import datetime
-from typing import Literal
+from pydantic import TypeAdapter, ValidationError
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from atlas.api.schemas import Email, Password, RepoFullName
 
 
+def test_email_is_stored_in_one_form() -> None:
+    assert TypeAdapter(Email).validate_python("  Ada@Example.COM ") == "ada@example.com"
+
+
+@pytest.mark.parametrize("value", ["pytorch/ignite", "sktime/sktime", "ML4SCI/DeepLense", "a.b/c-d_e"])
+def test_repo_full_name_accepts_owner_slash_name(value: str) -> None:
+    assert TypeAdapter(RepoFullName).validate_python(value) == value
+
+
+@pytest.mark.parametrize("value", ["ignite", "pytorch/ignite/extra", "not a repo", "/ignite", "x" * 199 + "/y"])
+def test_repo_full_name_rejects_anything_else(value: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(RepoFullName).validate_python(value)
+```
+
+`TypeAdapter(SomeType).validate_python(value)` runs a type's checks on a single value without a whole model. `@pytest.mark.parametrize` runs one test once per value in the list. The real file also checks malformed emails and password lengths. Then the types, at the top of `src/atlas/api/schemas.py`:
+
+```python
+from typing import Annotated, Literal
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+
+# ---------- Domain types (lesson 4.3) ----------
+# Each type is parsed once, at the edge. Code that receives an Email or a RepoFullName
+# never re-checks it: an invalid value can't get that far.
+
+
+def normalise_email(address: str) -> str:
+    # Atlas treats addresses as case-insensitive and stores one form, so
+    # "Ada@Example.com" and "ada@example.com" can't become two accounts.
+    return address.lower()
+
+
+Email = Annotated[EmailStr, AfterValidator(normalise_email)]
+
+# The upper bound matters too: hashing is slow on purpose (lesson 4.7), so a megabyte
+# "password" would make each login attempt expensive for the server.
+Password = Annotated[str, Field(min_length=10, max_length=128)]
+
+# "owner/name", as GitHub writes it; at most the 200 characters the repos column holds.
+RepoFullName = Annotated[
+    str, Field(pattern=r"^[\w.-]+/[\w.-]+$", max_length=200, examples=["pytorch/ignite"])
+]
+```
+
+`EmailStr` needs the `email-validator` package: `uv add email-validator`. It already removes surrounding spaces and lower-cases the domain part; `normalise_email` lower-cases the rest. Bug 1, replayed with the type:
+
+```python
+class Register(BaseModel):
+    email: Email
+
+
+typed: dict[str, str] = {}
+typed[Register(email="Ada@Example.com").email] = "account"
+print("parse once at the edge: ", Register(email="Ada@Example.com").email in typed)
+```
+```text
+parse once at the edge:  True
+```
+
+And a value that doesn't fit is refused with a reason:
+
+```text
+>>> TypeAdapter(RepoFullName).validate_python("ignite")
+pydantic_core._pydantic_core.ValidationError: 1 validation error for constrained-str
+  String should match pattern '^[\w.-]+/[\w.-]+$' [type=string_pattern_mismatch, input_value='ignite', input_type=str]
+```
+
+```text
+$ uv run pytest tests/test_schemas.py -q
+15 passed in 0.02s
+```
+
+### Schemas built from domain types
+
+```python
 class UserCreate(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=10, max_length=128)
+    email: Email
+    password: Password
 
 
 class UserOut(BaseModel):
@@ -81,18 +221,30 @@ class UserOut(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """PATCH body: every field optional, so a client can change just one."""
+    """PATCH body: a client sends only the fields it wants to change.
 
-    skills_profile: str | None = Field(default=None, max_length=2000)
+    Each field has a default so it may be left out, but its type doesn't allow null:
+    "absent" means "leave it alone", while null would mean "store nothing", which the
+    column forbids. Routes read model_dump(exclude_unset=True), so defaults never apply.
+    """
+
+    skills_profile: str = Field(default="", max_length=2000)
+
+
+class RepoCreate(BaseModel):
+    full_name: RepoFullName
 ```
 
-`EmailStr` needs the `email-validator` package: `uv add email-validator`. Why a maximum password length? Hashing (lesson 4.7) is deliberately slow; a megabyte-long "password" would make every login attempt expensive for the server.
+`UserOut.email` is optional because lesson 4.9 adds accounts that sign in with GitHub and have no email. `RepoFullName` is reused in lesson 4.12, where it also guards query parameters.
 
-Using them in routes (lesson 4.7 fills in the bodies):
+### Using them in routes
+
+Lessons 4.7 and 4.8 fill in these routes; what matters here is their signatures:
 
 ```python
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
 def register(body: UserCreate, session: SessionDep) -> User:
+    user = User(email=body.email, password_hash=hash_password(body.password))
     ...
 
 
@@ -106,71 +258,87 @@ def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> Us
     return user
 ```
 
-The function returns a `User` table object; `response_model=UserOut` turns it into the safe shape. `status_code=201` is HTTP's "Created". `setattr(user, field, value)` sets the attribute named by the string `field`, so the loop works for any field the schema adds later.
+`register` stores `body.email` as it is: it's already normalised, because its type is `Email`. Nothing in the route can forget. The function returns a `User` table object; `response_model=UserOut` turns it into the safe shape. `status_code=201` is HTTP's "Created". `setattr(user, field, value)` sets the attribute named by the string `field`, so the loop works for any field the schema adds later.
 
-Real output once lessons 4.7 and 4.8 are done:
-
-```text
-$ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "ada@example.com", "password": "correct-horse-battery"}'
-{"id":3,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"","created_at":"2026-11-18T03:10:48.623999Z"}
-
-$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"skills_profile\": \"metrics, handlers\"}"
-{"id":3,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"metrics, handlers","created_at":"2026-11-18T03:10:48.623999Z"}
-```
-
-No password or hash in the response, and the PATCH changed only `skills_profile`. A body that breaks the rules never reaches the function:
+Real output once lessons 4.7 and 4.8 are done. Registration with a capitalised address, then the three PATCH cases:
 
 ```text
-$ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "not-an-email", "password": "short"}'
-{"error":{"code":"validation_error","message":"The request is not valid","request_id":"bc087dbefa5b4a35a92873271d9edac0","details":[{"location":["body","email"],"message":"value is not a valid email address: An email address must have an @-sign."},{"location":["body","password"],"message":"String should have at least 10 characters"}]}}
+$ curl -s -X POST http://localhost:8000/auth/register -H "Content-Type: application/json" -d '{"email": "Ada@Example.com", "password": "correct-horse-battery"}'
+{"id":5,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"","created_at":"2026-11-18T06:29:54.358545Z"}
+
+$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"skills_profile": null}'
+{"error":{"code":"validation_error","message":"The request is not valid","request_id":"dad71fdc8e4743d6bbe322561ae6498b","details":[{"location":["body","skills_profile"],"message":"Input should be a valid string"}]}}
+
+$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"skills_profile": "metrics, handlers"}'
+{"id":5,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"metrics, handlers","created_at":"2026-11-18T06:29:54.358545Z"}
+
+$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'
+{"id":5,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"metrics, handlers","created_at":"2026-11-18T06:29:54.358545Z"}
 ```
 
-(The `{"error": ...}` shape is Atlas's own, from lesson 4.14.)
+The email was stored in one form, so logging in as `ADA@example.com` works too. No password or hash in any response. Null is now the client's 422 instead of the server's 500, and an empty PATCH changes nothing. (The `{"error": ...}` shape is Atlas's own, from lesson 4.14.)
 
-The rest of `schemas.py` follows the same pattern: `RepoCreate` (with `pattern=r"^[\w.-]+/[\w.-]+$"` so only `owner/name` is accepted), `IssueOut`, `SearchHit`, and page wrappers used in lesson 4.12.
+## Trade-offs: how strong should a type be? *(deep dive)*
+
+Atlas's domain types are `Annotated` aliases: Pydantic enforces them at the edge, but to mypy an `Email` is still a plain `str`. A function deep inside could receive any string and mypy wouldn't object. Stronger options exist:
+
+| Approach | Checked at the edge | Checked by mypy inside | Cost |
+|---|---|---|---|
+| `Annotated` alias (Atlas) | yes | no, it's a `str` | none: works everywhere a `str` does |
+| `typing.NewType("Email", str)` plus parsing | yes, if you parse | yes: a plain `str` is rejected | a conversion at every boundary, including tests |
+| A small class (say, a frozen dataclass with `owner` and `name`) | yes | yes | more code; must be converted back for JSON and SQL |
+
+Atlas's inside code is short and its inputs all arrive through schemas, so the simple alias is enough. If one value travelled through many layers, or invalid values were costly (money, permissions), a stronger type would earn its cost.
 
 ## Common mistakes
 
 - **Returning table objects without a response model**: every column leaks, including hashes and internal flags.
 - **One schema for input and output**: then `id` and `created_at` look like things a client may send, and `password` looks like something you return.
-- **PATCH with `model_dump()` instead of `model_dump(exclude_unset=True)`**: unsent fields come through as `None` and wipe stored values.
-- **Validating by hand inside the route** (`if len(password) < 10: ...`). Put rules in the schema: they run before your code, and they appear in the docs.
+- **Optional meaning nullable** in PATCH schemas (`str | None`) for columns that can't be empty: null reaches the database and becomes a 500.
+- **PATCH with `model_dump()` instead of `model_dump(exclude_unset=True)`**: unsent fields come through as defaults and overwrite stored values.
+- **Normalising in routes** (`body.email.lower()` here, forgotten there). Put it in the type.
+- **Validating by hand inside the route** (`if len(password) < 10: ...`). Rules in the schema run before your code and appear in the docs.
 - **Forgetting `from_attributes=True`** when a response model is built from an ORM object: Pydantic then expects a dict.
 
 ## Check yourself
 
-**1.** Why does Atlas have both a `User` model and a `UserOut` schema?
+**1.** What's the difference between validating and parsing, in one sentence each?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Validating checks data and keeps it in its raw form, so later code must trust or repeat the check. Parsing checks and converts it once into a type that can only hold valid values, so later code receives the proof along with the value.
+:::
+
+**2.** A client sends `PATCH /users/me` with `{}`. What changes? And with `{"skills_profile": null}`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+With `{}`, nothing: `exclude_unset=True` returns an empty dict, so the loop sets nothing. With null, the request is rejected with 422 before the route runs, because `skills_profile`'s type is `str`, which doesn't allow null.
+:::
+
+**3.** Why does Atlas have both a `User` model and a `UserOut` schema?
 
 ::: {.callout-tip collapse="true" title="Answer"}
 The model describes the table, including `password_hash`. The schema describes what clients may see. Keeping them separate means a new secret column can never appear in a response by accident; the schema is a whitelist.
 :::
 
-**2.** A client sends `PATCH /users/me` with `{}`. What changes?
-
-::: {.callout-tip collapse="true" title="Answer"}
-Nothing. `exclude_unset=True` returns an empty dict, so the loop sets no attributes. With a plain `model_dump()`, `skills_profile` would be set to `None`.
-:::
-
-**3.** Is `POST /auth/register` idempotent? Is `PUT`?
-
-::: {.callout-tip collapse="true" title="Answer"}
-POST isn't: a second identical request tries to create a second account (Atlas answers 409). PUT is: replacing a resource with the same content twice leaves it the same. Lesson 4.16 shows how to make POSTs safe to retry with idempotency keys.
-:::
-
 ## Exercise
 
-Add an optional `display_name` to `UserUpdate` (1 to 50 characters). Without changing the model, what does `UserUpdate(display_name="")` raise? And what does `UserUpdate().model_dump(exclude_unset=True)` return?
+Add a domain type `Label`: 1 to 50 characters, with spaces at both ends removed (hint: `AfterValidator(str.strip)` runs after the length check, so think about the order). Write parametrized tests for `"  good first issue "`, `""` and `"   "`.
 
 ::: {.callout-tip collapse="true" title="Solution"}
+Strip first, then check the length, so `"   "` becomes `""` and is rejected:
+
 ```python
-display_name: str | None = Field(default=None, min_length=1, max_length=50)
+from pydantic import BeforeValidator, StringConstraints
+
+Label = Annotated[str, BeforeValidator(str.strip), StringConstraints(min_length=1, max_length=50)]
 ```
-`UserUpdate(display_name="")` raises a `ValidationError`: "String should have at least 1 character". `UserUpdate().model_dump(exclude_unset=True)` returns `{}`. (To store it you'd also add a column and a migration, lesson 4.13.)
+
+`BeforeValidator` runs before the type's own checks. `TypeAdapter(Label).validate_python("  good first issue ")` returns `"good first issue"`; `""` and `"   "` both raise `ValidationError`. With `AfterValidator(str.strip)` instead, `"   "` would pass the length check first and be stored as `""`. Not in the reference code.
 :::
 
 ## Stretch
 
-Write a test proving `UserOut` can't leak the hash: build a `User(email="a@b.c", password_hash="$argon2...", ...)` object in memory, validate it with `UserOut.model_validate(user)` and assert `"password_hash"` isn't in `model_dump()`.
+Write a test proving `UserOut` can't leak the hash: build a `User(...)` object in memory with a `password_hash`, validate it with `UserOut.model_validate(user)` and assert `"password_hash"` isn't in `model_dump()`.
 
 ::: {.callout-tip collapse="true" title="Solution"}
 ```python
@@ -193,4 +361,4 @@ No database is needed: the object is never added to a session.
 
 ## What changed in the project
 
-New `src/atlas/api/schemas.py`; `email-validator` added. Commit: `feat: Added request and response schemas`.
+New `src/atlas/api/schemas.py` with domain types (`Email`, `Password`, `RepoFullName`) and the request and response schemas; `tests/test_schemas.py`; `email-validator` added. Commits: `feat: Added request and response schemas`, `feat: Parsed emails, passwords and repository names as domain types`, `fix: Rejected null in PATCH /users/me instead of failing with a 500`.

@@ -59,6 +59,7 @@ website:
           - part-4-fastapi/02-configuration-and-secrets.qmd
           - part-4-fastapi/03-pydantic-schemas.qmd
           - part-4-fastapi/04-sessions-and-dependency-injection.qmd
+          - part-4-fastapi/05-testing-the-api.qmd
           - part-4-fastapi/06-routers-and-project-structure.qmd
           - part-4-fastapi/07-users-and-password-hashing.qmd
           - part-4-fastapi/08-authentication-with-jwt.qmd
