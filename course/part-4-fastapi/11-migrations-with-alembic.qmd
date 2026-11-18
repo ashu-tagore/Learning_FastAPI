@@ -1,0 +1,234 @@
+---
+title: "4.11 Migrations with Alembic"
+description: "Change a live database schema safely with versioned Alembic migrations: autogenerate, review, upgrade, downgrade, and adopt an existing database."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 11 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: renovation plans, numbered"}
+You don't renovate a house people live in by demolishing it and building a new one. You follow a numbered list of changes: "1. add a window in the kitchen; 2. move the door". Each builder checks which steps were already done and continues from there. If step 2 goes badly, there's a plan for undoing it.
+
+A **migration** is one numbered step of renovation for a database schema. **Alembic** keeps the list, records which step each database has reached, and applies the rest in order.
+:::
+
+## Theory
+
+Until now `atlas init-db` called `Base.metadata.create_all()`, which creates missing tables. As lesson 3.8 warned, it can't *change* a table: add a column, add an index, rename something. And in production you can't drop and recreate tables: they hold users' data.
+
+A **schema migration** is a script that changes the schema from one version to the next, with an `upgrade()` function and a `downgrade()` function to undo it. **Alembic**, from the authors of SQLAlchemy, is the standard migration tool for SQLAlchemy projects.
+
+- Each migration has a **revision id** and points to the one before it (`down_revision`), forming a chain.
+- Alembic stores the current revision in a table called `alembic_version` in your database.
+- `alembic upgrade head` runs every migration after the current one, up to the newest (**head**).
+- **Autogenerate** compares your models with the live database and drafts a migration for the differences. A *draft*: you always read and fix it.
+
+Postgres can run schema changes inside a transaction (Alembic calls this **transactional DDL**; DDL, Data Definition Language, is SQL that changes structure, like `CREATE TABLE`). If a migration fails half-way, everything it did is rolled back.
+
+```{mermaid}
+flowchart LR
+  B["(empty)"] -->|0001| A["Part 3 tables"]
+  A -->|0002| C["+ users, tokens,<br/>saved issues, notes"]
+  C -->|0003| D["+ indexes on<br/>foreign keys"]
+  D -.->|"downgrade -1"| C
+```
+
+### What autogenerate can't see
+
+It detects new and removed tables, columns, indexes and constraints. It can't detect renames (it sees a dropped column and a new one, which would lose data), and it doesn't migrate your data. Changes like "split `name` into `first` and `last`" are written by hand.
+
+## In the project
+
+```bash
+uv add alembic
+uv run alembic init src/atlas/migrations
+```
+
+The migrations live *inside* the package, so they ship with Atlas and `atlas init-db` can find them wherever it's installed (the Docker image in Part 7 includes them automatically). In `alembic.ini`, `script_location = %(here)s/src/atlas/migrations`.
+
+`src/atlas/migrations/env.py` tells Alembic how to connect and where the models are:
+
+```python
+from atlas.config import Settings
+from atlas.models import Base
+
+# Autogenerate compares this (what the models say) with the live database (what exists).
+target_metadata = Base.metadata
+
+
+def database_url() -> str:
+    # A URL set programmatically (by `atlas init-db` or the tests) wins over the environment.
+    configured = config.get_main_option("sqlalchemy.url")
+    if configured:
+        return configured
+    url = Settings().database_url
+    if url is None:
+        raise SystemExit("Set DATABASE_URL before running migrations")
+    return url
+```
+
+### Atlas's three migrations
+
+- **0001**: the Part 3 tables (repositories, documents, chunks, issues, labels).
+- **0002**: the Part 4 tables (users, refresh tokens, saved issues, notes, idempotency keys).
+- **0003**: two indexes, found by a review of how the routes query.
+
+On a fresh database:
+
+```text
+$ uv run alembic upgrade head
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 0001, Part 3 tables: repositories, documents, chunks, issues and labels
+INFO  [alembic.runtime.migration] Running upgrade 0001 -> 0002, Part 4 tables: users, refresh tokens, saved issues, notes and idempotency keys
+INFO  [alembic.runtime.migration] Running upgrade 0002 -> 0003, index foreign keys used by queries
+
+$ uv run alembic history
+0002 -> 0003 (head), index foreign keys used by queries
+0001 -> 0002, Part 4 tables: users, refresh tokens, saved issues, notes and idempotency keys
+<base> -> 0001, Part 3 tables: repositories, documents, chunks, issues and labels
+```
+
+### Making a migration: the 0003 story
+
+Signing out everywhere (lesson 4.8) runs `UPDATE refresh_tokens ... WHERE user_id = ...`, and listing notes (lesson 4.16) filters by user, repository and issue. Postgres doesn't index foreign keys automatically (lesson 3.6), so both would scan whole tables as they grow. The fix in `models.py`: `index=True` on `RefreshToken.user_id`, and an `Index("ix_issue_notes_user_issue", "user_id", "repo_id", "issue_number")` on `IssueNote`. Then:
+
+```text
+$ uv run alembic revision --autogenerate -m "index foreign keys used by queries"
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.autogenerate.compare.constraints] Detected added index 'ix_issue_notes_user_issue' on '('user_id', 'repo_id', 'issue_number')'
+INFO  [alembic.autogenerate.compare.constraints] Detected added index 'ix_refresh_tokens_user_id' on '('user_id',)'
+Generating .../src/atlas/migrations/versions/84187d1f0028_index_foreign_keys_used_by_queries.py ...  done
+```
+
+Alembic named the file after a random revision id; Atlas renames revisions to `0003` and so on, so they sort in order. The generated file, reviewed:
+
+```python
+revision: str = "0003"
+down_revision: str | Sequence[str] | None = "0002"
+
+
+def upgrade() -> None:
+    op.create_index(
+        "ix_issue_notes_user_issue",
+        "issue_notes",
+        ["user_id", "repo_id", "issue_number"],
+        unique=False,
+    )
+    op.create_index(op.f("ix_refresh_tokens_user_id"), "refresh_tokens", ["user_id"], unique=False)
+
+
+def downgrade() -> None:
+    op.drop_index(op.f("ix_refresh_tokens_user_id"), table_name="refresh_tokens")
+    op.drop_index("ix_issue_notes_user_issue", table_name="issue_notes")
+```
+
+To see the exact SQL without running it (useful for review, or for a database administrator):
+
+```text
+$ uv run alembic upgrade 0002:0003 --sql
+BEGIN;
+
+-- Running upgrade 0002 -> 0003
+
+CREATE INDEX ix_issue_notes_user_issue ON issue_notes (user_id, repo_id, issue_number);
+
+CREATE INDEX ix_refresh_tokens_user_id ON refresh_tokens (user_id);
+
+UPDATE alembic_version SET version_num='0003' WHERE alembic_version.version_num = '0002';
+
+COMMIT;
+```
+
+Undo and redo, to prove `downgrade()` works:
+
+```text
+$ uv run alembic downgrade -1
+INFO  [alembic.runtime.migration] Running downgrade 0003 -> 0002, index foreign keys used by queries
+$ uv run alembic upgrade head
+INFO  [alembic.runtime.migration] Running upgrade 0002 -> 0003, index foreign keys used by queries
+```
+
+And to check the models and the migrations agree (CI runs this):
+
+```text
+$ uv run alembic check
+...
+No new upgrade operations detected.
+```
+
+### `atlas init-db` now migrates
+
+```python
+def run_init_db() -> int:
+    """Bring the database schema up to date by running every pending migration (lesson 4.11)."""
+    url = database_url()
+    ...
+    config = AlembicConfig()
+    config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+    config.set_main_option("sqlalchemy.url", url)
+    alembic_command.upgrade(config, "head")
+    print("database schema is up to date", file=sys.stderr)
+    return 0
+```
+
+### Adopting your Part 3 database
+
+Your dev database already has the Part 3 tables (made by `create_all`) but no `alembic_version` table. Running `upgrade head` would try to create those tables again and fail. Tell Alembic "this database is already at 0001" without running anything, then upgrade:
+
+```bash
+uv run alembic stamp 0001
+uv run alembic upgrade head
+```
+
+Your indexed chunks and stored issues are kept.
+
+## Common mistakes
+
+- **Trusting autogenerate blindly**: a renamed column becomes drop-and-add, and the data is gone. Read every migration.
+- **Editing a migration that already ran elsewhere.** Other databases won't rerun it. Write a new migration instead.
+- **Models and migrations drifting apart**: someone changes a model and forgets the migration. `alembic check` in CI catches it.
+- **Long locks in production**: `CREATE INDEX` blocks writes to the table while it builds. On big tables Postgres offers `CREATE INDEX CONCURRENTLY` (outside a transaction); lesson 7.7 covers zero-downtime schema changes.
+- **No downgrade.** Write it, and run it once, while the change is fresh in your mind.
+
+## Check yourself
+
+**1.** How does Alembic know which migrations a database still needs?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The `alembic_version` table holds the revision the database is at. Alembic follows the chain of `down_revision` links from head back to that revision and runs the ones in between, oldest first.
+:::
+
+**2.** You rename the model attribute `github_login` to `github_username` and autogenerate. What does the draft do, and what should it do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It drops `github_login` and adds an empty `github_username`, losing every value. It should rename the column: replace both operations with `op.alter_column("users", "github_login", new_column_name="github_username")` (and the reverse in `downgrade`).
+:::
+
+**3.** What does `alembic stamp 0001` change in the database?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Only the `alembic_version` table: it records "this database is at 0001" without running any migration. Use it to adopt a database whose schema already matches a revision.
+:::
+
+## Exercise
+
+Add a nullable `display_name` column (up to 50 characters) to `User`, autogenerate a migration, read it, upgrade, downgrade and upgrade again. Run `alembic check` at the end.
+
+::: {.callout-tip collapse="true" title="Solution"}
+In the model: `display_name: Mapped[str | None] = mapped_column(String(50))`. Then `uv run alembic revision --autogenerate -m "add display name"`. The draft contains `op.add_column("users", sa.Column("display_name", sa.String(length=50), nullable=True))` and a matching `op.drop_column`. After upgrading, `alembic check` prints `No new upgrade operations detected.` Not in the reference code: revert both files afterwards and downgrade.
+:::
+
+## Stretch
+
+Make `skills_profile` hold at most 2000 characters in the database too (the schema already limits the API). Write the migration by hand with `op.alter_column(..., type_=sa.String(2000))`. What happens on upgrade if an existing row is longer?
+
+::: {.callout-tip collapse="true" title="Solution"}
+Postgres refuses the type change with an error like `value too long for type character varying(2000)`, and because of transactional DDL nothing is changed. A real migration would first fix or truncate the long rows (an `op.execute("UPDATE ...")` step), then alter the column. Changes that can fail on existing data need a data step first.
+:::
+
+## What changed in the project
+
+`alembic.ini`, `src/atlas/migrations/` with revisions 0001 to 0003; `atlas init-db` runs `upgrade head`; `models.py` indexes the two foreign keys. Commit: `feat: Added database migrations`.

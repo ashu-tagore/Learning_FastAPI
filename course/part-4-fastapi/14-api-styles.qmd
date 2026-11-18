@@ -1,0 +1,199 @@
+---
+title: "4.14 API styles: REST, GraphQL, gRPC and WebSockets"
+description: "Compare the main ways programs talk over a network, know when each fits, and add a search-as-you-type WebSocket to Atlas."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 14 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: letters, a questionnaire, an internal phone line, a phone call"}
+- **REST** is sending letters to known addresses: each letter is complete on its own, and anyone can read the address.
+- **GraphQL** is a questionnaire: you tick exactly the boxes you want answered, and get one reply with just those.
+- **gRPC** is an internal phone line between departments: fast, with a fixed script both sides learned beforehand.
+- **A WebSocket** is a phone call that stays open: either side can speak at any time, until someone hangs up.
+:::
+
+## Theory
+
+### REST
+
+What Atlas has used all along: resources at URLs, HTTP methods as verbs, status codes for outcomes, JSON bodies (lessons 4.5 and 4.12). Strengths: simple, works with every tool (curl, browsers, caches, proxies), easy to secure and observe. Weaknesses: a screen may need several requests (user, then saved issues, then labels), or get more fields than it needs.
+
+### GraphQL
+
+One endpoint (`POST /graphql`). The client sends a **query** naming exactly the fields it wants, across related objects, and gets back that shape:
+
+```graphql
+query {
+  me {
+    email
+    savedIssues { number title labels }
+  }
+}
+```
+
+Strengths: one round trip for a complex screen; no over-fetching; a typed schema. Costs: HTTP caching mostly stops working (everything is a POST to one URL); a single query can be expensive to run, so servers need depth and cost limits; authorisation must be checked per field. Common for public APIs with many different clients (GitHub has a GraphQL API alongside its REST one).
+
+### gRPC
+
+A **remote procedure call** framework from Google. You describe services and messages in a `.proto` file; tools generate client and server code; messages travel in a compact binary format (Protocol Buffers) over HTTP/2, with streaming in both directions. Strengths: fast, strongly typed, good for many internal services calling each other. Costs: browsers can't call it directly, and it's harder to inspect with everyday tools. Mostly used *between* back-end services.
+
+### WebSockets
+
+HTTP is request-response: the client asks, the server answers, done. A **WebSocket** starts as an HTTP request that asks to **upgrade** the connection; afterwards the same TCP connection (lesson 2.2) carries messages in both directions until either side closes it. Strengths: low latency, server can push. Costs: each open connection holds memory on the server, load balancers must support long connections, and you design your own message format.
+
+There's also **Server-Sent Events** (SSE): a normal HTTP response that the server keeps open and writes events into, one direction only. Part 6 streams LLM answers with SSE, because answers only flow server → client.
+
+| Need | Good fit |
+|---|---|
+| Public or web API, CRUD on resources | REST |
+| Many clients wanting different shapes of related data | GraphQL |
+| Fast typed calls between internal services | gRPC |
+| Two-way, low-latency messages (chat, live search, games) | WebSocket |
+| Server pushes a stream to the client (LLM tokens, progress) | SSE |
+
+Atlas stays REST, adds one WebSocket here, and SSE in Part 6.
+
+```{mermaid}
+sequenceDiagram
+  participant B as Browser
+  participant A as Atlas
+  B->>A: GET /search/live (Upgrade: websocket)
+  A-->>B: 101 Switching Protocols
+  B->>A: "met"
+  A-->>B: {"query": "met", "items": []}
+  B->>A: "metric"
+  A-->>B: {"query": "metric", "items": [5 hits]}
+  B->>A: close
+```
+
+## In the project
+
+### Search as you type: `routes/search.py`
+
+```python
+@router.websocket("/live")
+async def search_as_you_type(websocket: WebSocket, repo: str = "pytorch/ignite") -> None:
+    """One open connection; each message is a query, each reply the top five hits (lesson 4.14).
+
+    Compared with calling GET /search on every keystroke, the connection (and its TCP and
+    TLS handshakes) is set up once, and the server could push updates without being asked.
+    """
+    await websocket.accept()
+    # A session per message, not per connection: a connection may stay open for minutes,
+    # and holding a database connection that long would starve everyone else of the pool.
+    session_factory = websocket.app.state.session_factory
+    try:
+        while True:
+            query = (await websocket.receive_text()).strip()
+            is_blank = query == ""
+            if is_blank:
+                await websocket.send_json({"query": query, "items": []})
+                continue
+            async with session_factory() as session:
+                rows = await session.execute(chunk_search_statement(repo, query, limit=5))
+                hits = [asdict(hit_from_row(row)) for row in rows]
+            await websocket.send_json({"query": query, "items": hits})
+    except WebSocketDisconnect:
+        # The browser tab closed or the user navigated away: nothing to clean up.
+        return
+```
+
+- `@router.websocket(...)` instead of `@router.get(...)`. The handler must be `async`: it waits on the client for as long as the connection lives.
+- `accept()` completes the upgrade. `receive_text()` waits for the next message; `send_json()` sends one.
+- Every reply repeats the query, so the client can ignore late answers to queries the user has already typed past.
+- `asdict` (from `dataclasses`) turns a `Hit` into a dict for JSON.
+- When the browser closes the tab, `receive_text()` raises `WebSocketDisconnect`, and the handler ends.
+
+It answers anyone, like `GET /search`: the code index is public. A WebSocket handler that needed a login would read a token from the first message (browsers can't set an `Authorization` header on WebSockets).
+
+### Trying it
+
+From Python, with the `websockets` library that `uvicorn[standard]` already installed:
+
+```python
+import asyncio
+import json
+
+from websockets.asyncio.client import connect
+
+
+async def main() -> None:
+    async with connect("ws://localhost:8000/search/live") as socket:
+        for query in ["met", "metric", "metric reset"]:
+            await socket.send(query)
+            reply = json.loads(await socket.recv())
+            paths = [hit["path"] for hit in reply["items"][:2]]
+            print(f"{reply['query']!r}: {len(reply['items'])} hits, first {paths}")
+
+
+asyncio.run(main())
+```
+```text
+'met': 0 hits, first []
+'metric': 5 hits, first ['ignite/metrics/__init__.py', 'tests/ignite/metrics/test_metric.py']
+'metric reset': 5 hits, first ['docs/source/metrics.rst', 'docs/source/metrics.rst']
+```
+
+`ws://` is the WebSocket scheme (`wss://` over TLS). Notice `met` finds nothing: keyword search matches whole words (after stemming), not prefixes. In the web UI, tick **Search as I type**: `web/app.js` opens the socket and sends the box's content on every keystroke.
+
+### When not to use it
+
+The same feature works with plain `GET /search` on each keystroke (with a short delay). The WebSocket saves a connection setup per keystroke. That's real, but modest; for most features REST is the right default, and the WebSocket here is mainly a working example of the style.
+
+## Common mistakes
+
+- **Choosing GraphQL or gRPC for a small app with one client**: more machinery, little gain.
+- **Holding a database session for a WebSocket's whole life**: connections run out. Use one per message.
+- **Assuming messages arrive in order relative to user intent**: a slow answer to an old query can arrive after a fast answer to a new one. Tag replies.
+- **No authentication story for WebSockets**, or passing tokens in the URL (it's logged). Send it in the first message.
+- **Using WebSockets for one-way server pushes**: SSE is simpler and works through more proxies.
+
+## Check yourself
+
+**1.** Why is HTTP caching hard with GraphQL?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Every request is usually a POST to the same URL with the query in the body. HTTP caches key on method and URL, and don't cache POSTs, so they can't tell requests apart or reuse responses. GraphQL clients and servers cache at the application level instead.
+:::
+
+**2.** What does `101 Switching Protocols` mean?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The server agreed to the client's `Upgrade: websocket` request. From then on the TCP connection carries WebSocket messages, not HTTP requests and responses.
+:::
+
+**3.** Part 6 streams an LLM's answer to the browser token by token. WebSocket or SSE, and why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+SSE: data flows only from server to client, SSE is a normal HTTP response (works with existing auth headers, proxies and load balancers), and the browser reconnects automatically.
+:::
+
+## Exercise
+
+Send a blank message (`"   "`) over the socket. What comes back? Then send `"engine"` twice and confirm the replies are identical.
+
+::: {.callout-tip collapse="true" title="Solution"}
+A blank query is stripped to `""` and answered immediately with `{"query": "", "items": []}`, without touching the database. Two `"engine"` messages give identical replies: the index hasn't changed between them. The reference test `test_search_as_you_type` (lesson 4.15) checks the blank case and a real query.
+:::
+
+## Stretch
+
+Sketch, in a `.proto`-like notation, a gRPC service a separate "indexer" process could expose to Atlas: index a repository, and stream progress back.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```proto
+service Indexer {
+  rpc IndexRepository(IndexRequest) returns (stream IndexProgress);
+}
+
+message IndexRequest { string full_name = 1; string commit = 2; }
+message IndexProgress { int32 files_done = 1; int32 files_total = 2; string current_path = 3; }
+```
+`stream` makes the response a sequence of messages. Atlas doesn't do this: Part 5 uses a queue and a worker, which decouple the two processes and survive restarts. gRPC fits better when callers need an immediate, typed answer.
+:::
+
+## What changed in the project
+
+`routes/search.py` gains the `/search/live` WebSocket; the web UI's **Search as I type** box uses it. Commit: `feat: Added live search over a WebSocket`.

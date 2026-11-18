@@ -73,3 +73,25 @@ def fake_github(request: httpx.Request) -> httpx.Response:
 
 
 TRANSPORT = httpx.MockTransport(fake_github)
+
+
+def fake_github_oauth(request: httpx.Request) -> httpx.Response:
+    """GitHub's sign-in endpoints: the code exchange and the "who am I" call."""
+    if request.url.path == "/login/oauth/access_token":
+        form = dict(httpx.QueryParams(request.content.decode()))
+        is_good_code = form.get("code") == "good-code" and bool(form.get("code_verifier"))
+        if not is_good_code:
+            return httpx.Response(
+                200,
+                json={
+                    "error": "bad_verification_code",
+                    "error_description": "The code passed is incorrect or expired.",
+                },
+            )
+        return httpx.Response(200, json={"access_token": "gho_fake", "token_type": "bearer"})
+    if request.url.path == "/user":
+        return httpx.Response(200, json={"id": 4242, "login": "octo-learner"})
+    return httpx.Response(404, json={"message": "Not Found"})
+
+
+OAUTH_TRANSPORT = httpx.MockTransport(fake_github_oauth)

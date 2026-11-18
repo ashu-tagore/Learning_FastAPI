@@ -1,0 +1,172 @@
+---
+title: "4.5 Routers and project structure"
+description: "Split the API into routers by resource, choose resource-shaped URLs, and lay out the project so each file has one clear job."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 5 · About 45 minutes
+:::
+
+::: {.callout-note title="Analogy: departments in a shop"}
+A small shop has one counter. A department store has departments (shoes, kitchen, books), each with its own staff, all under one roof and one entrance. Customers find things faster, and staff know exactly what's theirs.
+
+A **router** is a department of your API: all the routes for one resource, in one file, with a shared address prefix. The app is the building that puts the departments together.
+:::
+
+## Theory
+
+With every route in `app.py`, the file grows to thousands of lines and every change touches it. FastAPI's **`APIRouter`** is a group of routes that you define in its own module and later attach to the app with `app.include_router(...)`. A router can set a `prefix` (`/issues`) and `tags` (for the docs) once for all its routes.
+
+### Resource-shaped URLs
+
+**REST** (Representational State Transfer, more in lesson 4.14) is the dominant style for HTTP APIs. Its core habit: URLs name **resources** (nouns), and HTTP methods say what to do with them (verbs).
+
+| Method and path | Meaning |
+|---|---|
+| `GET /issues` | list issues |
+| `GET /issues/42` | one issue |
+| `PUT /issues/42/saved` | mark issue 42 as saved (for me) |
+| `DELETE /issues/42/saved` | unsave it |
+| `POST /repos` | add a repository |
+| `GET /users/me` | the signed-in user |
+
+Not `/getIssues` or `/saveIssue?id=42`: the method already says "get" or "save".
+
+### Atlas's layout
+
+```text
+src/atlas/
+  config.py          settings (lesson 4.2)
+  models.py          tables (Part 3, plus users in 4.6)
+  storage.py         database queries shared by CLI and API (Part 3)
+  security.py        hashing and tokens, no FastAPI imports (4.6, 4.7)
+  github_oauth.py    GitHub sign-in (4.8)
+  api/
+    app.py           create_app: middleware, error handlers, routers
+    deps.py          dependencies: settings, session, current user
+    schemas.py       request and response shapes
+    idempotency.py   safe retries (4.12)
+    routes/
+      auth.py        /auth/...
+      users.py       /users/me...
+      repos.py       /repos
+      issues.py      /issues...
+      search.py      /search
+      notes.py       notes (4.16)
+```
+
+The rule behind it: **code that knows about HTTP lives in `api/`; code that doesn't, lives outside.** `security.py` and `storage.py` can be used by the CLI, the API and the background worker (Part 5) alike.
+
+Why not a "services" layer and a "repositories" layer between routes and the database, as some templates have? For an app this size, each extra layer is a file to jump through that does little but pass arguments along. Atlas's routes call SQLAlchemy directly and share real logic through `storage.py`. If a rule grows complex, it moves into a deeper module then, not before.
+
+```{mermaid}
+flowchart TB
+  APP[app.py<br/>create_app] --> AUTH[routes/auth.py]
+  APP --> USERS[routes/users.py]
+  APP --> REPOS[routes/repos.py]
+  APP --> ISSUES[routes/issues.py]
+  APP --> SEARCH[routes/search.py]
+  AUTH & USERS & REPOS & ISSUES & SEARCH --> DEPS[deps.py]
+  AUTH --> SEC[security.py]
+  SEARCH --> ST[storage.py]
+  DEPS --> SEC
+```
+
+## In the project
+
+A router module, `src/atlas/api/routes/search.py` (lesson 4.10 fills in the query):
+
+```python
+"""Keyword search over an indexed codebase (the same query as `atlas find`)."""
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/search", tags=["search"])
+
+
+@router.get("", response_model=SearchPage)
+def search(session: SessionDep, q: str, ...) -> SearchPage:
+    ...
+```
+
+`@router.get("")` with `prefix="/search"` answers `GET /search`. Every module in `routes/` exposes a variable named `router`, so `create_app` attaches them in one loop:
+
+```python
+from atlas.api.routes import auth, issues, notes, repos, search, users
+
+for module in (auth, users, repos, issues, notes, search):
+    app.include_router(module.router)
+```
+
+Once all of Part 4 is in place, the OpenAPI document lists these paths:
+
+```text
+$ curl -s http://localhost:8000/openapi.json | python3 -c "import json,sys; print(sorted(json.load(sys.stdin)[\"paths\"]))"
+['/auth/login', '/auth/logout', '/auth/refresh', '/auth/register', '/health', '/issues', '/issues/{issue_id}', '/issues/{issue_id}/notes', '/issues/{issue_id}/saved', '/notes/{note_id}', '/ready', '/repos', '/search', '/users/me', '/users/me/saved-issues']
+```
+
+(The GitHub sign-in routes are hidden from the docs with `include_in_schema=False`: they're browser redirects, not calls a client makes.)
+
+## Common mistakes
+
+- **Circular imports**: `routes/users.py` imports from `app.py`, which imports `routes/users.py`. Shared things go in `deps.py` or `schemas.py`, which import nothing from routes.
+- **Verbs in URLs**: `/issues/42/save` with POST. Use the resource (`/issues/42/saved`) and let the method be the verb.
+- **Thin pass-through layers** (`IssueService.get_issue` calling `IssueRepository.get_issue` calling `session.get`): three files, one line of logic.
+- **Forgetting `include_router`**: the routes exist in the module but answer 404.
+- **Inconsistent plurals**: `/issue/42` and `/repos`. Pick plural nouns everywhere.
+
+## Check yourself
+
+**1.** What does `prefix="/issues"` on a router do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It's prepended to every route in the router, so `@router.get("/{issue_id}")` answers `GET /issues/{issue_id}`. The prefix is written once instead of on every route.
+:::
+
+**2.** Why does `security.py` live outside `api/`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It knows nothing about HTTP: hashing a password or signing a token is the same for the CLI (`atlas make-admin`), the API and tests. Keeping it free of FastAPI imports lets every part of Atlas use it.
+:::
+
+**3.** Design the URL and method for "list the notes I wrote on issue 42".
+
+::: {.callout-tip collapse="true" title="Answer"}
+`GET /issues/42/notes`: notes are a sub-resource of the issue, and GET reads. This is exactly what Atlas builds in lesson 4.16.
+:::
+
+## Exercise
+
+Move the `/stats` route from lesson 4.4's exercise into `routes/stats.py` with its own router (`prefix="/stats"`, `tags=["operations"]`) and include it in `create_app`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from fastapi import APIRouter
+from sqlalchemy import func, select
+
+from atlas.api.deps import SessionDep
+from atlas.models import Chunk, Repo
+
+router = APIRouter(prefix="/stats", tags=["operations"])
+
+
+@router.get("")
+def stats(session: SessionDep) -> dict[str, int]:
+    repos = session.scalar(select(func.count()).select_from(Repo)) or 0
+    chunks = session.scalar(select(func.count()).select_from(Chunk)) or 0
+    return {"repos": repos, "chunks": chunks}
+```
+Then add `stats` to the import and the `for module in (...)` loop.
+:::
+
+## Stretch
+
+Sketch REST URLs for Part 6's features: asking a question about a repository, listing past answers, and rating an answer as helpful. Which method does each use?
+
+::: {.callout-tip collapse="true" title="Solution"}
+One reasonable design: `POST /repos/{repo_id}/questions` (ask; creates a question and its answer), `GET /questions` (my past questions), `GET /questions/{id}` (one with its answer), `PUT /questions/{id}/rating` with `{"helpful": true}` (set my rating; idempotent). Part 6 builds its own version and explains its choices.
+:::
+
+## What changed in the project
+
+New `src/atlas/api/routes/` package with one router per resource; `create_app` includes them. Commit: `refactor: Split the API into routers`.

@@ -13,19 +13,22 @@ atlas issue-stats --repo pytorch/ignite
 import argparse
 import asyncio
 import json
-import os
 import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from atlas import issue_cache, storage
+from atlas.config import Settings
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
+from atlas.models import User
 from atlas.search import DEFAULT_EXTENSIONS, search
 from atlas.stats import collect_stats
 
@@ -74,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     commits_parser.add_argument("--repo", default=DEFAULT_REPO, help="owner/name on GitHub")
     commits_parser.add_argument("--limit", type=int, default=10, help="how many (1 to 100)")
 
-    commands.add_parser("init-db", help="create the database tables")
+    commands.add_parser("init-db", help="create or upgrade the database tables")
+
+    admin_parser = commands.add_parser("make-admin", help="give a user the admin role")
+    admin_parser.add_argument("--email", required=True)
 
     index_parser = commands.add_parser("index", help="store a codebase in Postgres")
     index_parser.add_argument("--path", type=Path, default=Path("."), help="folder to index")
@@ -93,8 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def database_url() -> str | None:
-    # Required for the database commands. Part 4 moves this into a settings object.
-    return os.environ.get("DATABASE_URL")
+    # Required for the database commands; read with the rest of the settings (lesson 4.2).
+    return Settings().database_url
 
 
 def open_database() -> Session | None:
@@ -119,9 +125,8 @@ def folder_error(path: Path) -> int | None:
 
 
 def github_token() -> str | None:
-    # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
-    # Part 4 moves this into a proper settings object.
-    return os.environ.get("GITHUB_TOKEN")
+    token = Settings().github_token
+    return token.get_secret_value() if token is not None else None
 
 
 def run_search(args: argparse.Namespace) -> int:
@@ -247,11 +252,31 @@ def run_commits(args: argparse.Namespace) -> int:
 
 
 def run_init_db() -> int:
+    """Bring the database schema up to date by running every pending migration (lesson 4.11)."""
     url = database_url()
     if url is None:
         return 1 if open_database() is None else 0
-    storage.create_schema(create_engine(url))
-    print("database tables are ready", file=sys.stderr)
+
+    config = AlembicConfig()
+    config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+    config.set_main_option("sqlalchemy.url", url)
+    alembic_command.upgrade(config, "head")
+    print("database schema is up to date", file=sys.stderr)
+    return 0
+
+
+def run_make_admin(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+
+    with session, session.begin():
+        user = session.scalar(select(User).where(User.email == args.email.lower()))
+        if user is None:
+            print(f"atlas: no user with email {args.email}", file=sys.stderr)
+            return 1
+        user.role = "admin"
+    print(f"{args.email} is now an administrator", file=sys.stderr)
     return 0
 
 
@@ -329,6 +354,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_commits(args)
     if args.command == "init-db":
         return run_init_db()
+    if args.command == "make-admin":
+        return run_make_admin(args)
     if args.command == "index":
         return run_index(args)
     if args.command == "find":

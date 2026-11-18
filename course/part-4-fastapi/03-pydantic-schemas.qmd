@@ -1,0 +1,196 @@
+---
+title: "4.3 Pydantic schemas: requests, responses, PATCH vs PUT"
+description: "Describe what clients may send and what they get back with Pydantic models, keep secrets out of responses, and update resources correctly with PATCH and PUT."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 3 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: forms at a bank counter"}
+To open an account you fill in a form with fixed boxes: name, address, a signature of a certain kind. The clerk rejects a form with an empty box or a date in the wrong format before doing anything. When you ask for a statement, you get a different, printed form: your balance and transactions, never the bank's internal notes or your PIN.
+
+A **schema** is one of those forms. The *request* schema says what a client may send; the *response* schema says exactly what goes back. They are separate forms on purpose.
+:::
+
+## Theory
+
+A **schema** is a description of the shape of some data: which fields, of which types, with which rules. In FastAPI you write schemas as **Pydantic models**: classes that inherit from `BaseModel`, with one type-hinted attribute per field.
+
+When a route has a parameter whose type is a Pydantic model, FastAPI reads the **JSON request body** into it. If the body doesn't match, the client gets 422 and your function never runs. When a route has a **response model**, FastAPI filters and converts whatever the function returns into that shape.
+
+### Models versus schemas
+
+Atlas already has *models* (`models.py`, lesson 3.8): classes mapped to database tables. Schemas describe the HTTP boundary. They differ deliberately:
+
+| | `User` model (table) | `UserOut` schema (response) |
+|---|---|---|
+| `password_hash` | yes | **no** |
+| `email` | yes | yes |
+| purpose | storage | what clients may see |
+
+If a route returned the table object directly, every column, including `password_hash`, would leak. The response model is a whitelist.
+
+### Validation rules
+
+`Field(...)` adds rules to a field: `min_length`, `max_length`, `ge` (greater or equal), `le`, `pattern` (a regular expression, lesson 1.7). Special types validate formats: `EmailStr` checks an email address. `Literal["user", "admin"]` allows only those exact values.
+
+### PUT versus PATCH
+
+Both change an existing resource, but they mean different things in HTTP (lesson 2.3):
+
+- **PUT** replaces the resource with what you send. Fields you leave out are reset. Sending the same PUT twice gives the same result: PUT is **idempotent**.
+- **PATCH** changes only the fields you send. Everything else stays.
+
+For PATCH, every field in the schema is optional, and the route must tell "not sent" apart from "sent as null". Pydantic remembers which fields were actually set: `model_dump(exclude_unset=True)` returns only those.
+
+```{mermaid}
+flowchart LR
+  B["JSON body"] -->|validate| I[UserCreate<br/>email, password]
+  I --> R[route function]
+  R -->|"User (ORM object)"| O[UserOut<br/>whitelist]
+  O -->|JSON without password_hash| C[client]
+```
+
+## In the project
+
+`src/atlas/api/schemas.py` holds every request and response shape. The user schemas:
+
+```python
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=128)
+
+
+class UserOut(BaseModel):
+    # from_attributes lets Pydantic read user.email from an ORM object, not only dict keys.
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr | None
+    github_login: str | None
+    role: Literal["user", "admin"]
+    skills_profile: str
+    created_at: datetime
+
+
+class UserUpdate(BaseModel):
+    """PATCH body: every field optional, so a client can change just one."""
+
+    skills_profile: str | None = Field(default=None, max_length=2000)
+```
+
+`EmailStr` needs the `email-validator` package: `uv add email-validator`. Why a maximum password length? Hashing (lesson 4.6) is deliberately slow; a megabyte-long "password" would make every login attempt expensive for the server.
+
+Using them in routes (lesson 4.6 fills in the bodies):
+
+```python
+@router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
+def register(body: UserCreate, session: SessionDep) -> User:
+    ...
+
+
+@router.patch("/me", response_model=UserOut)
+def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> User:
+    # exclude_unset: only the fields the client actually sent, so PATCH changes just those.
+    for field, value in changes.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+    session.commit()
+    session.refresh(user)
+    return user
+```
+
+The function returns a `User` table object; `response_model=UserOut` turns it into the safe shape. `status_code=201` is HTTP's "Created". `setattr(user, field, value)` sets the attribute named by the string `field`, so the loop works for any field the schema adds later.
+
+Real output once lessons 4.6 and 4.7 are done:
+
+```text
+$ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "ada@example.com", "password": "correct-horse-battery"}'
+{"id":3,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"","created_at":"2026-11-18T03:10:48.623999Z"}
+
+$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"skills_profile\": \"metrics, handlers\"}"
+{"id":3,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"metrics, handlers","created_at":"2026-11-18T03:10:48.623999Z"}
+```
+
+No password or hash in the response, and the PATCH changed only `skills_profile`. A body that breaks the rules never reaches the function:
+
+```text
+$ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "not-an-email", "password": "short"}'
+{"error":{"code":"validation_error","message":"The request is not valid","request_id":"bc087dbefa5b4a35a92873271d9edac0","details":[{"location":["body","email"],"message":"value is not a valid email address: An email address must have an @-sign."},{"location":["body","password"],"message":"String should have at least 10 characters"}]}}
+```
+
+(The `{"error": ...}` shape is Atlas's own, from lesson 4.12.)
+
+The rest of `schemas.py` follows the same pattern: `RepoCreate` (with `pattern=r"^[\w.-]+/[\w.-]+$"` so only `owner/name` is accepted), `IssueOut`, `SearchHit`, and page wrappers used in lesson 4.10.
+
+## Common mistakes
+
+- **Returning table objects without a response model**: every column leaks, including hashes and internal flags.
+- **One schema for input and output**: then `id` and `created_at` look like things a client may send, and `password` looks like something you return.
+- **PATCH with `model_dump()` instead of `model_dump(exclude_unset=True)`**: unsent fields come through as `None` and wipe stored values.
+- **Validating by hand inside the route** (`if len(password) < 10: ...`). Put rules in the schema: they run before your code, and they appear in the docs.
+- **Forgetting `from_attributes=True`** when a response model is built from an ORM object: Pydantic then expects a dict.
+
+## Check yourself
+
+**1.** Why does Atlas have both a `User` model and a `UserOut` schema?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The model describes the table, including `password_hash`. The schema describes what clients may see. Keeping them separate means a new secret column can never appear in a response by accident; the schema is a whitelist.
+:::
+
+**2.** A client sends `PATCH /users/me` with `{}`. What changes?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Nothing. `exclude_unset=True` returns an empty dict, so the loop sets no attributes. With a plain `model_dump()`, `skills_profile` would be set to `None`.
+:::
+
+**3.** Is `POST /auth/register` idempotent? Is `PUT`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+POST isn't: a second identical request tries to create a second account (Atlas answers 409). PUT is: replacing a resource with the same content twice leaves it the same. Lesson 4.12 shows how to make POSTs safe to retry with idempotency keys.
+:::
+
+## Exercise
+
+Add an optional `display_name` to `UserUpdate` (1 to 50 characters). Without changing the model, what does `UserUpdate(display_name="")` raise? And what does `UserUpdate().model_dump(exclude_unset=True)` return?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+display_name: str | None = Field(default=None, min_length=1, max_length=50)
+```
+`UserUpdate(display_name="")` raises a `ValidationError`: "String should have at least 1 character". `UserUpdate().model_dump(exclude_unset=True)` returns `{}`. (To store it you'd also add a column and a migration, lesson 4.11.)
+:::
+
+## Stretch
+
+Write a test proving `UserOut` can't leak the hash: build a `User(email="a@b.c", password_hash="$argon2...", ...)` object in memory, validate it with `UserOut.model_validate(user)` and assert `"password_hash"` isn't in `model_dump()`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from datetime import UTC, datetime
+
+from atlas.api.schemas import UserOut
+from atlas.models import User
+
+
+def test_user_out_has_no_hash() -> None:
+    user = User(id=1, email="a@b.c", password_hash="$argon2id$fake", role="user",
+                skills_profile="", created_at=datetime.now(UTC))
+
+    dumped = UserOut.model_validate(user).model_dump()
+
+    assert "password_hash" not in dumped
+```
+No database is needed: the object is never added to a session.
+:::
+
+## What changed in the project
+
+New `src/atlas/api/schemas.py`; `email-validator` added. Commit: `feat: Added request and response schemas`.

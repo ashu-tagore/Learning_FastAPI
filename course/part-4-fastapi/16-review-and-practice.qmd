@@ -1,0 +1,190 @@
+---
+title: "4.16 Review and practice"
+description: "Pull Part 4 together, practise across it, and build a private notes resource on your own from a spec and acceptance tests."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 16 · About 3 hours
+:::
+
+## Recap
+
+Atlas is now a web API with a web interface. Run it:
+
+```bash
+cd atlas && docker compose up -d
+uv run atlas init-db
+WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload
+```
+
+and open `http://localhost:8000/app/`: create an account, search the codebase (or tick **Search as I type**), browse and save issues, and write your skills profile.
+
+| Idea | One line | Lesson |
+|---|---|---|
+| FastAPI, ASGI, Uvicorn | Functions become routes; types become validation and docs | [4.1](01-fastapi-fundamentals.qmd) |
+| Settings | One typed class reads the environment; secrets have no defaults | [4.2](02-configuration-and-secrets.qmd) |
+| Schemas | Separate request and response shapes; PATCH uses `exclude_unset` | [4.3](03-pydantic-schemas.qmd) |
+| Dependency injection | Routes declare what they need; one session per request | [4.4](04-sessions-and-dependency-injection.qmd) |
+| Routers | One module per resource; nouns in URLs, verbs in methods | [4.5](05-routers-and-project-structure.qmd) |
+| Password hashing | Argon2 with salt; uniform login errors | [4.6](06-users-and-password-hashing.qmd) |
+| JWT | Signed, readable, short-lived access tokens | [4.7](07-authentication-with-jwt.qmd) |
+| OAuth2, refresh, roles | GitHub sign-in with state and PKCE; rotating refresh tokens | [4.8](08-github-sign-in-refresh-tokens-roles.qmd) |
+| Authorisation | 401 vs 403 vs 404; owner in the query | [4.9](09-relationships-and-authorisation.qmd) |
+| Pagination | Cursor for feeds, offset for ranked results; `selectinload` | [4.10](10-pagination-filtering-search.qmd) |
+| Migrations | Versioned, reviewed schema changes with Alembic | [4.11](11-migrations-with-alembic.qmd) |
+| Errors and conventions | One error shape, request ids, CORS, idempotency keys | [4.12](12-errors-middleware-cors-conventions.qmd) |
+| Async | Await all I/O; CPU work to the thread pool; load relationships | [4.13](13-async-fastapi.qmd) |
+| API styles | REST by default; GraphQL, gRPC, WebSocket, SSE for specific needs | [4.14](14-api-styles.qmd) |
+| Testing | In-process client, rolled-back transaction, fakes at the boundary | [4.15](15-testing-apis.qmd) |
+
+## Mixed practice
+
+No step-by-step hints; each relates to several lessons.
+
+1. **Docs only.** Add a "documentation only" checkbox to the web UI's search. Which file changes, and which API parameter already exists?
+2. **Admin sees users.** Add `GET /users` (admins only) with cursor pagination by `id`. Return `UserOut` items. Write the 401, 403 and happy-path tests.
+3. **Expire idempotency keys.** Keys are kept forever. Add a `created_at` filter so keys older than 24 hours are ignored by `replay`, and write a test that uses `update(...)` to age a key.
+4. **Who's slow?** Using lesson 4.12's stretch logging, find the slowest route when you click through the web UI. Explain why.
+5. **Break it on purpose.** Remove `selectinload(Issue.repo)` from `get_issue_or_404`, restart the server and call `GET /issues/1`. You get a 500, and the server log shows `MissingGreenlet`. Now run the tests: they all still pass. Why? (Hint: in the tests, the same session that stored the issues still holds the `Repo` object in memory.) Write a test that would catch it.
+
+## Build it alone: private notes on issues
+
+A learner wants to keep notes while exploring an issue: "start in `engine.py`", "ask about the test fixture". Build a **notes** resource.
+
+### Spec
+
+- A note belongs to one user and one issue, and has a `body` of 1 to 5000 characters.
+- Notes are **private**: other users can't list, read, edit or delete them; to them, someone else's note doesn't exist (404).
+- Closed issues are removed from the `issues` table on the next sync (lesson 3.8). **Notes must survive that**: when the issue reopens, its notes are still attached. (Hint: don't point at the `issues` row.)
+- Creating a note honours the `Idempotency-Key` header (lesson 4.12).
+- Responses include `id`, `repo` (`"pytorch/ignite"`), `issue_number`, `body`, `created_at`, `updated_at`.
+
+| Method and path | Result |
+|---|---|
+| `POST /issues/{issue_id}/notes` | 201 + the note |
+| `GET /issues/{issue_id}/notes` | 200 + my notes on that issue, oldest first |
+| `PATCH /notes/{note_id}` | 200 + the updated note |
+| `DELETE /notes/{note_id}` | 204 |
+
+### Acceptance tests
+
+Your implementation is done when these pass (they're in `tests/test_api_resources.py` of the reference code; the helpers `store_numbers` and `sign_up` are shown in lesson 4.15):
+
+```python
+async def test_notes_are_created_listed_edited_and_deleted(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    ids = await store_numbers(async_session, [7])
+    ada = await sign_up(client, "ada@example.com")
+
+    created = await client.post(
+        f"/issues/{ids[7]}/notes", json={"body": "Start in engine.py"}, headers=ada
+    )
+    note_id = created.json()["id"]
+    edited = await client.patch(
+        f"/notes/{note_id}", json={"body": "Start in events.py"}, headers=ada
+    )
+
+    assert created.status_code == 201
+    assert created.json()["issue_number"] == 7 and created.json()["repo"] == "pytorch/ignite"
+    assert edited.json()["body"] == "Start in events.py"
+    listed = (await client.get(f"/issues/{ids[7]}/notes", headers=ada)).json()
+    assert [note["body"] for note in listed] == ["Start in events.py"]
+
+    assert (await client.delete(f"/notes/{note_id}", headers=ada)).status_code == 204
+    assert (await client.get(f"/issues/{ids[7]}/notes", headers=ada)).json() == []
+
+
+async def test_other_peoples_notes_are_invisible(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    ids = await store_numbers(async_session, [7])
+    ada = await sign_up(client, "ada@example.com")
+    grace = await sign_up(client, "grace@example.com")
+    created = await client.post(f"/issues/{ids[7]}/notes", json={"body": "mine"}, headers=ada)
+    note_id = created.json()["id"]
+
+    assert (await client.get(f"/issues/{ids[7]}/notes", headers=grace)).json() == []
+    edit = await client.patch(f"/notes/{note_id}", json={"body": "x"}, headers=grace)
+    assert edit.status_code == 404
+    assert (await client.delete(f"/notes/{note_id}", headers=grace)).status_code == 404
+
+
+async def test_notes_survive_the_issue_closing(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    ids = await store_numbers(async_session, [7, 8])
+    ada = await sign_up(client, "ada@example.com")
+    await client.post(f"/issues/{ids[7]}/notes", json={"body": "keep me"}, headers=ada)
+
+    # Issue 7 closes: the next sync removes it from the issues table...
+    await store_numbers(async_session, [8])
+    # ...and when it reopens it gets a new row, but the note is still attached by number.
+    reopened = await store_numbers(async_session, [7, 8])
+
+    notes = (await client.get(f"/issues/{reopened[7]}/notes", headers=ada)).json()
+    assert [note["body"] for note in notes] == ["keep me"]
+
+
+async def test_note_creation_honours_idempotency_keys(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    ids = await store_numbers(async_session, [7])
+    ada = {**await sign_up(client, "ada@example.com"), "Idempotency-Key": "note-1"}
+    path = f"/issues/{ids[7]}/notes"
+
+    first = await client.post(path, json={"body": "once"}, headers=ada)
+    retry = await client.post(path, json={"body": "once"}, headers=ada)
+    other_path = await client.post(
+        f"/issues/{ids[7] + 1000}/notes", json={"body": "x"}, headers=ada
+    )
+
+    assert retry.json() == first.json()
+    assert len((await client.get(path, headers=ada)).json()) == 1
+    assert other_path.status_code == 422
+```
+
+You'll need a table and a migration (lesson 4.11), schemas (4.3), a router (4.5), ownership checks (4.9) and idempotency (4.12).
+
+::: {.callout-tip collapse="true" title="One possible solution: the design"}
+The reference code's `IssueNote` stores `user_id`, `repo_id` and `issue_number` instead of a foreign key to `issues.id`, so deleting and re-creating the issue row doesn't touch notes. An index on `(user_id, repo_id, issue_number)` serves the list query (migration 0003). Routes live in `src/atlas/api/routes/notes.py`; every query filters by `IssueNote.user_id == user.id`, so another user's note is simply not found. `POST` first resolves the issue with `get_issue_or_404` to learn its repository and number, then uses `idempotency.replay` and `idempotency.remember` exactly as `POST /repos` does. Compare your version with the reference after your tests pass.
+:::
+
+## From earlier parts
+
+**1.** (Part 3) Why does `saved_issues` cascade on delete from `issues`, while notes deliberately don't reference `issues` at all?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A saved issue only makes sense while the issue is open and stored: when it closes, the bookmark can go. A note is the learner's own writing, worth keeping across the issue closing and reopening, so it points at the stable `(repository, issue number)` pair instead of a row that comes and goes.
+:::
+
+**2.** (Part 2) What does `curl -i` show that plain `curl` doesn't, and when did it help in Part 4?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The status line and response headers. It showed the `x-request-id` header, CORS's `access-control-allow-*` headers, and GitHub sign-in's `location` and `set-cookie` headers.
+:::
+
+**3.** (Part 1) In `app.py`, `for module in (auth, users, ...): app.include_router(module.router)`. What Python idea makes that loop possible?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Modules are objects (lesson 1.4): they can be put in a tuple and their attributes read with `module.router`. Each route module follows the same convention of exposing a variable named `router`.
+:::
+
+## Self-check
+
+Without notes, you should be able to:
+
+- Build a FastAPI route with path, query and body parameters, and explain where each comes from.
+- Explain why a response schema is a whitelist, and write a correct PATCH.
+- Write a dependency with cleanup, and override it in a test.
+- Explain how Argon2, JWTs and refresh tokens each protect users, and the limits of each.
+- Describe the OAuth2 authorization code flow, and what `state` and PKCE prevent.
+- Choose between 401, 403 and 404, and between offset and cursor pagination.
+- Write, review and roll back an Alembic migration.
+- Say when to use `def`, `async def` and `run_in_threadpool`.
+- Pick an API style for a new feature and justify it.
+- Write API tests that cover unhappy paths against a real database.
+
+## What changed in the project
+
+Checkpoint 4: the Atlas API v1 (accounts, GitHub sign-in, issues, saved issues, notes, keyword search, live search) with the ready-made web UI at `/app`, migrations, and 81 tests. Tag: `checkpoint-04`.

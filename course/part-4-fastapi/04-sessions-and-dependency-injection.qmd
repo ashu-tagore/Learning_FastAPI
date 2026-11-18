@@ -1,0 +1,216 @@
+---
+title: "4.4 Database sessions and dependency injection"
+description: "Give every request its own database session with a FastAPI dependency, share one engine through the app's lifespan, and swap dependencies in tests."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 4 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: a hotel room with everything laid out"}
+When you check into a hotel, you don't bring towels, soap or a kettle. You state what you need ("a room with a desk"), and when you arrive it's ready. When you leave, housekeeping cleans up, whether you left tidily or in a hurry.
+
+**Dependency injection** works the same way. A route function states what it needs as parameters: "a database session", "the current user". FastAPI prepares each one before calling it and cleans up afterwards, even if the function fails.
+:::
+
+## Theory
+
+A **dependency** is anything a function needs from outside to do its job: settings, a database session, the signed-in user. **Dependency injection** means the function doesn't create these itself; it declares them and something else (here FastAPI) provides them.
+
+Why bother?
+
+- **No repeated setup**: twenty routes need a session; the code to open and close it is written once.
+- **Guaranteed cleanup**: the session is closed after the response, error or not.
+- **Swappable in tests**: a test tells FastAPI "when a route asks for a session, give it this one instead" (lesson 4.15).
+
+### Declaring a dependency
+
+You write a function that produces the thing, and refer to it with `Depends(...)`:
+
+```python
+def get_session(request: Request) -> Iterator[Session]:
+    with request.app.state.session_factory() as session:
+        yield session
+```
+
+A dependency that uses `yield` (a generator, lesson 1.6) runs in two halves: the part before `yield` runs before the route; the value yielded is passed in; the part after runs after the response. Here `with` closes the session at the end, whatever happened.
+
+Dependencies can depend on other dependencies. FastAPI works out the order, and within one request it runs each dependency once and reuses the result.
+
+### `Annotated` aliases
+
+`Annotated[Session, Depends(get_session)]` means "a `Session`, and here's extra information for FastAPI: get it from `get_session`". Writing that in every route is noisy, so Atlas names it once:
+
+```python
+SessionDep = Annotated[Session, Depends(get_session)]
+```
+
+and a route just says `session: SessionDep`. The type checker still sees a plain `Session`.
+
+### One engine, many sessions
+
+Lesson 3.8 said: one engine (with its connection pool) per program, one session per unit of work. For a web API the unit of work is the request. The engine is created once when the app starts, in its **lifespan**: a function that runs code at startup, then `yield`s while the app serves requests, then runs shutdown code.
+
+```{mermaid}
+sequenceDiagram
+  participant U as Uvicorn
+  participant A as App lifespan
+  participant D as get_session
+  participant R as route
+  U->>A: startup
+  A->>A: create engine + session factory
+  U->>D: request arrives
+  D->>R: session
+  R-->>D: return (or raise)
+  D->>D: close session
+  U->>A: shutdown
+  A->>A: engine.dispose()
+```
+
+## In the project
+
+The lifespan in `create_app` (`src/atlas/api/app.py`):
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Runs once at startup: one engine (and its connection pool) for the whole process.
+    engine = create_engine(settings.database_url, pool_pre_ping=True)
+    app.state.session_factory = sessionmaker(engine, expire_on_commit=False)
+    yield
+    # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
+    engine.dispose()
+```
+
+- `@asynccontextmanager` turns this generator into something FastAPI can enter at startup and exit at shutdown. FastAPI's lifespan is written as an `async def` function even in an otherwise synchronous app; nothing inside it blocks for long.
+- `pool_pre_ping=True` checks a pooled connection is still alive before using it, so a database restart doesn't produce errors on the next requests.
+- `sessionmaker(...)` is a **session factory**: calling it makes a new session bound to the engine.
+- `expire_on_commit=False` keeps objects readable after `commit()` without reloading them; routes often commit and then return the object.
+
+The dependencies live in `src/atlas/api/deps.py`:
+
+```python
+"""Dependencies: things a route asks for by declaring a parameter, and FastAPI provides."""
+
+from collections.abc import Iterator
+from typing import Annotated
+
+from fastapi import Depends, Request
+from sqlalchemy.orm import Session
+
+from atlas.config import ApiSettings
+
+
+def get_settings(request: Request) -> ApiSettings:
+    settings: ApiSettings = request.app.state.settings
+    return settings
+
+
+def get_session(request: Request) -> Iterator[Session]:
+    """One database session per request, always closed, even if the route raises."""
+    with request.app.state.session_factory() as session:
+        yield session
+
+
+SettingsDep = Annotated[ApiSettings, Depends(get_settings)]
+SessionDep = Annotated[Session, Depends(get_session)]
+```
+
+A first route that uses the database: **readiness**. `/health` (lesson 4.1) says "the process answers". `/ready` says "and it can reach its database, so send it real traffic". Load balancers use the difference (lesson 7.9).
+
+```python
+@app.get("/ready", tags=["operations"])
+def ready(session: SessionDep) -> dict[str, str]:
+    """Readiness: the process can reach its database, so it can do real work."""
+    session.execute(text("SELECT 1"))
+    return {"status": "ready"}
+```
+
+```text
+$ curl -s http://localhost:8000/ready
+{"status":"ready"}
+```
+
+Stop Postgres and the two answers part ways, which is exactly the distinction you want:
+
+```text
+$ docker compose stop db
+$ curl -s http://localhost:8000/health
+{"status":"ok"}
+$ curl -s http://localhost:8000/ready
+{"error":{"code":"internal_server_error","message":"Something went wrong on our side","request_id":"936e83214ee9445bb3f8c870cf846487"}}
+$ docker compose start db
+```
+
+(The status code is 500; lesson 4.12 builds this error format.)
+
+### Creating the tables
+
+The API expects the tables to exist. Until lesson 4.11 replaces it with migrations, `atlas init-db` from Part 3 creates them.
+
+## Common mistakes
+
+- **A global session** shared by all requests: two requests interleave their changes and transactions. One session per request.
+- **Creating the engine inside `get_session`**: a new connection pool per request, which defeats pooling and exhausts the database's connection limit.
+- **`return` instead of `yield` in `get_session`**: the cleanup never runs and connections leak.
+- **Calling a dependency yourself** (`session = get_session(request)`) instead of declaring it: you lose cleanup and test overrides.
+- **Doing work at import time** (connecting to the database when the module loads). Use the lifespan, so tests and tools can import the module without a database.
+
+## Check yourself
+
+**1.** What runs before the route, and what after, in `get_session`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Before: opening a session from the factory (entering the `with`). The session is passed to the route at `yield`. After the response (or an error): leaving the `with`, which closes the session and returns its connection to the pool.
+:::
+
+**2.** Why is the engine created in the lifespan rather than at module level?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Its URL comes from the settings passed to `create_app`, so tests can point it at a test database. And importing the module never connects to anything; the connection pool exists only while the app is running, and is disposed of cleanly at shutdown.
+:::
+
+**3.** What's the difference between `/health` and `/ready`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`/health` (liveness) says the process is running and answering. `/ready` (readiness) also checks the database, so it says whether the instance can serve real requests. An orchestrator restarts instances that fail liveness, and stops sending traffic to ones that fail readiness.
+:::
+
+## Exercise
+
+Add `GET /stats` returning `{"repos": N, "chunks": M}` using `SessionDep` and `select(func.count()).select_from(Repo)` (and the same for `Chunk`).
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from sqlalchemy import func, select
+
+from atlas.models import Chunk, Repo
+
+
+@app.get("/stats")
+def stats(session: SessionDep) -> dict[str, int]:
+    repos = session.scalar(select(func.count()).select_from(Repo)) or 0
+    chunks = session.scalar(select(func.count()).select_from(Chunk)) or 0
+    return {"repos": repos, "chunks": chunks}
+```
+`scalar` returns the single value of the single row. Not in the reference code.
+:::
+
+## Stretch
+
+Write a dependency `get_page_size(limit: int = 20) -> int` that caps `limit` at 100, and use it in two routes with `Annotated[int, Depends(get_page_size)]`. Where does `limit` appear in `/docs`?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def get_page_size(limit: int = 20) -> int:
+    return min(limit, 100)
+
+
+PageSize = Annotated[int, Depends(get_page_size)]
+```
+A dependency's own parameters become the route's parameters, so `limit` shows up as a query parameter of every route that uses `PageSize`. (Atlas uses `Query(ge=1, le=100)` instead, lesson 4.10, which rejects bad values rather than quietly changing them.)
+:::
+
+## What changed in the project
+
+`app.py` has the lifespan and `/ready`; new `src/atlas/api/deps.py` with `get_settings`, `get_session`, `SettingsDep` and `SessionDep`. Commit: `feat: Added per-request database sessions`.

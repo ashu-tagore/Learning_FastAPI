@@ -10,7 +10,7 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 | M1 | Parts 0-1 | 15 lessons; `atlas` CLI v0 keyword search | Done (tag `checkpoint-01` pending: this environment cannot push tags) |
 | M2 | Part 2 | 7 lessons; OS and network basics, GitHub client, concurrent issue fetch | Done (tag `checkpoint-02` pending: this environment cannot push tags) |
 | M3 | Part 3 | 12 lessons; Postgres schema, query tuning, concurrency, SQL search | Done (tag `checkpoint-03` pending: this environment cannot push tags) |
-| M4 | Part 4 | 16 lessons (12 ported from the original tutorial); GitHub sign-in; async API v1; web UI v1 | Not started |
+| M4 | Part 4 | 16 lessons (12 ported from the original tutorial); GitHub sign-in; async API v1; web UI v1 | Done (tag `checkpoint-04` pending: this environment cannot push tags) |
 | M5 | Part 5 | 7 lessons; worker, queue, webhooks, storage, cache, event streams | Not started |
 | M6 | Part 6 | 9 lessons; providers, ingestion, hybrid search, `/ask`, evals | Not started |
 | M7 | Part 7 | 14 lessons; Terraform, ECS deploy, CI/CD, database operations, observability, security, privacy, incident response | Not started |

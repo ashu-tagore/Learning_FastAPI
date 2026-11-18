@@ -1,0 +1,287 @@
+---
+title: "4.12 Errors, middleware, CORS and API conventions"
+description: "Give every error one predictable shape, trace requests with ids in middleware, allow browser origins with CORS, and make POST safe to retry with idempotency keys."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 12 · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: a parcel service's habits"}
+A good parcel service is predictable. Every parcel gets a tracking number you can quote when something goes wrong. Every "we couldn't deliver" card has the same layout, so you know where to look for the reason. A receptionist checks the sender's address before accepting parcels from strangers. And if you send the same parcel twice by mistake, with the same reference number, they notice and don't charge you twice.
+
+This lesson gives Atlas those habits: one error layout, a request id on everything, a front-door check on browser origins, and idempotency keys.
+:::
+
+## Theory
+
+### One error shape
+
+FastAPI's default errors come in different shapes: `{"detail": "Not Found"}` for one, a list of dicts for validation errors (lesson 4.1). Clients then need special cases. Atlas answers every error with one shape:
+
+```json
+{"error": {"code": "not_found", "message": "Issue 999 not found", "request_id": "8807...", "details": [...]}}
+```
+
+- `code`: a stable, machine-readable name a client can branch on.
+- `message`: for people.
+- `request_id`: quote it in a bug report; the same id is in the server logs.
+- `details`: only for validation errors: which field, what's wrong.
+
+An **exception handler** is a function FastAPI calls when a given exception escapes a route; it builds the response. Atlas registers three: for `HTTPException` (errors routes raise on purpose), for `RequestValidationError` (bad input) and for `Exception` (bugs). The last one logs the full traceback on the server and tells the client only "Something went wrong on our side": internals like SQL or file paths must never reach clients, because they help attackers.
+
+### Middleware
+
+**Middleware** is code that wraps every request: it runs before the route and after it, like layers of an onion. Atlas has two:
+
+- **Request id**: reuse the caller's `X-Request-ID` header or make a new random id; store it on `request.state`; add it to the response. One id follows a request through logs and, in Part 5, through the worker.
+- **CORS** (below).
+
+### CORS
+
+Browsers enforce the **same-origin policy**: a page from one **origin** (scheme + host + port, like `https://atlas.example`) can't read responses from another origin unless that origin allows it. Otherwise any website you visit could call your bank's API with your cookies and read the results.
+
+**CORS** (Cross-Origin Resource Sharing) is how a server says which other origins may call it. For requests with custom headers like `Authorization`, the browser first sends a **preflight**: an `OPTIONS` request asking "may this origin send a POST with these headers?". The server answers with `Access-Control-Allow-*` headers, or doesn't.
+
+CORS is a browser rule. It doesn't stop curl or scripts, so it isn't authentication. Atlas's web UI is served from the same origin as the API, so it doesn't need CORS at all; the setting exists for a front end hosted elsewhere (Part 7's CloudFront setup).
+
+### Idempotency keys
+
+A client POSTs "add repository", the network drops, and the client never sees the answer. Did it work? Retrying might add it twice. An **idempotency key** fixes this: the client generates a unique `Idempotency-Key` header and sends the same key with each retry. The server stores the response under the key the first time, and replays it for repeats. Stripe's API popularised this; an IETF draft standardises the header.
+
+```{mermaid}
+flowchart LR
+  REQ[request] --> CORS[CORS middleware] --> RID[request id middleware] --> ROUTE[route]
+  ROUTE -->|raises| H[exception handlers<br/>one error shape]
+  ROUTE --> RES[response + X-Request-ID]
+  H --> RES
+```
+
+### Conventions Atlas follows
+
+Plural resource nouns; JSON everywhere with `snake_case` fields; times in UTC, ISO 8601 (`2026-11-18T03:10:48Z`); 201 + the created resource for POST; 204 for empty successes; `limit` with a maximum on every list; versioning by adding fields, never changing their meaning (a `/v2/` prefix only if a breaking change is ever unavoidable).
+
+## In the project
+
+### Error handlers: `app.py`
+
+```python
+def error_body(
+    code: str, message: str, request: Request, details: object = None
+) -> dict[str, object]:
+    """Every error from the API has this one shape, so clients handle errors in one place."""
+    error: dict[str, object] = {
+        "code": code,
+        "message": message,
+        "request_id": getattr(request.state, "request_id", None),
+    }
+    if details is not None:
+        error["details"] = details
+    return {"error": error}
+
+
+def status_code_name(status_code: int) -> str:
+    # 404 -> "not_found": readable, and derived from the standard status phrases.
+    return HTTPStatus(status_code).phrase.lower().replace(" ", "_").replace("-", "_")
+```
+
+Inside `create_app`:
+
+```python
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, error: HTTPException) -> JSONResponse:
+        body = error_body(status_code_name(error.status_code), str(error.detail), request)
+        return JSONResponse(body, status_code=error.status_code, headers=error.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
+        details = [
+            {"location": list(item["loc"]), "message": item["msg"]} for item in error.errors()
+        ]
+        body = error_body("validation_error", "The request is not valid", request, details)
+        return JSONResponse(body, status_code=422)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, error: Exception) -> JSONResponse:
+        # The full traceback goes to the server log; the client gets an id to quote, not internals.
+        logger.exception(
+            "unhandled error, request_id=%s", getattr(request.state, "request_id", None)
+        )
+        body = error_body("internal_server_error", "Something went wrong on our side", request)
+        return JSONResponse(body, status_code=500)
+```
+
+`HTTPStatus` is from Python's standard `http` module: `HTTPStatus(404).phrase` is `"Not Found"`. Handlers are `async def` because they do no blocking work. You've seen their output throughout Part 4, for example:
+
+```text
+$ curl -s http://localhost:8000/issues/999
+{"error":{"code":"not_found","message":"Issue 999 not found","request_id":"8807aeb3e4bc46e8ae2a52511477c258"}}
+```
+
+### Request ids and CORS
+
+```python
+    @app.middleware("http")
+    async def request_id(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        # Reuse the caller's id if it sent one, so one request can be traced across services.
+        request.state.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
+
+    # Added after request_id, so it wraps it: CORS headers are on every response, errors included.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    )
+```
+
+`call_next(request)` runs everything inside (other middleware, then the route) and returns its response. Middleware added later wraps middleware added earlier.
+
+```text
+$ curl -s -i http://localhost:8000/health -H "X-Request-ID: trace-me-123"
+HTTP/1.1 200 OK
+...
+x-request-id: trace-me-123
+
+$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: http://localhost:8000" -H "Access-Control-Request-Method: POST"
+HTTP/1.1 200 OK
+...
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE
+access-control-allow-headers: Accept, Accept-Language, Authorization, Content-Language, Content-Type, Idempotency-Key, X-Request-ID
+access-control-allow-origin: http://localhost:8000
+
+$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: https://evil.example" -H "Access-Control-Request-Method: POST"
+HTTP/1.1 400 Bad Request
+...
+Disallowed CORS origin
+```
+
+### Idempotency keys: `api/idempotency.py`
+
+The keys live in a table, `idempotency_keys`, unique per `(user_id, key)`:
+
+```python
+def replay(session: Session, user: User, key: str | None, path: str) -> JSONResponse | None:
+    """The stored response for this key, or None if the request is new."""
+    if key is None:
+        return None
+    stored = session.scalar(
+        select(IdempotencyKey).where(IdempotencyKey.user_id == user.id, IdempotencyKey.key == key)
+    )
+    if stored is None:
+        return None
+
+    used_for_another_request = stored.request_path != path
+    if used_for_another_request:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "This Idempotency-Key was already used for a different request",
+        )
+    return JSONResponse(stored.response_body, status_code=stored.response_status)
+
+
+def remember(
+    session: Session, user: User, key: str | None, path: str, status_code: int, body: Any
+) -> None:
+    """Store the response in the same transaction as the change it describes."""
+    if key is None:
+        return
+    session.add(IdempotencyKey(user_id=user.id, key=key, request_path=path,
+                               response_status=status_code, response_body=body))
+```
+
+`POST /repos` uses both, around its work. Storing the response in the *same transaction* as the new repository is the important part: either both are saved or neither, so there's no moment where the repository exists but the key doesn't.
+
+```python
+    previous = idempotency.replay(session, admin, idempotency_key, request.url.path)
+    if previous is not None:
+        return previous
+    ...
+    session.add(repo)
+    session.flush()
+    payload = RepoOut.model_validate(repo).model_dump(mode="json")
+    idempotency.remember(
+        session, admin, idempotency_key, request.url.path, status.HTTP_201_CREATED, payload
+    )
+    session.commit()
+```
+
+`idempotency_key: Annotated[str | None, Header(max_length=100)] = None` in the route's parameters reads the `Idempotency-Key` header (FastAPI converts underscores to hyphens). Retrying with the same key replays; without one, the duplicate is a conflict:
+
+```text
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
+{"id":3,"full_name":"sktime/sktime","indexed_at":null}
+
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
+{"id":3,"full_name":"sktime/sktime","indexed_at":null}
+
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
+{"error":{"code":"conflict","message":"sktime/sktime is already tracked","request_id":"81971f390e3c4354bfeb09c88afc9716"}}
+```
+
+## Common mistakes
+
+- **Leaking internals in errors**: stack traces, SQL, file paths. Log them; return an id.
+- **`allow_origins=["*"]` with credentials**: browsers refuse the combination, and it's unsafe anyway. List the origins.
+- **Thinking CORS protects the API.** It only restrains browsers. Authentication protects the API.
+- **Storing idempotency keys in a separate transaction** from the change: a crash in between breaks the guarantee.
+- **Idempotency keys shared across users**: one user could replay another's response. Atlas scopes them per user.
+- **Changing an error's `code`** once clients depend on it. Codes are part of your API.
+
+## Check yourself
+
+**1.** Why does the `Exception` handler return a generic message instead of the error text?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Unexpected errors can contain internals (SQL, paths, library versions) that help attackers and confuse users. The server logs the full traceback with the request id; the client gets the id to quote, which is enough to find the log entry.
+:::
+
+**2.** A script on `https://evil.example` calls Atlas's API with `fetch`. What does CORS do, and what doesn't it do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The browser won't let that page read Atlas's responses (and for requests needing a preflight, won't send the real request). It doesn't stop the same request from curl or a server; that's what authentication is for.
+:::
+
+**3.** Why must the idempotency record be saved in the same transaction as the new repository?
+
+::: {.callout-tip collapse="true" title="Answer"}
+If they were separate, a crash after creating the repository but before storing the key would let a retry create it again (or hit a conflict), which is exactly what the key is meant to prevent. One transaction makes them all-or-nothing.
+:::
+
+## Exercise
+
+Send a request that triggers a validation error with your own `X-Request-ID: my-test-1` header. Confirm the id appears both in the response header and in the error body.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```bash
+curl -s -i "http://localhost:8000/search" -H "X-Request-ID: my-test-1"
+```
+The response has `x-request-id: my-test-1` and the body's `"request_id":"my-test-1"`, with `details` saying `["query","q"]` is required.
+:::
+
+## Stretch
+
+Add structured request logging to the `request_id` middleware: after `call_next`, log one line with method, path, status code, duration in milliseconds and the request id. Use `time.perf_counter()`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "%s %s %s %.1fms request_id=%s",
+            request.method, request.url.path, response.status_code, elapsed_ms,
+            request.state.request_id,
+        )
+```
+Lesson 7.8 replaces this with JSON logs that tools can search. Not in the reference code yet.
+:::
+
+## What changed in the project
+
+`app.py` gains error handlers, the request id middleware and CORS; new `api/idempotency.py` and `idempotency_keys` table; `POST /repos` honours `Idempotency-Key`. Commit: `feat: Added consistent errors, request ids, CORS and idempotency keys`.

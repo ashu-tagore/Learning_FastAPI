@@ -42,3 +42,15 @@ jobs:
         run: uv run mypy src tests
       - name: Tests
         run: uv run pytest -v
+      # Migrations run from empty on their own database, then `alembic check` fails the build
+      # if a model changed without a migration (lesson 4.11).
+      - name: Migrations
+        env:
+          PGPASSWORD: atlas-test-password
+          DATABASE_URL: postgresql+psycopg://atlas:atlas-test-password@localhost:5432/migrations
+        run: |
+          psql -h localhost -U atlas -d atlas_test -c "CREATE DATABASE migrations"
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check

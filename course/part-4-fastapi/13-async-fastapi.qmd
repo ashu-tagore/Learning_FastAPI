@@ -1,0 +1,244 @@
+---
+title: "4.13 Async FastAPI with async SQLAlchemy"
+description: "Convert Atlas's API to async database access, keep CPU-heavy work off the event loop, and avoid the lazy-loading trap of async ORMs."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 13 · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: one waiter, many tables"}
+A restaurant can hire one waiter per table, who stands beside it while the kitchen cooks (threads). Or one waiter can serve twenty tables: take an order, hand it to the kitchen, and serve other tables until the kitchen calls (async). The single waiter is efficient only if they never stand still waiting: a waiter who personally cooks a slow dish (blocking work) leaves every other table unattended.
+:::
+
+## Theory
+
+Lesson 2.6 introduced `async`/`await` and the **event loop**; lesson 4.1 measured what happens when an `async def` route blocks. Atlas's routes have been plain `def`, running in FastAPI's thread pool, because SQLAlchemy's `Session` is synchronous: every query blocks its thread until Postgres answers.
+
+That works. Why change?
+
+- A thread pool has a fixed size (Starlette's default allows 40 threads at once). Each request waiting on the database holds a thread. Async code waits without holding a thread, so one process can keep many more requests in flight.
+- Part 6 streams LLM answers that take many seconds each, and the WebSocket in lesson 4.14 holds a connection open indefinitely. Both are long *waits*, exactly what async is good at.
+
+The cost: everything slow must be awaited, and a single blocking call stalls everyone.
+
+### Async SQLAlchemy
+
+SQLAlchemy has an async layer with the same ideas and new names:
+
+| Synchronous (4.1 to 4.12) | Async (4.13 on) |
+|---|---|
+| `create_engine(url)` | `create_async_engine(url)` |
+| `sessionmaker(engine)` | `async_sessionmaker(engine)` |
+| `Session` | `AsyncSession` |
+| `session.execute(...)` | `await session.execute(...)` |
+| `session.commit()` | `await session.commit()` |
+| `with factory() as session` | `async with factory() as session` |
+
+The URL stays `postgresql+psycopg://...`: psycopg 3 supports both modes. Install the extra that async SQLAlchemy needs: `uv add "sqlalchemy[asyncio]"` (it brings the `greenlet` package, which SQLAlchemy uses internally to bridge the two styles).
+
+`session.add(obj)` stays synchronous: it only puts an object in the session's memory, without talking to the database.
+
+### The lazy-loading trap
+
+With a synchronous session, touching `issue.repo` on an issue whose repository isn't loaded quietly runs a query (a **lazy load**). In async code, a query must be awaited, and an attribute access can't be. So SQLAlchemy refuses:
+
+```text
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place? (Background on this error at: https://sqlalche.me/e/21/xd2s)
+```
+
+That's what you get running `issue = await session.get(Issue, 1)` and then `issue.repo.full_name`. The fix is to say up front what to load: `selectinload(Issue.repo)` (lesson 4.10). It also kills N+1 queries, so async forces a good habit. And `expire_on_commit=False` matters more now: after a commit, expired attributes would also need a reload.
+
+### CPU-heavy work
+
+Argon2 (lesson 4.6) takes about 0.06 s of pure computation. Nothing to await, so in an `async def` route it would block the loop for every login. Starlette's `run_in_threadpool(func, *args)` runs a blocking function in the thread pool and lets you await the result.
+
+```{mermaid}
+flowchart LR
+  L[event loop] -->|await session.execute| PG[(Postgres)]
+  PG -->|rows| L
+  L -->|await run_in_threadpool| T[worker thread<br/>Argon2 hash]
+  T -->|result| L
+  L -.->|meanwhile| O[other requests]
+```
+
+## In the project
+
+The conversion touched every route file, `deps.py`, `app.py` and `github_oauth.py`, and nothing outside `api/`, because the CLI keeps its synchronous code. Here's the shape of the change.
+
+### Engine and sessions
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    # expire_on_commit=False: objects stay readable after commit without a surprise reload,
+    # which in async code would be an implicit (and forbidden) database call.
+    app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield
+    await engine.dispose()
+```
+
+`deps.py`, as a diff (lines starting `-` were removed, `+` added):
+
+```diff
+-def get_session(request: Request) -> Iterator[Session]:
++async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+     """One database session per request, always closed, even if the route raises."""
+-    with request.app.state.session_factory() as session:
++    async with request.app.state.session_factory() as session:
+         yield session
+
+-SessionDep = Annotated[Session, Depends(get_session)]
++SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+-def get_current_user(
++async def get_current_user(
+     ...
+-    user = session.get(User, user_id)
++    user = await session.get(User, user_id)
+```
+
+Because routes depend on `SessionDep` and `CurrentUser` by name, their signatures don't change.
+
+### A route
+
+```diff
+ @router.patch("/me", response_model=UserOut)
+-def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> User:
++async def update_me(changes: UserUpdate, user: CurrentUser, session: SessionDep) -> User:
+     for field, value in changes.model_dump(exclude_unset=True).items():
+         setattr(user, field, value)
+-    session.commit()
+-    session.refresh(user)
++    await session.commit()
++    await session.refresh(user)
+     return user
+```
+
+Most of the conversion is this mechanical. mypy (lesson 1.11) catches the places you forget: a forgotten `await` leaves a coroutine where a value was expected.
+
+### Hashing off the loop
+
+```python
+from starlette.concurrency import run_in_threadpool
+
+@router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserOut)
+async def register(body: UserCreate, session: SessionDep) -> User:
+    password_hash = await run_in_threadpool(hash_password, body.password)
+    user = User(email=body.email.lower(), password_hash=password_hash)
+    ...
+```
+
+`login` does the same for both `verify_password` calls.
+
+### Calling GitHub without blocking
+
+`github_oauth.exchange_code` now uses `httpx.AsyncClient`, httpx's async twin, and is itself `async def`:
+
+```python
+    async with httpx.AsyncClient(timeout=10.0, transport=transport) as client:
+        token_response = await client.post(TOKEN_URL, data={...}, headers={"Accept": "application/json"})
+        ...
+        user_response = await client.get(f"{GITHUB_API}/user", headers={...})
+```
+
+### Loading relationships explicitly
+
+`get_issue_or_404` gained `selectinload(Issue.repo)` because `issue_out` reads `issue.repo.full_name`. In the synchronous version that was a silent lazy load; without the option, the async version answers 500 with the `MissingGreenlet` error above. The tests happen not to catch this one; lesson 4.16's practice asks you why.
+
+### Results
+
+The behaviour is identical, so every test from the synchronous version passes unchanged in meaning (lesson 4.15 shows the async test setup). All the curl output in lessons 4.1 to 4.12 was in fact captured from the async version.
+
+## Common mistakes
+
+- **A synchronous call in an async route**: `requests.get`, `time.sleep`, a sync `Session`, Argon2 without `run_in_threadpool`. Everything stalls.
+- **Forgetting `await`**: you get a coroutine object instead of a result. Type checking catches most of these.
+- **Lazy loading** (`MissingGreenlet`). Load relationships with `selectinload` in the query.
+- **Sharing one `AsyncSession` between concurrent tasks** (for example in `asyncio.gather`). One session per task.
+- **Converting for its own sake.** A sync API in a thread pool is fine for many apps. Switch when you need many concurrent waits, as Atlas does from Part 6.
+
+## Check yourself
+
+**1.** Why does `session.add(user)` have no `await`, while `session.commit()` does?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`add` only registers the object in the session's memory; no database work happens. `commit` sends SQL and waits for Postgres, which is I/O, so it's awaited.
+:::
+
+**2.** What does `MissingGreenlet` usually mean in an async FastAPI app?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Code touched a relationship (or an expired attribute) that wasn't loaded, so SQLAlchemy needed to query the database in a place that can't be awaited. Load it up front with `selectinload` (or `await session.refresh(obj, ["relationship"])`).
+:::
+
+**3.** Hashing a password involves no I/O. Why does it still go through `run_in_threadpool`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It's 0.06 s of CPU work. Run directly in an async route, it would hold the event loop for that time on every login, delaying every other request. In a worker thread, the loop keeps serving others.
+:::
+
+## Exercise
+
+Write a small async script that opens an `AsyncSession` on your dev database and prints the titles of the three newest issues with their labels, without triggering `MissingGreenlet`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import asyncio
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import selectinload
+
+from atlas.models import Issue
+
+URL = "postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas"
+
+
+async def main() -> None:
+    engine = create_async_engine(URL)
+    async with async_sessionmaker(engine)() as session:
+        statement = (
+            select(Issue).order_by(Issue.number.desc()).limit(3)
+            .options(selectinload(Issue.labels))
+        )
+        for issue in await session.scalars(statement):
+            print(issue.title, [label.name for label in issue.labels])
+    await engine.dispose()
+
+
+asyncio.run(main())
+```
+Remove `.options(...)` to see `MissingGreenlet`.
+:::
+
+## Stretch
+
+Load-test the difference yourself: start the API, then fire 50 concurrent `GET /search?q=engine` requests with an async httpx client and `asyncio.gather`, timing the batch. Compare against the synchronous version (`git switch --detach` to the commit before the conversion) with the same script.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import asyncio
+import time
+
+import httpx
+
+
+async def main() -> None:
+    async with httpx.AsyncClient(base_url="http://localhost:8000") as client:
+        started = time.perf_counter()
+        await asyncio.gather(*(client.get("/search", params={"q": "engine"}) for _ in range(50)))
+        print(f"{time.perf_counter() - started:.2f}s for 50 requests")
+
+
+asyncio.run(main())
+```
+With fast queries and only 50 requests both versions finish quickly and close to each other: the thread pool isn't exhausted. The difference shows when each request *waits* long (slow queries, LLM calls) and concurrency exceeds the pool size. Measuring before believing is the point; lesson 7.12 does proper load testing.
+:::
+
+## What changed in the project
+
+All API routes and dependencies are `async def` on `AsyncSession`; `github_oauth.exchange_code` is async; password hashing runs in the thread pool; `sqlalchemy[asyncio]` added. Commit: `feat: Converted the Atlas API to async`.
