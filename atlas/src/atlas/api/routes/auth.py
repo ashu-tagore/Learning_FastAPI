@@ -78,6 +78,7 @@ async def login(
     settings: SettingsDep,
 ) -> TokenPair:
     # OAuth2's password flow calls the field "username"; Atlas uses the email address.
+    # The form isn't a schema, so the normalisation from lesson 4.3 is applied by hand.
     user = await session.scalar(select(User).where(User.email == normalise_email(form.username)))
 
     # Same message whether the email is unknown or the password is wrong,
