@@ -2,7 +2,7 @@
 // It only talks to the Atlas API, on the same origin, with fetch() and one WebSocket.
 
 // Tokens live in sessionStorage: they disappear when the tab closes. Any script running
-// on this page could read them, which is why the page loads no third-party code (lesson 4.7).
+// on this page could read them, which is why the page loads no third-party code (lesson 4.8).
 const tokens = {
   get access() { return sessionStorage.getItem("atlas.access"); },
   get refresh() { return sessionStorage.getItem("atlas.refresh"); },
