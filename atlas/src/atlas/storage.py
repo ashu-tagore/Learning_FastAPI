@@ -10,12 +10,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import case, delete, func, select
-from sqlalchemy.engine import Engine
+from sqlalchemy import Row, Select, case, delete, func, select
 from sqlalchemy.orm import Session
 
 from atlas import github
-from atlas.models import Base, Chunk, Document, Issue, Label, Repo, issue_labels
+from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels
 from atlas.search import DEFAULT_EXTENSIONS, iter_source_files
 
 DOC_EXTENSIONS = {".md", ".rst"}
@@ -35,11 +34,6 @@ class Hit:
     end_line: int
     rank: float
     snippet: str
-
-
-def create_schema(engine: Engine) -> None:
-    """Create any missing tables. Lesson 4.11 replaces this with migrations."""
-    Base.metadata.create_all(engine)
 
 
 def get_or_create_repo(session: Session, full_name: str) -> Repo:
@@ -113,8 +107,15 @@ def index_folder(
     return IndexSummary(documents=document_count, chunks=chunk_count, skipped=skipped)
 
 
-def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 10) -> list[Hit]:
-    """Full-text search: chunks matching the query's words, best match first."""
+def chunk_search_statement(
+    repo_full_name: str,
+    query: str,
+    *,
+    kind: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> Select[str, int, int, float, str]:
+    """The full-text search query, built once and run by the CLI and the web API alike."""
     # websearch_to_tsquery understands what people type into search boxes:
     # quoted phrases, "or", and -excluded words.
     ts_query = func.websearch_to_tsquery("english", query)
@@ -133,18 +134,25 @@ def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 
         # Path and line break ties so results come out the same on every run.
         .order_by(rank.desc(), Document.path, Chunk.start_line)
         .limit(limit)
+        .offset(offset)
     )
-    return [
-        # The snippet can span lines; one line reads better in a terminal.
-        Hit(
-            path=path,
-            start_line=start,
-            end_line=end,
-            rank=float(score),
-            snippet=" ".join(text.split()),
-        )
-        for path, start, end, score, text in session.execute(statement)
-    ]
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+    return statement
+
+
+def hit_from_row(row: Row[str, int, int, float, str]) -> Hit:
+    path, start, end, score, text = row
+    # The snippet can span lines; one line reads better in a terminal or a web page.
+    return Hit(
+        path=path, start_line=start, end_line=end, rank=float(score), snippet=" ".join(text.split())
+    )
+
+
+def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 10) -> list[Hit]:
+    """Full-text search: chunks matching the query's words, best match first."""
+    statement = chunk_search_statement(repo_full_name, query, limit=limit)
+    return [hit_from_row(row) for row in session.execute(statement)]
 
 
 def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:
