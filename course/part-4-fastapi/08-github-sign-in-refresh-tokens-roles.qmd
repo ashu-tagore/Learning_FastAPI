@@ -1,0 +1,264 @@
+---
+title: "4.8 Sign in with GitHub, refresh tokens and roles"
+description: "Add GitHub sign-in with the OAuth2 authorization code flow (state and PKCE), keep users signed in with rotating refresh tokens, and give accounts roles."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 8 · About 120 minutes
+:::
+
+::: {.callout-note title="Analogy: a hotel key card from the front desk"}
+A conference venue doesn't check your passport itself. It sends you to the hotel's front desk, which already knows you; the desk gives you a slip; the venue phones the desk with that slip and asks "who is this?". The venue never sees your passport, and the hotel only tells it your name.
+
+**OAuth2** is that arrangement on the web. Atlas (the venue) sends you to GitHub (the desk). You sign in *there*, approve Atlas, and GitHub sends you back with a one-time code. Atlas trades the code for a token and asks GitHub "who is this?". Atlas never sees your GitHub password.
+:::
+
+## Theory
+
+### OAuth2, the authorization code flow
+
+**OAuth2** (RFC 6749) is a framework that lets a user grant one application limited access to their account on another, without sharing a password. The roles: the **user**, the **client** (Atlas), and the **authorization server** (GitHub). The flow for web apps is the **authorization code flow**:
+
+1. Atlas redirects the browser to GitHub's authorize page with its `client_id`, a `redirect_uri` and a random `state`.
+2. The user signs in to GitHub and approves.
+3. GitHub redirects the browser back to the `redirect_uri` with a short-lived `code` and the same `state`.
+4. Atlas's server sends the `code` plus its **client secret** to GitHub directly (not through the browser) and gets an access token.
+5. Atlas calls GitHub's `GET /user` with that token to learn the user's id and login.
+
+**OIDC** (OpenID Connect) is a layer on top of OAuth2 that standardises step 5: the server returns a signed **ID token** (a JWT, lesson 4.7) saying who the user is. Google and Microsoft sign-in use it. GitHub's sign-in for apps is plain OAuth2, so Atlas asks the `/user` endpoint instead. The ideas carry over.
+
+### Two protections
+
+- **`state`**: a random value Atlas stores in a cookie and sends to GitHub. On the way back, it must match. Without it, an attacker could send you a link to Atlas's callback with *their* code, and you'd be signed in to their account (a login CSRF attack).
+- **PKCE** (Proof Key for Code Exchange, RFC 7636, said "pixy"): Atlas makes a random **code verifier**, sends GitHub only its SHA-256 hash (the **code challenge**), and later proves it knows the verifier when exchanging the code. An intercepted code is useless without the verifier. GitHub's documentation strongly recommends both.
+
+**Scopes** say what access the app wants (`repo`, `read:org`, ...). Atlas asks for **no scopes**: GitHub then grants read-only access to public information, which is all sign-in needs. This keeps the product rule from [the vision](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/01-vision.md): Atlas never writes to GitHub.
+
+```{mermaid}
+sequenceDiagram
+  participant B as Browser
+  participant A as Atlas
+  participant G as GitHub
+  B->>A: GET /auth/github/login
+  A-->>B: 302 to GitHub + cookie (state, verifier)
+  B->>G: authorize?client_id, state, code_challenge
+  G-->>B: 302 to /auth/github/callback?code, state
+  B->>A: callback (+ cookie)
+  A->>A: state matches cookie?
+  A->>G: POST access_token (code, secret, verifier)
+  G-->>A: GitHub token
+  A->>G: GET /user
+  G-->>A: id 4242, login
+  A-->>B: Atlas tokens
+```
+
+### Refresh tokens
+
+Access tokens last 15 minutes (lesson 4.7). A **refresh token** is a long-lived (30 days) random string the client trades for a new access token. Unlike a JWT it means nothing on its own: it is looked up in a table, so it **can be revoked** (logout).
+
+Atlas uses **rotation**: each refresh token works once and is replaced by a new one. If a used token ever comes back, either the user or a thief is replaying an old copy. Atlas can't tell which, so it revokes every token that user has: **reuse detection**. Refresh tokens are long and random, so a fast SHA-256 hash is safe for storing them (unlike passwords).
+
+### Roles
+
+**Authorisation** answers "what may you do?" (authentication answered "who are you?"). The simplest model is a **role** per user: Atlas has `user` and `admin`. Admins may add repositories; lesson 4.9 enforces it.
+
+## In the project
+
+### Configuration
+
+Create a GitHub **OAuth app** (GitHub → Settings → Developer settings → OAuth Apps → New OAuth App) with callback URL `http://localhost:8000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `.env`. Without them, `/auth/github/login` answers 404 "GitHub sign-in is not configured", and everything else works.
+
+### The flow helpers: `github_oauth.py`
+
+```python
+def new_pkce_pair() -> tuple[str, str]:
+    """A random code verifier and its S256 code challenge (RFC 7636)."""
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    # Base64url without padding gives the 43-character challenge GitHub expects.
+    challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return verifier, challenge
+
+
+def authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
+    """Where to send the browser so the user can approve signing in to Atlas."""
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            # No "scope" parameter: Atlas only needs to know who the user is.
+            "allow_signup": "true",
+        }
+    )
+    return f"{AUTHORIZE_URL}?{query}"
+```
+
+`exchange_code(...)` does steps 4 and 5 with `httpx` (lesson 2.5). GitHub reports problems like an expired code in the JSON body (`"error": "bad_verification_code"`) rather than only the status, so it checks the body. Its `transport` parameter lets tests replace GitHub with a fake (lesson 4.15).
+
+### The two routes: `routes/auth.py`
+
+```python
+@router.get("/github/login", include_in_schema=False)
+def github_login(request: Request, settings: SettingsDep) -> RedirectResponse:
+    client_id = github_client_id(settings)
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = github_oauth.new_pkce_pair()
+    redirect_uri = str(request.url_for("github_callback"))
+
+    response = RedirectResponse(
+        github_oauth.authorize_url(client_id, redirect_uri, state, challenge),
+        status_code=status.HTTP_302_FOUND,
+    )
+    # The browser keeps state and verifier for the callback. HttpOnly: page scripts can't read it.
+    response.set_cookie(
+        OAUTH_COOKIE,
+        f"{state}.{verifier}",
+        max_age=OAUTH_COOKIE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+    )
+    return response
+```
+
+`samesite="lax"` lets the cookie travel on GitHub's top-level redirect back to Atlas, but not on requests other sites make in the background. `max_age` is 600 seconds because GitHub's codes expire after 10 minutes anyway.
+
+The callback checks `state`, exchanges the code, then finds or creates the account by GitHub's numeric id:
+
+```python
+    # secrets.compare_digest takes the same time whatever the input, leaking nothing via timing.
+    state_matches = bool(expected_state) and secrets.compare_digest(state, expected_state)
+    if not state_matches:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Sign-in expired or was not started here")
+    ...
+    user = session.scalar(select(User).where(User.github_id == identity.github_id))
+    if user is None:
+        user = User(github_id=identity.github_id, github_login=identity.login)
+        session.add(user)
+    else:
+        # Logins can be renamed on GitHub; the numeric id never changes.
+        user.github_login = identity.login
+```
+
+Finally it issues Atlas tokens. When serving the web interface, it redirects to `/app/#access_token=...&refresh_token=...`. The part after `#` (the **fragment**) is never sent to any server, so tokens don't land in server logs; `web/app.js` reads it and clears it from the address bar.
+
+### Refresh, rotation and logout
+
+```python
+@router.post("/refresh", response_model=TokenPair)
+def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) -> TokenPair:
+    """Trade a refresh token for a new pair. Each refresh token works exactly once."""
+    stored = session.scalar(
+        select(RefreshToken).where(
+            RefreshToken.token_hash == hash_refresh_token(body.refresh_token)
+        )
+    )
+    rejected = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token")
+    if stored is None:
+        raise rejected
+
+    now = datetime.now(UTC)
+    was_already_used = stored.revoked_at is not None
+    if was_already_used:
+        # A used token coming back means it was probably stolen. Sign the user out everywhere.
+        session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == stored.user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        session.commit()
+        raise rejected
+
+    has_expired = stored.expires_at <= now
+    if has_expired:
+        raise rejected
+
+    stored.revoked_at = now
+    user = session.get(User, stored.user_id)
+    if user is None:
+        raise rejected
+    return issue_tokens(session, user, settings)
+```
+
+The same refresh token, used twice:
+
+```text
+$ curl -s -X POST http://localhost:8000/auth/refresh -H "Content-Type: application/json" -d "{\"refresh_token\": \"$REFRESH\"}"
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIzIiwidHlwZSI6ImFjY2VzcyIsImlhdCI6MTc5NDk3MTQ1OCwiZXhwIjoxNzk0OTcyMzU4fQ.lkmalTBx9H0fRCKyeq57wFoCre2KfbzXPNgbyNyYecI","refresh_token":"0y640gA8JRRgHKnd7cCZ5WQmOgCSfLSqNQSiTQ5w-w0","token_type":"bearer","expires_in":900}
+
+$ curl -s -X POST http://localhost:8000/auth/refresh -H "Content-Type: application/json" -d "{\"refresh_token\": \"$REFRESH\"}"
+{"error":{"code":"unauthorized","message":"Invalid refresh token","request_id":"c191d67b6b614db48d83aba2683634dd"}}
+```
+
+The second call also revoked the new refresh token from the first call. `POST /auth/logout` revokes one refresh token; the access token still works until it expires, at most 15 minutes. The web page calls `/auth/refresh` automatically when a request gets 401.
+
+### Making an administrator
+
+There's deliberately no API route to become admin. An operator with database access runs a CLI command:
+
+```text
+$ atlas make-admin --email ada@example.com
+ada@example.com is now an administrator
+
+$ atlas make-admin --email nobody@example.com
+atlas: no user with email nobody@example.com
+```
+
+## Common mistakes
+
+- **Skipping `state`** (or not comparing it): login CSRF.
+- **Putting the client secret in the browser** (in JavaScript). The code exchange must happen on the server.
+- **Asking for broad scopes** "just in case". Ask for the least you need; Atlas asks for none.
+- **Identifying GitHub users by login.** Logins can be renamed and reused; the numeric `id` is permanent.
+- **Storing refresh tokens in plain text**: a database leak would hand out 30-day sessions.
+- **Refresh tokens that never rotate**: a stolen one works for its whole life, unnoticed.
+
+## Check yourself
+
+**1.** What would an attacker gain by intercepting the `code` in the callback URL, with PKCE in place?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Nothing useful: exchanging the code requires the code verifier, which never left Atlas's cookie (and Atlas's client secret). GitHub checks that the verifier hashes to the challenge it received.
+:::
+
+**2.** Why does Atlas revoke *all* of a user's refresh tokens when a used one comes back?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A used token returning means two parties hold copies: the real user and probably a thief. Atlas can't tell which request is which, so it ends every session; the real user just signs in again, and the thief is locked out.
+:::
+
+**3.** What's the difference between authentication and authorisation?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Authentication establishes who you are (password, GitHub sign-in, token). Authorisation decides what you may do (roles, ownership). A request can be authenticated and still forbidden: 401 means "who are you?", 403 means "I know who you are, and no".
+:::
+
+## Exercise
+
+Without a GitHub app, call `GET /auth/github/login` and read the redirect: `curl -s -i http://localhost:8000/auth/github/login | head -5`. Then set fake `GITHUB_CLIENT_ID=test` and `GITHUB_CLIENT_SECRET=test`, restart, and repeat. What's in the `location` header, and which cookie is set?
+
+::: {.callout-tip collapse="true" title="Solution"}
+Without settings: 404 `GitHub sign-in is not configured`. With them: `302 Found`, `location: https://github.com/login/oauth/authorize?client_id=test&redirect_uri=...&state=...&code_challenge=...&code_challenge_method=S256&allow_signup=true` (no `scope`), and `set-cookie: atlas_oauth=<state>.<verifier>; HttpOnly; Max-Age=600; Path=/; SameSite=lax`. The test `test_github_login_redirects_with_state_and_pkce` checks these.
+:::
+
+## Stretch
+
+Check `new_pkce_pair` against RFC 7636's worked example (Appendix B): the verifier `dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` must give the challenge `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import base64, hashlib
+
+verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+digest = hashlib.sha256(verifier.encode("ascii")).digest()
+print(base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="))
+```
+Prints `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`, the RFC's value, so Atlas computes S256 correctly.
+:::
+
+## What changed in the project
+
+New `src/atlas/github_oauth.py`; `RefreshToken` table; `routes/auth.py` gains `/auth/github/login`, `/auth/github/callback`, `/auth/refresh` and `/auth/logout`; `atlas make-admin`. Commit: `feat: Added GitHub sign-in, refresh tokens and roles`.

@@ -1,0 +1,218 @@
+---
+title: "4.9 Relationships and authorisation"
+description: "Model a many-to-many 'saved issues' relationship, enforce who may do what with role and ownership checks, and answer 401, 403 and 404 correctly."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 9 · About 75 minutes
+:::
+
+::: {.callout-note title="Analogy: a library card and the staff room"}
+With a library card you can borrow books and see your own borrowing list, but not anyone else's. Some doors (the staff room) need a staff badge, and showing a library card there gets a polite "no".
+
+Two separate checks are at work: *who* you are (your card) and *what that lets you do* (your list only; staff doors only with a badge). Atlas does the same with **ownership** (your saved issues, your notes) and **roles** (admins add repositories).
+:::
+
+## Theory
+
+### Many-to-many, again
+
+A user can save many issues, and an issue can be saved by many users: a **many-to-many** relationship. Lesson 3.4 modelled one already (issues and labels) with a **join table**: a table whose rows each link one of each. `saved_issues` has `(user_id, issue_id, saved_at)`, and its primary key is the pair, so the same issue can't be saved twice by the same user.
+
+### Authorisation checks
+
+After authentication (lesson 4.7) every request has a user. Authorisation decides what that user may do. Two common forms:
+
+- **Role-based**: "only admins may add repositories". Check the user's role.
+- **Ownership-based**: "you may edit only your own notes". Check the row's owner. The cleanest way is to put the owner into the query itself: `WHERE id = :note_id AND user_id = :me`. A row that isn't yours is simply not found.
+
+### Which status code?
+
+| Status | Meaning | Atlas example |
+|---|---|---|
+| **401 Unauthorized** | "Who are you?" No valid credentials. | no token on `PUT /issues/1/saved` |
+| **403 Forbidden** | "I know who you are, and you may not." | a non-admin calls `POST /repos` |
+| **404 Not Found** | It doesn't exist, *or* you mayn't know it exists. | someone else's note |
+
+Why 404 for someone else's note rather than 403? A 403 confirms the note exists, which leaks information (that note ids are in use, how many there are). For private, per-user data, "not found" is the honest answer from your point of view. GitHub does the same for private repositories.
+
+```{mermaid}
+flowchart TB
+  Q[request] --> T{valid token?}
+  T -->|no| U[401]
+  T -->|yes| R{route needs admin?}
+  R -->|yes, not admin| F[403]
+  R -->|no, or admin| O{row belongs to user?}
+  O -->|no| N[404]
+  O -->|yes| OK[200 / 204]
+```
+
+### Idempotent saving with PUT
+
+"Save issue 42" is naturally idempotent: saving it again should change nothing and still succeed. So it's `PUT /issues/42/saved`, and in SQL it's an insert that ignores conflicts: Postgres's `INSERT ... ON CONFLICT DO NOTHING`. `DELETE /issues/42/saved` is idempotent too: deleting something already gone still leaves it gone. Both answer **204 No Content**: success, nothing to send back.
+
+## In the project
+
+The join table in `models.py`, written as a plain `Table` because it has no behaviour of its own:
+
+```python
+saved_issues = Table(
+    "saved_issues",
+    Base.metadata,
+    Column("user_id", ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("issue_id", ForeignKey("issues.id", ondelete="CASCADE"), primary_key=True),
+    Column("saved_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+```
+
+`ondelete="CASCADE"`: when a user or an issue is deleted, their saved rows go too (lesson 3.5).
+
+### Saving and unsaving: `routes/issues.py`
+
+```python
+@router.put("/{issue_id}/saved", status_code=status.HTTP_204_NO_CONTENT)
+def save_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
+    """PUT is idempotent: saving an already-saved issue changes nothing and still succeeds."""
+    get_issue_or_404(session, issue_id)
+    session.execute(
+        insert(saved_issues)
+        .values(user_id=user.id, issue_id=issue_id)
+        .on_conflict_do_nothing(index_elements=["user_id", "issue_id"])
+    )
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+
+`insert` here comes from `sqlalchemy.dialects.postgresql`, which adds `on_conflict_do_nothing`. `CurrentUser` makes the route require a login; `user.id` makes the row belong to whoever is signed in. There's no way to save an issue *for someone else*: the user id never comes from the request body.
+
+```text
+$ curl -s -X PUT http://localhost:8000/issues/1/saved -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+204
+$ curl -s -X PUT http://localhost:8000/issues/1/saved -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+204
+$ curl -s http://localhost:8000/users/me/saved-issues -H "Authorization: Bearer $TOKEN"
+[{"id":1,"repo":"pytorch/ignite","number":20,"title":"Support new metric","url":"https://github.com/pytorch/ignite/issues/20","author":"contributor","labels":["help wanted"],"comments":2,"created_at":"2026-11-02T09:14:00Z"}]
+```
+
+(`-w "%{http_code}\n"` makes curl print the status code.)
+
+### Listing my saved issues: `routes/users.py`
+
+```python
+@router.get("/me/saved-issues", response_model=list[IssueOut])
+def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
+    statement = (
+        select(Issue)
+        .join(saved_issues, saved_issues.c.issue_id == Issue.id)
+        .where(saved_issues.c.user_id == user.id)
+        .order_by(saved_issues.c.saved_at.desc())
+        # Load every issue's labels and repo in one extra query each, not one per issue (N+1).
+        .options(selectinload(Issue.labels), selectinload(Issue.repo))
+    )
+    return [issue_out(issue) for issue in session.scalars(statement)]
+```
+
+`saved_issues.c.user_id` is how you refer to a column of a plain `Table` (`c` for columns). `selectinload` is explained in lesson 4.10.
+
+### Admin-only routes: a role dependency
+
+In `deps.py`, a dependency built on top of `CurrentUser`:
+
+```python
+def require_admin(user: CurrentUser) -> User:
+    is_admin = user.role == "admin"
+    if not is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Administrators only")
+    return user
+
+
+AdminUser = Annotated[User, Depends(require_admin)]
+```
+
+A route that takes `admin: AdminUser` is now admin-only, with no check inside the route. `routes/repos.py`:
+
+```python
+@router.get("", response_model=list[RepoOut])
+def list_repos(session: SessionDep) -> list[Repo]:
+    return list(session.scalars(select(Repo).order_by(Repo.full_name)))
+
+
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=RepoOut)
+def add_repo(body: RepoCreate, admin: AdminUser, session: SessionDep, ...) -> JSONResponse:
+    exists = session.scalar(select(Repo.id).where(Repo.full_name == body.full_name)) is not None
+    if exists:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{body.full_name} is already tracked")
+    ...
+```
+
+(The full version also handles idempotency keys, lesson 4.12.) A regular user, then the same user after `atlas make-admin`:
+
+```text
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
+{"error":{"code":"forbidden","message":"Administrators only","request_id":"558237a62ed54108bcc617175fdc502d"}}
+
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
+{"id":3,"full_name":"sktime/sktime","indexed_at":null}
+```
+
+Adding a repository only records it. Indexing it (downloading and chunking its files) is slow work for the background worker in Part 5.
+
+## Common mistakes
+
+- **Taking the user id from the request** (`{"user_id": 7, ...}`) instead of from the token. Anyone could act as anyone.
+- **Checking ownership after loading**, in Python, in some routes and forgetting in others. Filter by owner in the query.
+- **403 for private resources** that should be invisible: it confirms they exist.
+- **401 when the user is known but not allowed**: that's 403.
+- **Role checks copied into each route** instead of one `require_admin` dependency.
+- **Check-then-insert for "save"**: a race. Let `ON CONFLICT DO NOTHING` decide.
+
+## Check yourself
+
+**1.** Why does `saved_issues` use `(user_id, issue_id)` as its primary key?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Each pair can appear only once, so a user can't save the same issue twice, and the database enforces it. It also gives an index for "is this saved by this user?".
+:::
+
+**2.** A logged-in non-admin calls `POST /repos`. Which status, and why not 401?
+
+::: {.callout-tip collapse="true" title="Answer"}
+403 Forbidden. The user is authenticated (Atlas knows who they are), just not allowed. 401 would mean the credentials are missing or invalid.
+:::
+
+**3.** Why is "save" a PUT and not a POST?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Saving is idempotent: doing it twice has the same effect as once. PUT promises that; POST doesn't. Clients (and proxies) may safely retry a PUT.
+:::
+
+## Exercise
+
+Write a test (or a curl session) showing that user B can't see user A's saved issues: A saves issue 1; B lists their saved issues.
+
+::: {.callout-tip collapse="true" title="Solution"}
+B's list is `[]`. The query filters by `saved_issues.c.user_id == user.id`, and `user` comes from B's token. The reference test `test_saving_is_idempotent_and_private` (lesson 4.15) does exactly this.
+:::
+
+## Stretch
+
+Add `GET /issues/{issue_id}/saved` that answers `{"saved": true}` or `{"saved": false}` for the signed-in user, in one query.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from sqlalchemy import exists
+
+
+@router.get("/{issue_id}/saved")
+def is_saved(issue_id: int, user: CurrentUser, session: SessionDep) -> dict[str, bool]:
+    statement = select(
+        exists().where(saved_issues.c.user_id == user.id, saved_issues.c.issue_id == issue_id)
+    )
+    return {"saved": bool(session.scalar(statement))}
+```
+`EXISTS` stops at the first match. Not in the reference code.
+:::
+
+## What changed in the project
+
+`saved_issues` table; `require_admin` and `AdminUser` in `deps.py`; routes `PUT`/`DELETE /issues/{id}/saved`, `GET /users/me/saved-issues`, `GET`/`POST /repos`. Commit: `feat: Added saved issues and admin-only repositories`.

@@ -1,0 +1,221 @@
+---
+title: "4.10 Querying: pagination, filtering and search"
+description: "Return large result sets in pages with offset and cursor (keyset) pagination, filter with query parameters, expose keyword search over HTTP, and avoid N+1 queries."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 10 · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: a bookmark versus a page number"}
+You're reading a printed list that someone keeps adding entries to at the top. If you remember "I was on page 3", the next time you open it page 3 holds different entries: you skip some and see others twice. If instead you keep a bookmark at the last entry you read, you continue exactly where you left off, however many entries were added.
+
+**Offset pagination** is the page number. **Cursor pagination** is the bookmark.
+:::
+
+## Theory
+
+An endpoint that returns "all issues" works with 3 issues and fails with 300,000: slow queries, huge responses, browsers that freeze. **Pagination** returns results in pages, with a way to ask for the next one.
+
+### Offset pagination
+
+`?limit=10&offset=20` means "skip 20, return 10": SQL's `LIMIT 10 OFFSET 20`. Simple, and you can jump to any page. Two weaknesses:
+
+- The database still reads and discards the skipped rows, so deep pages get slower.
+- If rows are added or removed between requests, items shift: duplicates or gaps.
+
+### Cursor (keyset) pagination
+
+The response includes a **cursor**: a token that encodes where the page ended. The next request sends it back, and the query continues *after* that point: `WHERE number < 12 ORDER BY number DESC LIMIT 10`. With an index on the sort column (lesson 3.6), every page is equally fast, and insertions don't shift anything. The cost: no jumping to page 50, only "next".
+
+The cursor is **opaque**: clients pass it back unchanged and must not build or parse it. Atlas encodes `{"before": 12}` as base64url text, so the format can change later without breaking clients.
+
+| | Offset | Cursor |
+|---|---|---|
+| Jump to page N | yes | no |
+| Deep pages | slow | fast |
+| Stable when data changes | no | yes |
+| Atlas uses it for | search results | issues |
+
+Search uses offset because results are ranked, nobody reads past the first few pages, and Atlas caps `offset` at 1000.
+
+### The `limit + 1` trick
+
+How does the server know whether there's a next page without a separate `COUNT`? Ask for one row more than the page size. If it comes back, there's more; drop it and return a cursor.
+
+### The N+1 problem
+
+Listing 20 issues and then reading `issue.labels` on each runs 1 query for the issues plus 20 for labels: **N+1** queries (warned about in lesson 3.8). **`selectinload(Issue.labels)`** tells SQLAlchemy to load all labels for all 20 issues in one extra query: `... WHERE issue_id IN (...)`. Two queries instead of 21.
+
+```{mermaid}
+sequenceDiagram
+  participant C as Client
+  participant A as Atlas
+  C->>A: GET /issues?limit=2
+  A-->>C: items #20, #12 + next_cursor "before 12"
+  C->>A: GET /issues?limit=2&cursor=...
+  A-->>C: items #7 + next_cursor null
+```
+
+## In the project
+
+### Listing issues: `routes/issues.py`
+
+```python
+def encode_cursor(last_number: int) -> str:
+    # Opaque to clients: they pass it back unchanged, so its format can change later.
+    raw = json.dumps({"before": last_number}).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_cursor(cursor: str) -> int:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        return int(payload["before"])
+    except (binascii.Error, ValueError, KeyError, TypeError, UnicodeEncodeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid cursor") from None
+
+
+@router.get("", response_model=IssuePage)
+def list_issues(
+    session: SessionDep,
+    repo: str = "pytorch/ignite",
+    label: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: str | None = None,
+) -> IssuePage:
+    """Newest first. Keyset pagination: each page continues below the last issue number seen."""
+    statement = (
+        select(Issue)
+        .join(Issue.repo)
+        .where(Repo.full_name == repo)
+        .order_by(Issue.number.desc())
+        # One more than asked for: if it exists, there is a next page.
+        .limit(limit + 1)
+        .options(selectinload(Issue.labels), selectinload(Issue.repo))
+    )
+    if label is not None:
+        statement = statement.where(Issue.labels.any(Label.name == label))
+    if cursor is not None:
+        statement = statement.where(Issue.number < decode_cursor(cursor))
+
+    issues = list(session.scalars(statement))
+    has_next_page = len(issues) > limit
+    page = issues[:limit]
+    next_cursor = encode_cursor(page[-1].number) if has_next_page else None
+    return IssuePage(items=[issue_out(issue) for issue in page], next_cursor=next_cursor)
+```
+
+- `Query(ge=1, le=100)` validates a query parameter the way `Field` validates a body field: a client can't ask for a million rows.
+- `Issue.labels.any(Label.name == label)` becomes SQL `EXISTS (...)`: "has at least one label with this name". Filters are added only when given, so one query covers every combination.
+- A garbled cursor is the client's mistake: **400 Bad Request**, not a 500.
+
+With the course's three sample issues (lesson 3.8):
+
+```text
+$ curl -s "http://localhost:8000/issues?limit=2"
+{"items":[{"id":1,"repo":"pytorch/ignite","number":20,"title":"Support new metric",...,"labels":["help wanted"],...},{"id":2,"repo":"pytorch/ignite","number":12,"title":"Fix docstring typo",...,"labels":["good first issue"],...}],"next_cursor":"eyJiZWZvcmUiOiAxMn0="}
+
+$ curl -s "http://localhost:8000/issues?limit=2&cursor=eyJiZWZvcmUiOiAxMn0="
+{"items":[{"id":3,"repo":"pytorch/ignite","number":7,"title":"Add example to Engine",...,"labels":["good first issue","help wanted"],...}],"next_cursor":null}
+
+$ curl -s "http://localhost:8000/issues?cursor=nonsense"
+{"error":{"code":"bad_request","message":"Invalid cursor","request_id":"2e1a2ea15e794bfab13c4521ac3f11c1"}}
+```
+
+(Some fields are shortened with `...` here; the full responses include `url`, `author`, `comments` and `created_at`.) `echo eyJiZWZvcmUiOiAxMn0= | base64 -d` prints `{"before": 12}`: opaque, not secret.
+
+### Search: `routes/search.py`
+
+The search query from `atlas find` (lesson 3.8) moved into `storage.chunk_search_statement`, which returns the statement without running it, so the CLI and the API share it:
+
+```python
+@router.get("", response_model=SearchPage)
+def search(
+    session: SessionDep,
+    q: Annotated[str, Query(min_length=1, max_length=200, description="Words to look for")],
+    repo: str = "pytorch/ignite",
+    kind: Literal["code", "doc"] | None = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    offset: Annotated[int, Query(ge=0, le=1000)] = 0,
+) -> SearchPage:
+    """Offset pagination: fine here, because nobody reads past the first few pages of results."""
+    statement = chunk_search_statement(repo, q, kind=kind, limit=limit + 1, offset=offset)
+    hits = [hit_from_row(row) for row in session.execute(statement)]
+
+    has_next_page = len(hits) > limit
+    page = hits[:limit]
+    return SearchPage(
+        items=[SearchHit(**vars(hit)) for hit in page],
+        limit=limit,
+        offset=offset,
+        next_offset=offset + limit if has_next_page else None,
+    )
+```
+
+`vars(hit)` turns the `Hit` dataclass into a dict; `**` passes its entries as keyword arguments. Against the real Ignite index:
+
+```text
+$ curl -s "http://localhost:8000/search?q=early%20stopping&limit=2"
+{"items":[{"path":"tests/ignite/handlers/test_early_stopping.py","start_line":481,"end_line":520,"rank":0.732754,"snippet":"device = idist.device() _test_distrib_with_engine_[early]_[stopping](device) _test_distrib_integration_engine_[early]"},{"path":"tests/ignite/handlers/test_early_stopping.py","start_line":521,"end_line":560,"rank":0.70265085,"snippet":"device = idist.device() _test_distrib_with_engine_[early]_[stopping](device) _test_distrib_integration_engine_[early]"}],"limit":2,"offset":0,"next_offset":2}
+
+$ curl -s "http://localhost:8000/search?limit=500"
+{"error":{"code":"validation_error","message":"The request is not valid","request_id":"f760c6e848254daaa63340d7d99740ec","details":[{"location":["query","q"],"message":"Field required"},{"location":["query","limit"],"message":"Input should be less than or equal to 50"}]}}
+```
+
+The top hits are tests, not the `EarlyStopping` class itself: keyword search counts words, it doesn't understand what you meant. Part 6 adds meaning-based (semantic) search and compares the two with measurements.
+
+## Common mistakes
+
+- **No upper bound on `limit`.** A client asks for 10 million rows.
+- **Offset pagination on a feed that changes**: users see duplicates and miss items.
+- **Cursor on a non-unique sort column** (e.g. `created_at` alone): rows with equal values are skipped or repeated. Sort by something unique (issue number per repository) or add the id as a tie-breaker.
+- **Clients building cursors.** Keep them opaque.
+- **A `COUNT(*)` on every page** to show "page 3 of 912": often the slowest query in the app. Use `limit + 1`.
+- **Lazy-loading relationships in a loop** (N+1). Use `selectinload`.
+
+## Check yourself
+
+**1.** Why does `list_issues` fetch `limit + 1` rows?
+
+::: {.callout-tip collapse="true" title="Answer"}
+To learn whether a next page exists without a separate count query. If the extra row comes back there's more, so the response includes a cursor; the extra row itself is dropped.
+:::
+
+**2.** A new issue #25 is opened while you're on page 2 of the issues list. What happens with offset pagination, and with Atlas's cursor?
+
+::: {.callout-tip collapse="true" title="Answer"}
+With offset, everything shifts down one place, so page 3 repeats the last item of page 2. With the cursor ("numbers below 12"), the next page is unaffected; #25 simply appears at the top when you start again.
+:::
+
+**3.** How many queries does `list_issues` run for a page of 20 issues?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Three: one for the issues, one `selectinload` query for all their labels, one for their repositories. Without `selectinload`, touching `issue.labels` and `issue.repo` per issue would make it 41.
+:::
+
+## Exercise
+
+Add an `author` filter to `GET /issues` (`?author=contributor`), then confirm it combines with `label` and the cursor.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Add a parameter `author: str | None = None` and:
+
+```python
+    if author is not None:
+        statement = statement.where(Issue.author == author)
+```
+Filters combine with `AND`, and the cursor condition is just one more `WHERE`, so pagination keeps working. Not in the reference code.
+:::
+
+## Stretch
+
+Turn on SQL logging (`create_engine(..., echo=True)`) and call `GET /issues`. Count the `SELECT` statements. Then remove `selectinload(Issue.labels)` and count again.
+
+::: {.callout-tip collapse="true" title="Solution"}
+With `selectinload`, three `SELECT`s per request (issues, labels, repos). Without it on labels, one extra `SELECT` per issue as `issue_out` reads `issue.labels`: with the three sample issues, five in total, and with 20 issues, 22. That growth with the page size is the N+1 problem. (After lesson 4.13's switch to async, the lazy loads fail outright instead, which is one reason async code makes you load relationships explicitly.)
+:::
+
+## What changed in the project
+
+`storage.py` exposes `chunk_search_statement` and `hit_from_row`; new `GET /issues`, `GET /issues/{id}` and `GET /search`; page schemas `IssuePage` and `SearchPage`. Commit: `feat: Added paginated issues and search endpoints`.

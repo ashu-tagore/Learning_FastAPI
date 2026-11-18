@@ -1,0 +1,250 @@
+---
+title: "4.1 FastAPI fundamentals: ASGI, routes, parameters and docs"
+description: "Write a web API with FastAPI: routes, path and query parameters, automatic validation and interactive docs, and know when to write def or async def."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 1 · About 90 minutes
+:::
+
+::: {.callout-note title="Analogy: a restaurant's front desk"}
+A restaurant has a front desk and a kitchen. The desk takes orders in a standard format ("table 4, two soups"), checks they make sense ("we don't serve that"), sends them to the right cook, and brings the plate back. The cooks never talk to customers directly.
+
+A **web framework** is the front desk of your program. It receives HTTP requests (lesson 2.3), checks them, calls the right Python function (the cook), and turns what the function returns into an HTTP response. FastAPI is a front desk that also writes the menu for you: it publishes interactive documentation of every order it accepts.
+:::
+
+## Theory
+
+So far Atlas has been a command-line tool: you run `atlas find`, it prints, it exits. A **web API** is a program that keeps running, listens on a port (lesson 2.2) and answers HTTP requests from anyone allowed to reach it: a browser, a phone app, another program. From Part 4 on, Atlas is both: the same `storage.py` serves the command line and the API.
+
+### The pieces
+
+- **FastAPI** is a Python web framework: you write ordinary functions, and decorate each with the HTTP method and path it answers.
+- **ASGI** (Asynchronous Server Gateway Interface) is the agreement between a Python web application and the server that runs it. FastAPI applications are ASGI applications.
+- **Uvicorn** is an ASGI server: it owns the socket, speaks HTTP, and hands each request to the application. You never write socket code.
+- **Starlette** is the toolkit FastAPI is built on (routing, requests, responses). You'll see its name in a few imports.
+- **Pydantic** checks and converts data using type hints (lesson 1.9). FastAPI uses it for every parameter and body.
+
+```{mermaid}
+flowchart LR
+  C[client: curl, browser] -->|HTTP request| U[Uvicorn<br/>ASGI server]
+  U -->|ASGI call| F[FastAPI app<br/>routing + validation]
+  F -->|"read_issue(number=42)"| R[your function]
+  R -->|"dict / object"| F
+  F -->|JSON| U -->|HTTP response| C
+```
+
+### Routes
+
+A **route** pairs an HTTP method and a path with a function (the **path operation function**, or **handler**):
+
+```python
+@app.get("/issues/{number}")
+def read_issue(number: int) -> dict[str, int]:
+    return {"number": number}
+```
+
+`@app.get(...)` is a **decorator**: a line starting with `@` above a function that registers or changes it (you met `@dataclass` in lesson 1.8). Here it tells FastAPI "when a GET request arrives for `/issues/<something>`, call this function".
+
+### Where parameters come from
+
+FastAPI reads your function's parameters and decides where each value comes from:
+
+| Parameter | Comes from | Example |
+|---|---|---|
+| name appears in the path as `{number}` | **path parameter** | `/issues/42` |
+| simple type, not in the path | **query parameter** | `/repos/a/b?details=true` |
+| a Pydantic model | the JSON **request body** | lesson 4.3 |
+
+The type hint is not decoration: FastAPI converts the text `"42"` into the integer `42`, and rejects `"forty-two"` with a clear error before your function runs.
+
+## In the project
+
+Start small, in a scratch folder, to see each idea on its own. Add FastAPI and Uvicorn to `my-atlas` first:
+
+```bash
+uv add fastapi "uvicorn[standard]"
+```
+
+Create `hello.py`:
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI(title="Hello")
+
+
+@app.get("/")
+def home() -> dict[str, str]:
+    return {"message": "Hello, world"}
+
+
+@app.get("/repos/{owner}/{name}")
+def read_repo(owner: str, name: str, details: bool = False) -> dict[str, object]:
+    return {"full_name": f"{owner}/{name}", "details": details}
+
+
+@app.get("/issues/{number}")
+def read_issue(number: int) -> dict[str, int]:
+    return {"number": number}
+```
+
+Run it. `hello:app` means "the variable `app` in the module `hello`":
+
+```bash
+uv run uvicorn hello:app --reload
+```
+```text
+INFO:     Started server process [24530]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+`--reload` restarts the server whenever you save a file: handy while developing, never in production. In a second terminal:
+
+```text
+$ curl -s http://localhost:8000/
+{"message":"Hello, world"}
+
+$ curl -s 'http://localhost:8000/repos/pytorch/ignite?details=true'
+{"full_name":"pytorch/ignite","details":true}
+
+$ curl -s http://localhost:8000/issues/42
+{"number":42}
+
+$ curl -s http://localhost:8000/issues/forty-two
+{"detail":[{"type":"int_parsing","loc":["path","number"],"msg":"Input should be a valid integer, unable to parse string as an integer","input":"forty-two"}]}
+```
+
+Notice three things:
+
+1. The returned `dict` became JSON automatically.
+2. `details=true` in the URL arrived as the Python boolean `True`.
+3. The bad number was rejected with status 422 and a precise location (`["path", "number"]`). Lesson 4.12 reshapes this error into Atlas's own format.
+
+### Interactive documentation
+
+Open `http://localhost:8000/docs` in a browser. FastAPI generated a page listing every route, its parameters and types, with a **Try it out** button. It comes from the **OpenAPI** document at `/openapi.json`: a standard, machine-readable description of your API. Other tools read it too, for example to generate client code.
+
+### The Atlas API skeleton
+
+Atlas's real API lives in `src/atlas/api/`. Instead of a global `app`, it uses a **factory**: a function that builds and returns the app. That lets tests build an app with their own settings (lesson 4.15):
+
+```python
+def create_app(settings: ApiSettings | None = None) -> FastAPI:
+    """Build the application. Tests pass their own settings."""
+    settings = settings or ApiSettings()
+    app = FastAPI(title="Atlas API", version=__version__, lifespan=lifespan)
+
+    @app.get("/health", tags=["operations"])
+    def health() -> dict[str, str]:
+        """Liveness: the process is up and answering."""
+        return {"status": "ok"}
+
+    return app
+```
+
+```bash
+uv run uvicorn atlas.api.app:create_app --factory --reload
+```
+```text
+$ curl -s http://localhost:8000/health
+{"status":"ok"}
+```
+
+`--factory` tells Uvicorn to call `create_app()` to get the application. `tags` groups routes in the docs page. The docstring becomes the route's description there. (`ApiSettings` and `lifespan` arrive in lessons 4.2 and 4.4.)
+
+### `def` or `async def`?
+
+FastAPI accepts both. They behave differently under load:
+
+- An `async def` handler runs on the **event loop** (lesson 2.6), the single thread that juggles every request. While it `await`s, other requests proceed. But if it calls something slow that does not `await` (a blocking call), every other request waits.
+- A plain `def` handler runs in a **thread pool**: FastAPI hands it to one of a set of worker threads, so a blocking call only holds up that one thread.
+
+Here is the difference measured. Three handlers each wait one second, and we send five requests at once:
+
+```python
+@app.get("/blocking")
+async def blocking() -> dict[str, str]:
+    time.sleep(1)  # blocks the event loop
+    return {"slept": "1s, blocking"}
+
+
+@app.get("/awaiting")
+async def awaiting() -> dict[str, str]:
+    await asyncio.sleep(1)  # gives the event loop back while waiting
+    return {"slept": "1s, awaiting"}
+
+
+@app.get("/threaded")
+def threaded() -> dict[str, str]:
+    time.sleep(1)  # blocks only its own worker thread
+    return {"slept": "1s, in a thread"}
+```
+```text
+$ time (for i in 1 2 3 4 5; do curl -s -o /dev/null http://localhost:8000/blocking & done; wait)
+real 5.0s
+
+$ time (for i in 1 2 3 4 5; do curl -s -o /dev/null http://localhost:8000/awaiting & done; wait)
+real 1.0s
+
+$ time (for i in 1 2 3 4 5; do curl -s -o /dev/null http://localhost:8000/threaded & done; wait)
+real 1.0s
+```
+
+The blocking `async def` served the five requests one after another. The rule: **use `async def` only if everything slow inside it is awaited; otherwise use `def`.** Atlas's database code in Part 3 is synchronous, so lessons 4.1 to 4.12 use `def`. Lesson 4.13 switches the whole API to async database access and `async def`.
+
+## Common mistakes
+
+- **Blocking inside `async def`**: `time.sleep`, `requests.get`, a synchronous database call. It stalls every request, as measured above.
+- **Forgetting `--factory`** with `create_app`: Uvicorn then tries to serve the function itself and fails.
+- **Using `--reload` in production**: it watches files and restarts; it's a development convenience.
+- **Two routes that overlap in the wrong order**: `/issues/{number}` declared before `/issues/saved` would capture `"saved"` as a number (and reject it). Declare fixed paths before parameterised ones.
+- **Returning objects FastAPI can't turn into JSON**, such as an open file. Return dicts, lists, Pydantic models or ORM objects with a response model (lesson 4.3).
+
+## Check yourself
+
+**1.** What does Uvicorn do, and what does FastAPI do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Uvicorn is the server: it listens on the port, speaks HTTP and passes each request to the application through ASGI. FastAPI is the application framework: it matches the request to a route, validates and converts parameters, calls your function and turns the result into a response.
+:::
+
+**2.** In `def read_repo(owner: str, name: str, details: bool = False)` on path `/repos/{owner}/{name}`, where does each value come from?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`owner` and `name` appear in the path, so they are path parameters. `details` isn't in the path and is a simple type, so it's a query parameter (`?details=true`), optional because it has a default.
+:::
+
+**3.** Why did five requests to `/blocking` take five seconds?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`time.sleep` doesn't await, so it held the event loop for a full second each time. No other request could run meanwhile, so they were served one by one. `await asyncio.sleep` gives the loop back while waiting, and a plain `def` runs in a worker thread, so both served all five at once.
+:::
+
+## Exercise
+
+Add `GET /add?a=2&b=3` to `hello.py` returning `{"sum": 5}`. Then try `?a=2` (missing `b`) and `?a=two&b=3`. What status and error do you get?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+@app.get("/add")
+def add(a: int, b: int) -> dict[str, int]:
+    return {"sum": a + b}
+```
+
+Both bad requests get status 422. Missing `b` reports `"type":"missing"` at `["query","b"]`; `a=two` reports `"int_parsing"` at `["query","a"]`. Parameters without defaults are required.
+:::
+
+## Stretch
+
+Open `/openapi.json` and find `/repos/{owner}/{name}`. Which part of the document says `details` is optional and a boolean? Then add a docstring to `read_repo` and see where it appears.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Under `paths` → `/repos/{owner}/{name}` → `get` → `parameters`, the `details` entry has `"in": "query"`, `"required": false` and `"schema": {"type": "boolean", "default": false, ...}`. A docstring becomes the operation's `description`, shown under the route on `/docs`.
+:::
+
+## What changed in the project
+
+`fastapi` and `uvicorn[standard]` are dependencies, and `src/atlas/api/app.py` holds `create_app()` with `/health`. Commit: `feat: Added the API skeleton`.

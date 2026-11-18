@@ -10,19 +10,19 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 4.1 | FastAPI fundamentals: ASGI, routes, parameters, docs, `def` vs `async def` *(coming soon)* | API skeleton |
-| 4.2 | Configuration and secrets with pydantic-settings *(coming soon)* | `Settings` |
-| 4.3 | Pydantic schemas: requests, responses, PATCH vs PUT *(coming soon)* | Schemas |
-| 4.4 | Database sessions and dependency injection *(coming soon)* | `get_db` |
-| 4.5 | Routers and project structure *(coming soon)* | Routers |
-| 4.6 | Users and password hashing *(coming soon)* | Users |
-| 4.7 | Authentication with JWT *(coming soon)* | Login, `get_current_user` |
-| 4.8 | Sign in with GitHub (OAuth2 and OIDC), refresh tokens, roles *(coming soon)* | GitHub login, admin role |
-| 4.9 | Relationships and authorisation *(coming soon)* | Saved issues, admin-only routes |
-| 4.10 | Querying: pagination (offset and cursor), filtering, search *(coming soon)* | `/search` (keyword), `/issues` |
-| 4.11 | Migrations with Alembic *(coming soon)* | Migrations |
-| 4.12 | Errors, middleware, CORS, API design conventions, idempotency keys *(coming soon)* | Error format, request ids |
-| 4.13 | Async FastAPI with async SQLAlchemy *(coming soon)* | API converted to async |
-| 4.14 | API styles: REST, GraphQL, gRPC, WebSockets, and when to use each *(coming soon)* | WebSocket demo |
-| 4.15 | Testing APIs against a real Postgres *(coming soon)* | Test suite |
-| 4.16 | Review and practice *(coming soon)* | Unguided: a "notes on issues" resource |
+| 4.1 | [FastAPI fundamentals: ASGI, routes, parameters, docs, `def` vs `async def`](01-fastapi-fundamentals.qmd) | API skeleton |
+| 4.2 | [Configuration and secrets with pydantic-settings](02-configuration-and-secrets.qmd) | `Settings` |
+| 4.3 | [Pydantic schemas: requests, responses, PATCH vs PUT](03-pydantic-schemas.qmd) | Schemas |
+| 4.4 | [Database sessions and dependency injection](04-sessions-and-dependency-injection.qmd) | `get_db` |
+| 4.5 | [Routers and project structure](05-routers-and-project-structure.qmd) | Routers |
+| 4.6 | [Users and password hashing](06-users-and-password-hashing.qmd) | Users |
+| 4.7 | [Authentication with JWT](07-authentication-with-jwt.qmd) | Login, `get_current_user` |
+| 4.8 | [Sign in with GitHub (OAuth2 and OIDC), refresh tokens, roles](08-github-sign-in-refresh-tokens-roles.qmd) | GitHub login, admin role |
+| 4.9 | [Relationships and authorisation](09-relationships-and-authorisation.qmd) | Saved issues, admin-only routes |
+| 4.10 | [Querying: pagination (offset and cursor), filtering, search](10-pagination-filtering-search.qmd) | `/search` (keyword), `/issues` |
+| 4.11 | [Migrations with Alembic](11-migrations-with-alembic.qmd) | Migrations |
+| 4.12 | [Errors, middleware, CORS, API design conventions, idempotency keys](12-errors-middleware-cors-conventions.qmd) | Error format, request ids |
+| 4.13 | [Async FastAPI with async SQLAlchemy](13-async-fastapi.qmd) | API converted to async |
+| 4.14 | [API styles: REST, GraphQL, gRPC, WebSockets, and when to use each](14-api-styles.qmd) | WebSocket demo |
+| 4.15 | [Testing APIs against a real Postgres](15-testing-apis.qmd) | Test suite |
+| 4.16 | [Review and practice](16-review-and-practice.qmd) | Unguided: a "notes on issues" resource |
