@@ -11,6 +11,7 @@ These documents are the single source of truth for what this repository is, what
 | [05-roadmap.md](05-roadmap.md) | In what order is the work done, and what is the status of each milestone? |
 | [06-conventions.md](06-conventions.md) | How do we write code, lessons, tests and commits? |
 | [07-decisions.md](07-decisions.md) | Which decisions were made, why, and what was rejected? |
+| [08-depth-pass.md](08-depth-pass.md) | Proposed: how Parts 4 and 7 get deeper (pending approval). |
 
 ## Rules for keeping these docs useful
 
