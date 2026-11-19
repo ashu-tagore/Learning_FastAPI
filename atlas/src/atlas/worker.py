@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from atlas.jobs import WorkerContext, create_job, run_job
 from atlas.models import Job, Repo
+from atlas.queue import WAIT_SECONDS
 
 logger = logging.getLogger("atlas.worker")
 
@@ -28,7 +29,7 @@ STUCK_AFTER = timedelta(minutes=5)
 def work(
     ctx: WorkerContext,
     stop: threading.Event,
-    wait_seconds: int = 5,
+    wait_seconds: int = WAIT_SECONDS,
     stop_when_idle: bool = False,
 ) -> int:
     """Run jobs until `stop` is set; return how many deliveries were handled.

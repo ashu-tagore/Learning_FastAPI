@@ -18,12 +18,17 @@ from typing import Protocol
 
 import redis
 
+# How long receive() waits for a message before returning None. It must stay below the
+# Redis client's socket timeout (5 seconds by default in redis-py 8): a blocking command
+# that outlasts it fails with TimeoutError instead of returning empty (lesson 5.1).
+WAIT_SECONDS = 2
+
 
 class JobQueue(Protocol):
     """What Atlas needs from a queue. RedisQueue provides it locally; Part 7 adds SQS."""
 
     def send(self, job_id: int, delay_seconds: float = 0) -> None: ...
-    def receive(self, wait_seconds: int = 5) -> int | None: ...
+    def receive(self, wait_seconds: int = WAIT_SECONDS) -> int | None: ...
     def ack(self, job_id: int) -> None: ...
 
 
@@ -49,7 +54,7 @@ class RedisQueue:
             return
         self.client.lpush(self.ready, str(job_id))
 
-    def receive(self, wait_seconds: int = 5) -> int | None:
+    def receive(self, wait_seconds: int = WAIT_SECONDS) -> int | None:
         """The next job id, hidden from other workers until ack() or its timeout."""
         self._release_due_messages()
         # LMOVE is atomic: the id is never in neither list, so a crash here can't lose it.

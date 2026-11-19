@@ -47,3 +47,12 @@ def test_messages_come_out_in_the_order_they_went_in(queue: RedisQueue) -> None:
     received = [queue.receive(wait_seconds=0) for _ in range(3)]
 
     assert received == [1, 2, 3]
+
+
+def test_waiting_on_an_empty_queue_returns_none_instead_of_timing_out(
+    queue: RedisQueue,
+) -> None:
+    # Regression (lesson 5.1): a 5-second wait on redis-py 8's default 5-second socket
+    # timeout raised TimeoutError after a minute of retries, and the worker crashed.
+    # This test takes WAIT_SECONDS of real time, because the bug only shows in real time.
+    assert queue.receive() is None

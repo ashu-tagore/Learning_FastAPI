@@ -144,7 +144,7 @@ class RecordingQueue:
     def send(self, job_id: int, delay_seconds: float = 0) -> None:
         self.sent.append(job_id)
 
-    def receive(self, wait_seconds: int = 5) -> int | None:
+    def receive(self, wait_seconds: int = 2) -> int | None:
         raise NotImplementedError("the API never receives")
 
     def ack(self, job_id: int) -> None:
