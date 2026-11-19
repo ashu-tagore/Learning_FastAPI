@@ -31,10 +31,16 @@ RepoFullName = Annotated[
     str, Field(pattern=r"^[\w.-]+/[\w.-]+$", max_length=200, examples=["pytorch/ignite"])
 ]
 
+# Request bodies refuse fields they don't list. Silently ignoring them would hide client
+# mistakes ("skils_profile") and attack attempts ("role": "admin", lesson 4.11) alike.
+REQUEST_BODY = ConfigDict(extra="forbid")
+
 # ---------- Users and authentication ----------
 
 
 class UserCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     email: Email
     password: Password
 
@@ -59,6 +65,8 @@ class UserUpdate(BaseModel):
     column forbids. Routes read model_dump(exclude_unset=True), so defaults never apply.
     """
 
+    model_config = REQUEST_BODY
+
     skills_profile: str = Field(default="", max_length=2000)
 
 
@@ -70,6 +78,8 @@ class TokenPair(BaseModel):
 
 
 class RefreshRequest(BaseModel):
+    model_config = REQUEST_BODY
+
     refresh_token: str
 
 
@@ -77,6 +87,8 @@ class RefreshRequest(BaseModel):
 
 
 class RepoCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     full_name: RepoFullName
 
 
@@ -131,10 +143,14 @@ class SearchPage(BaseModel):
 
 
 class NoteCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     body: str = Field(min_length=1, max_length=5000)
 
 
 class NoteUpdate(BaseModel):
+    model_config = REQUEST_BODY
+
     body: str = Field(min_length=1, max_length=5000)
 
 
