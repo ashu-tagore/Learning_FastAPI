@@ -4,10 +4,13 @@ Models (models.py) describe tables; schemas describe requests and responses. Kee
 separate is what keeps fields like password_hash out of every response.
 """
 
+import base64
+import binascii
+import json
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, EmailStr, Field
 
 # ---------- Domain types (lesson 4.3) ----------
 # Each type is parsed once, at the edge. Code that receives an Email or a RepoFullName
@@ -113,6 +116,25 @@ class IssueOut(BaseModel):
     labels: list[str]
     comments: int
     created_at: datetime
+
+
+def encode_issue_cursor(last_number: int) -> str:
+    # Opaque to clients: they pass it back unchanged, so its format can change later.
+    raw = json.dumps({"before": last_number}).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_issue_cursor(cursor: str) -> int:
+    """The issue number a cursor this API issued points below (lesson 4.12)."""
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        return int(payload["before"])
+    except (binascii.Error, ValueError, KeyError, TypeError, UnicodeEncodeError):
+        raise ValueError("not a cursor this API issued") from None
+
+
+# Parsed at the edge like the other domain types: a route receives the issue number itself.
+IssueCursor = Annotated[int, BeforeValidator(decode_issue_cursor)]
 
 
 class IssuePage(BaseModel):
