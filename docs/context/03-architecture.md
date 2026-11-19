@@ -15,7 +15,7 @@ flowchart LR
   Q --> W[Worker<br/>sync, ingest, embed]
   Q --> AW[Agent worker<br/>agent runs]
   W --> GHAPI[GitHub REST API<br/>read-only token]
-  W --> OS[(Object storage<br/>MinIO locally, S3 on AWS)]
+  W --> OS[(Object storage<br/>SeaweedFS locally, S3 on AWS)]
   W --> PG
   W --> LLM[LLM + embedding providers]
   AW --> PG
@@ -33,7 +33,7 @@ flowchart LR
 | Postgres | All durable state, full-text search, vectors (pgvector) | One database keeps the course simpler than adding a vector DB |
 | Redis | Local queue, cache, rate limits | Fast shared state between processes |
 
-The queue carries only ids (`{"job": "ingest", "repo_id": 3}`); the job's state lives in Postgres. This makes jobs idempotent and inspectable.
+The queue carries only a job id; the job's kind, repository, status, attempts and last error live in the Postgres `jobs` table. This makes jobs idempotent and inspectable (lessons 5.1 to 5.3, decision D26).
 
 ## LLM and embedding providers
 
@@ -162,7 +162,7 @@ erDiagram
 
 ## Local development stack
 
-`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `minio`, and optionally `ollama`. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
+`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage), and optionally `ollama`. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
 
 ## AWS deployment
 

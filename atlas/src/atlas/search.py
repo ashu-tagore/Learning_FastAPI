@@ -22,12 +22,14 @@ class Match:
     line: str
 
 
+def is_in_skipped_folder(relative_path: Path) -> bool:
+    return any(part in SKIPPED_FOLDERS for part in relative_path.parts)
+
+
 def iter_source_files(root: Path, extensions: tuple[str, ...]) -> Iterator[Path]:
     """Yield files under root with one of the given extensions, in a stable order."""
     for path in sorted(root.rglob("*")):
-        relative_parts = path.relative_to(root).parts
-        is_in_skipped_folder = any(part in SKIPPED_FOLDERS for part in relative_parts)
-        if is_in_skipped_folder:
+        if is_in_skipped_folder(path.relative_to(root)):
             continue
 
         is_wanted_file = path.is_file() and path.suffix in extensions

@@ -5,7 +5,7 @@ Atlas never writes to GitHub, so this module only ever sends GET requests.
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -15,6 +15,14 @@ GITHUB_API = "https://api.github.com"
 
 class GitHubError(Exception):
     """A problem talking to GitHub, explained in words a user can act on."""
+
+
+class RateLimited(GitHubError):
+    """GitHub's rate limit is used up until retry_at; retrying sooner only makes it worse."""
+
+    def __init__(self, message: str, retry_at: datetime) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 @dataclass(frozen=True)
@@ -56,8 +64,15 @@ def check_response(response: httpx.Response) -> None:
     out_of_requests = response.headers.get("x-ratelimit-remaining") == "0"
     if out_of_requests:
         reset_epoch = int(response.headers.get("x-ratelimit-reset", "0"))
-        reset_at = datetime.fromtimestamp(reset_epoch, tz=UTC).strftime("%H:%M UTC")
-        raise GitHubError(f"GitHub rate limit reached; it resets at {reset_at}")
+        reset_at = datetime.fromtimestamp(reset_epoch, tz=UTC)
+        message = f"GitHub rate limit reached; it resets at {reset_at:%H:%M UTC}"
+        raise RateLimited(message, retry_at=reset_at)
+
+    # A secondary rate limit (too many requests too quickly) may name its own wait instead.
+    retry_after = response.headers.get("retry-after")
+    if retry_after is not None:
+        retry_at = datetime.now(UTC) + timedelta(seconds=int(retry_after))
+        raise RateLimited(f"GitHub asked to wait {retry_after} seconds", retry_at=retry_at)
 
     if response.status_code == 404:
         raise GitHubError(f"not found on GitHub: {response.request.url.path}")
@@ -161,3 +176,75 @@ async def fetch_recent_commits(
             )
         )
     return commits
+
+
+@dataclass(frozen=True)
+class IssueChanges:
+    """What changed among a repository's issues since the last poll (lesson 5.3)."""
+
+    not_modified: bool  # GitHub answered 304: nothing changed, and the poll cost no quota
+    open_issues: list[Issue]  # new or updated, still open: store them
+    closed_numbers: list[int]  # closed since the last poll: remove them
+    etag: str | None  # send back as If-None-Match next time
+    newest_update: datetime | None  # the next poll asks for changes since this moment
+
+
+async def fetch_issue_changes(
+    repo: str,
+    *,
+    since: datetime | None,
+    etag: str | None,
+    token: str | None = None,
+    max_pages: int = 10,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> IssueChanges:
+    """Issues changed since `since` (all open issues on the first sync), newest first.
+
+    `since` is the newest `updated_at` seen on the previous poll: a time from GitHub's own
+    clock, so the two machines' clocks never need to agree. The URL stays the same until
+    something changes, which is what lets the etag produce 304 Not Modified.
+    """
+    # Oldest change first: if max_pages cuts the list short, newest_update is still the
+    # last change seen, and the next poll carries on from there without a gap.
+    params: dict[str, str | int] = {"sort": "updated", "direction": "asc", "per_page": 100}
+    if since is None:
+        params["state"] = "open"
+    else:
+        # state=all: an issue closed since the last poll must be seen, to be removed.
+        params["state"] = "all"
+        params["since"] = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conditional = {"If-None-Match": etag} if etag else {}
+
+    async with httpx.AsyncClient(
+        base_url=GITHUB_API, headers=build_headers(token), timeout=10.0, transport=transport
+    ) as client:
+        url = f"/repos/{repo}/issues"
+        response = await client.get(url, params=params, headers=conditional)
+        if response.status_code == 304:
+            return IssueChanges(True, [], [], etag, since)
+        check_response(response)
+        first_page_etag = response.headers.get("etag")
+
+        open_issues: list[Issue] = []
+        closed_numbers: list[int] = []
+        newest_update = since
+        for _ in range(max_pages):
+            for item in response.json():
+                updated_at = datetime.fromisoformat(item["updated_at"])
+                if newest_update is None or updated_at > newest_update:
+                    newest_update = updated_at
+                # The issues endpoint also returns pull requests; they carry this key.
+                if "pull_request" in item:
+                    continue
+                if item["state"] == "closed":
+                    closed_numbers.append(item["number"])
+                else:
+                    open_issues.append(parse_issue(item))
+
+            next_page = response.links.get("next")
+            if next_page is None:
+                break
+            response = await client.get(next_page["url"])
+            check_response(response)
+
+    return IssueChanges(False, open_issues, closed_numbers, first_page_etag, newest_update)

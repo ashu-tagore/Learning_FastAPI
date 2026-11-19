@@ -60,6 +60,12 @@
       "422"
     ]
   },
+  "/jobs/{job_id}": {
+    "get": [
+      "200",
+      "422"
+    ]
+  },
   "/notes/{note_id}": {
     "delete": [
       "204",
@@ -85,6 +91,18 @@
       "422"
     ]
   },
+  "/repos/{repo_id}": {
+    "get": [
+      "200",
+      "422"
+    ]
+  },
+  "/repos/{repo_id}/sync": {
+    "post": [
+      "202",
+      "422"
+    ]
+  },
   "/search": {
     "get": [
       "200",
@@ -103,6 +121,12 @@
   "/users/me/saved-issues": {
     "get": [
       "200"
+    ]
+  },
+  "/webhooks/github": {
+    "post": [
+      "202",
+      "422"
     ]
   }
 }

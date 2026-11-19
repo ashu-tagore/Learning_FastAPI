@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -42,6 +43,12 @@ class Repo(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     full_name: Mapped[str] = mapped_column(String(200), unique=True)  # "pytorch/ignite"
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The commit the stored index reflects; the next sync indexes only what changed since.
+    indexed_commit: Mapped[str | None] = mapped_column(String(40))
+    # Conditional requests (lesson 5.3): GitHub's etag for the last issues poll, and the
+    # newest `updated_at` seen so far, which is where the next poll starts.
+    issues_etag: Mapped[str | None] = mapped_column(String(200))
+    issues_synced_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     documents: Mapped[list["Document"]] = relationship(back_populates="repo")
 
@@ -216,3 +223,34 @@ class IdempotencyKey(Base):
     response_status: Mapped[int]
     response_body: Mapped[Any] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Job(Base):
+    """A unit of background work (lesson 5.1). The queue carries only the job's id."""
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        CheckConstraint("kind IN ('sync_repo', 'sync_issues')", name="jobs_kind_valid"),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'dead')", name="jobs_status_valid"
+        ),
+        # At most one pending job per kind and repository: a burst of webhooks or two
+        # schedulers can't pile up duplicate work (lesson 5.2).
+        Index(
+            "ix_jobs_one_pending",
+            "kind",
+            "repo_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(10), default="queued", server_default="queued")
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

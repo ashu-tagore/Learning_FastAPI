@@ -68,7 +68,7 @@ Parts 1 to 8 end with a **Review and practice** lesson: mixed exercises without 
 
 ## Part 4: Building APIs with FastAPI (20)
 
-This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources. Its depth pass ([08-depth-pass.md](08-depth-pass.md)) makes lessons failure-first and test-first from 4.5, and adds "Attack it" sections to the security lessons.
+This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources. Its depth pass (decision D22, `docs/context/08-depth-pass.md`) makes lessons failure-first and test-first from 4.5, and adds "Attack it" sections to the security lessons.
 
 | Id | Lesson | Builds |
 |---|---|---|
@@ -102,7 +102,7 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 | 5.1 | Queues and workers: at-least-once delivery, idempotency, retries, dead letters | Worker + Redis queue |
 | 5.2 | Scheduling and webhooks: cron, GitHub webhooks, HMAC signature checks | Scheduled sync, webhook route |
 | 5.3 | Syncing with GitHub properly: conditional requests, rate limits, incremental sync by commit | Incremental sync |
-| 5.4 | Object storage with the S3 API (MinIO locally) | Repo snapshots |
+| 5.4 | Object storage with the S3 API (SeaweedFS locally) | Repo snapshots |
 | 5.5 | Caching and rate limiting with Redis | Cache, per-user limits |
 | 5.6 | Publish/subscribe and event streams: Redis Streams, Kafka concepts, consumer groups | `issue.updated` events |
 | 5.7 | Review and practice | Unguided: a daily digest job |

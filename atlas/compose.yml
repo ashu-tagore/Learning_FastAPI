@@ -17,5 +17,15 @@ services:
       interval: 2s
       retries: 15
 
+  # The job queue (lesson 5.1); also the cache and rate limiter in lesson 5.5.
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
 volumes:
   atlas-db:

@@ -8,27 +8,36 @@ atlas init-db
 atlas index --path ~/code/ignite --repo pytorch/ignite
 atlas find "event handlers" --repo pytorch/ignite
 atlas issue-stats --repo pytorch/ignite
+atlas worker
+atlas scheduler
+atlas sync pytorch/ignite
+atlas jobs
 """
 
 import argparse
 import asyncio
 import json
+import logging
 import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import redis
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from atlas import issue_cache, storage
+from atlas import issue_cache, storage, worker
 from atlas.config import Settings
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
-from atlas.models import User
+from atlas.jobs import WorkerContext, create_job
+from atlas.logs import configure_logging
+from atlas.models import Job, Repo, User
+from atlas.queue import RedisQueue
 from atlas.search import DEFAULT_EXTENSIONS, search
 from atlas.stats import collect_stats
 
@@ -94,6 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_db_parser = commands.add_parser("issue-stats", help="summarise stored issues")
     stats_db_parser.add_argument("--repo", default=DEFAULT_REPO)
+
+    commands.add_parser("worker", help="run background jobs from the queue")
+    commands.add_parser("scheduler", help="queue a sync of every repository, periodically")
+
+    sync_parser = commands.add_parser("sync", help="queue a sync of one repository now")
+    sync_parser.add_argument("repo", help="owner/name of a tracked repository")
+
+    jobs_parser = commands.add_parser("jobs", help="list recent background jobs")
+    jobs_parser.add_argument("--limit", type=int, default=20)
 
     return parser
 
@@ -314,6 +332,76 @@ def run_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def worker_context() -> WorkerContext | None:
+    """Everything the background commands need, or None after explaining what's missing."""
+    settings = Settings()
+    if settings.database_url is None:
+        open_database()  # prints the explanation
+        return None
+    factory = sessionmaker(create_engine(settings.database_url))
+    queue = RedisQueue(redis.Redis.from_url(settings.redis_url))
+    return WorkerContext(factory, queue, settings)
+
+
+def run_worker() -> int:
+    ctx = worker_context()
+    if ctx is None:
+        return 1
+    configure_logging()
+    logging.getLogger("atlas").info("worker started")
+    worker.work(ctx, worker.stop_on_signals())
+    return 0
+
+
+def run_scheduler() -> int:
+    ctx = worker_context()
+    if ctx is None:
+        return 1
+    configure_logging()
+    worker.run_scheduler(ctx, worker.stop_on_signals())
+    return 0
+
+
+def run_sync(args: argparse.Namespace) -> int:
+    ctx = worker_context()
+    if ctx is None:
+        return 1
+
+    job_ids = []
+    with ctx.session_factory() as session, session.begin():
+        repo_id = session.scalar(select(Repo.id).where(Repo.full_name == args.repo))
+        if repo_id is None:
+            print(f"atlas: {args.repo} is not tracked; add it first", file=sys.stderr)
+            return 1
+        for kind in ("sync_repo", "sync_issues"):
+            job_id, created = create_job(session, kind, repo_id)
+            if created:
+                job_ids.append(job_id)
+            print(f"{kind}: job {job_id}{'' if created else ' (already pending)'}")
+    for job_id in job_ids:
+        ctx.queue.send(job_id)
+    return 0
+
+
+def run_jobs(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+
+    with session:
+        rows = session.execute(
+            select(Job, Repo.full_name)
+            .join(Repo, Job.repo_id == Repo.id)
+            .order_by(Job.id.desc())
+            .limit(args.limit)
+        ).all()
+
+    for job, repo_name in rows:
+        error = f"  {job.last_error}" if job.last_error else ""
+        print(f"{job.id:>5}  {job.kind:<11}  {job.status:<9}  {job.attempts}  {repo_name}{error}")
+    return 0
+
+
 def run_issue_stats(args: argparse.Namespace) -> int:
     session = open_database()
     if session is None:
@@ -360,6 +448,14 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_index(args)
     if args.command == "find":
         return run_find(args)
+    if args.command == "worker":
+        return run_worker()
+    if args.command == "scheduler":
+        return run_scheduler()
+    if args.command == "sync":
+        return run_sync(args)
+    if args.command == "jobs":
+        return run_jobs(args)
     return run_issue_stats(args)
 
 

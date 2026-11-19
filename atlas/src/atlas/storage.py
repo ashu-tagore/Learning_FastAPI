@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from atlas import github
 from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels
-from atlas.search import DEFAULT_EXTENSIONS, iter_source_files
+from atlas.search import DEFAULT_EXTENSIONS, is_in_skipped_folder, iter_source_files
 
 DOC_EXTENSIONS = {".md", ".rst"}
 
@@ -56,6 +56,31 @@ def split_into_chunks(lines: list[str], size: int) -> Iterator[tuple[int, int, s
         yield start + 1, start + len(block), "\n".join(block)
 
 
+def read_document(repo: Repo, root: Path, path: Path, chunk_lines: int) -> Document | None:
+    """A Document with its chunks for one file, or None if it can't be stored as text."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+    # Postgres text columns cannot hold the NUL character.
+    if "\x00" in text:
+        return None
+
+    lines = text.splitlines()
+    document = Document(
+        repo=repo,
+        path=str(path.relative_to(root)),
+        kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
+        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        line_count=len(lines),
+    )
+    document.chunks = [
+        Chunk(start_line=start, end_line=end, text=block)
+        for start, end, block in split_into_chunks(lines, chunk_lines)
+    ]
+    return document
+
+
 def index_folder(
     session: Session,
     repo_full_name: str,
@@ -75,29 +100,47 @@ def index_folder(
     chunk_count = 0
     skipped = 0
     for path in iter_source_files(root, extensions):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        document = read_document(repo, root, path, chunk_lines)
+        if document is None:
             skipped += 1
             continue
+        session.add(document)
+        document_count += 1
+        chunk_count += len(document.chunks)
 
-        # Postgres text columns cannot hold the NUL character.
-        if "\x00" in text:
+    repo.indexed_at = datetime.now(UTC)
+    session.flush()
+    return IndexSummary(documents=document_count, chunks=chunk_count, skipped=skipped)
+
+
+def update_index(
+    session: Session,
+    repo_full_name: str,
+    root: Path,
+    *,
+    changed: list[str],
+    deleted: list[str],
+    extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
+    chunk_lines: int = 40,
+) -> IndexSummary:
+    """Re-index only the files a commit changed (lesson 5.3); every other file is untouched."""
+    repo = get_or_create_repo(session, repo_full_name)
+    session.execute(
+        delete(Document).where(Document.repo_id == repo.id, Document.path.in_([*changed, *deleted]))
+    )
+
+    document_count = 0
+    chunk_count = 0
+    skipped = 0
+    for relative in changed:
+        path = root / relative
+        is_wanted = path.suffix in extensions and not is_in_skipped_folder(Path(relative))
+        if not is_wanted:
+            continue
+        document = read_document(repo, root, path, chunk_lines)
+        if document is None:
             skipped += 1
             continue
-
-        lines = text.splitlines()
-        document = Document(
-            repo=repo,
-            path=str(path.relative_to(root)),
-            kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
-            content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            line_count=len(lines),
-        )
-        document.chunks = [
-            Chunk(start_line=start, end_line=end, text=block)
-            for start, end, block in split_into_chunks(lines, chunk_lines)
-        ]
         session.add(document)
         document_count += 1
         chunk_count += len(document.chunks)
@@ -158,6 +201,20 @@ def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 
 def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:
     """Make the stored open issues match the fetched list; return how many are stored."""
     repo = get_or_create_repo(session, repo_full_name)
+    stored_numbers = set(session.scalars(select(Issue.number).where(Issue.repo_id == repo.id)))
+    no_longer_open = stored_numbers - {issue.number for issue in issues}
+    apply_issue_changes(session, repo_full_name, issues, list(no_longer_open))
+    return len(issues)
+
+
+def apply_issue_changes(
+    session: Session,
+    repo_full_name: str,
+    open_issues: list[github.Issue],
+    closed_numbers: list[int],
+) -> None:
+    """Store new and updated open issues, and remove closed ones (lesson 5.3)."""
+    repo = get_or_create_repo(session, repo_full_name)
     labels_by_name = {
         label.name: label
         for label in session.scalars(select(Label).where(Label.repo_id == repo.id))
@@ -167,13 +224,12 @@ def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue
         for issue in session.scalars(select(Issue).where(Issue.repo_id == repo.id))
     }
 
-    fetched_numbers = {issue.number for issue in issues}
-    for number, stored in stored_by_number.items():
-        is_no_longer_open = number not in fetched_numbers
-        if is_no_longer_open:
+    for number in closed_numbers:
+        stored = stored_by_number.get(number)
+        if stored is not None:
             session.delete(stored)
 
-    for fetched in issues:
+    for fetched in open_issues:
         row = stored_by_number.get(fetched.number)
         if row is None:
             row = Issue(repo_id=repo.id, number=fetched.number)
@@ -189,7 +245,6 @@ def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue
         ]
 
     session.flush()
-    return len(issues)
 
 
 def _get_or_create_label(

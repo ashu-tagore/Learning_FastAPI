@@ -79,7 +79,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E4
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
-from atlas.api.deps import get_session  # noqa: E402
+from atlas.api.deps import get_queue, get_session  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
 
@@ -98,6 +98,8 @@ def api_settings() -> ApiSettings:
         github_client_id="test-client-id",
         github_client_secret=SecretStr("test-client-secret"),
         cors_origins=["http://localhost:8000"],
+        # The secret from GitHub's own worked example, so its published signature checks out.
+        github_webhook_secret=SecretStr("It's a Secret to Everybody"),
     )
 
 
@@ -130,11 +132,38 @@ def github() -> FakeGitHubSignIn:
     return FakeGitHubSignIn()
 
 
+class RecordingQueue:
+    """Stands in for Redis in API tests: it remembers what was sent (lesson 5.2).
+
+    The API only ever sends; receiving is the worker's side, tested against real Redis.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[int] = []
+
+    def send(self, job_id: int, delay_seconds: float = 0) -> None:
+        self.sent.append(job_id)
+
+    def receive(self, wait_seconds: int = 2) -> int | None:
+        raise NotImplementedError("the API never receives")
+
+    def ack(self, job_id: int) -> None:
+        raise NotImplementedError("the API never receives")
+
+
+@pytest.fixture
+def sent_jobs() -> RecordingQueue:
+    return RecordingQueue()
+
+
 @pytest.fixture
 def api_app(
-    async_session: AsyncSession, api_settings: ApiSettings, github: FakeGitHubSignIn
+    async_session: AsyncSession,
+    api_settings: ApiSettings,
+    github: FakeGitHubSignIn,
+    sent_jobs: RecordingQueue,
 ) -> FastAPI:
-    """The real app, wired to the test's rolled-back session and the fake GitHub."""
+    """The real app, wired to the test's rolled-back session, the fake GitHub and queue."""
     app = create_app(api_settings, github_transport=github.transport)
 
     async def test_session() -> AsyncIterator[AsyncSession]:
@@ -142,6 +171,7 @@ def api_app(
 
     # Every route that asks for a database session gets the test's rolled-back one.
     app.dependency_overrides[get_session] = test_session
+    app.dependency_overrides[get_queue] = lambda: sent_jobs
     return app
 
 
@@ -164,3 +194,109 @@ async def sign_up(
     await client.post("/auth/register", json={"email": email, "password": password})
     response = await client.post("/auth/login", data={"username": email, "password": password})
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+# ---------- Redis fixtures (lesson 5.1) ----------
+
+import uuid  # noqa: E402
+
+import redis  # noqa: E402
+
+from atlas.queue import RedisQueue  # noqa: E402
+
+
+@pytest.fixture
+def redis_client() -> Iterator[redis.Redis]:
+    url = os.environ.get("TEST_REDIS_URL")
+    if url is None:
+        pytest.skip("set TEST_REDIS_URL to run queue tests (see lesson 5.1)")
+    client = redis.Redis.from_url(url, decode_responses=True)
+    yield client
+    client.close()
+
+
+class FakeClock:
+    """A clock tests move by hand, so timeouts can pass without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def queue(redis_client: redis.Redis, clock: FakeClock) -> Iterator[RedisQueue]:
+    """A queue under a name no other test uses; its keys are deleted afterwards."""
+    name = f"test-jobs-{uuid.uuid4().hex}"
+    yield RedisQueue(redis_client, name=name, visibility_timeout=60, clock=clock)
+    for key in redis_client.scan_iter(f"{name}:*"):
+        redis_client.delete(key)
+
+
+# ---------- Background job fixtures (lessons 5.1 to 5.3) ----------
+
+import subprocess  # noqa: E402
+
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+
+from atlas.config import Settings  # noqa: E402
+from atlas.jobs import WorkerContext  # noqa: E402
+from tests.fake_github import FakeIssueTracker  # noqa: E402
+
+
+def git_commit(path: Path, message: str) -> str:
+    """Commit everything in path as a fixed test author; return the new commit."""
+    identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", *identity, "commit", "-qm", message], cwd=path, check=True)
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def upstream(tmp_path: Path) -> Path:
+    """A local Git repository standing in for github.com/pytorch/ignite."""
+    path = tmp_path / "remotes" / "pytorch" / "ignite.git"
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    (path / "engine.py").write_text("class Engine:\n    def run(self):\n        pass\n")
+    (path / "README.md").write_text("# Ignite\n\nTraining loops with events.\n")
+    git_commit(path, "first commit")
+    return path
+
+
+@pytest.fixture
+def issue_tracker() -> FakeIssueTracker:
+    return FakeIssueTracker()
+
+
+@pytest.fixture
+def worker(
+    engine: Engine, queue: RedisQueue, tmp_path: Path, issue_tracker: FakeIssueTracker
+) -> Iterator[WorkerContext]:
+    """A worker's world: real Postgres (rolled back), real Redis, local Git, fake GitHub.
+
+    Every session the jobs open shares one outer transaction, so their commits become
+    savepoints and the test still leaves the tables empty.
+    """
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]  # pydantic-settings option, not a field
+        repos_dir=tmp_path / "clones",
+        git_base_url=str(tmp_path / "remotes"),
+    )
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
+        yield WorkerContext(factory, queue, settings, issue_tracker.transport())
+        transaction.rollback()
