@@ -5,6 +5,7 @@ Run it with:
 """
 
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from atlas.api.errors import ApiError
 from atlas.api.routes import auth, issues, notes, repos, search, users
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
+from atlas.logs import configure_logging, current_request_id
 
 logger = logging.getLogger("atlas.api")
 
@@ -56,6 +58,7 @@ def create_app(
 ) -> FastAPI:
     """Build the application. Tests pass their own settings and a fake GitHub."""
     settings = settings or ApiSettings()  # type: ignore[call-arg]  # values come from the environment
+    configure_logging()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -83,9 +86,27 @@ def create_app(
     ) -> Response:
         # Reuse the caller's id if it sent one, so one request can be traced across services.
         request.state.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.request_id
-        return response
+        # Not reset afterwards: each request runs in its own copy of the context, and the
+        # crash handler, which runs after this middleware has finished, still needs the id.
+        current_request_id.set(request.state.request_id)
+        started = time.perf_counter()
+        status_code = 500  # what the client gets if call_next raises
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+        finally:
+            # Path only, never the query string or body: they can hold tokens and passwords.
+            logger.info(
+                "request finished",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": status_code,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
+            )
 
     # Added after request_id, so it wraps it: CORS headers are on every response, errors included.
     app.add_middleware(
@@ -120,9 +141,7 @@ def create_app(
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, error: Exception) -> JSONResponse:
         # The full traceback goes to the server log; the client gets an id to quote, not internals.
-        logger.exception(
-            "unhandled error, request_id=%s", getattr(request.state, "request_id", None)
-        )
+        logger.exception("unhandled error")
         body = error_body("internal_server_error", "Something went wrong on our side", request)
         # This handler runs outside the request_id middleware, so it adds the header itself.
         request_id = getattr(request.state, "request_id", None)
