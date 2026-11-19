@@ -5,7 +5,7 @@ Atlas never writes to GitHub, so this module only ever sends GET requests.
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -67,6 +67,12 @@ def check_response(response: httpx.Response) -> None:
         reset_at = datetime.fromtimestamp(reset_epoch, tz=UTC)
         message = f"GitHub rate limit reached; it resets at {reset_at:%H:%M UTC}"
         raise RateLimited(message, retry_at=reset_at)
+
+    # A secondary rate limit (too many requests too quickly) may name its own wait instead.
+    retry_after = response.headers.get("retry-after")
+    if retry_after is not None:
+        retry_at = datetime.now(UTC) + timedelta(seconds=int(retry_after))
+        raise RateLimited(f"GitHub asked to wait {retry_after} seconds", retry_at=retry_at)
 
     if response.status_code == 404:
         raise GitHubError(f"not found on GitHub: {response.request.url.path}")

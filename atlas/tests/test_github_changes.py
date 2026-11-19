@@ -1,8 +1,9 @@
 """Incremental issue polling with `since` and conditional requests (lesson 5.3)."""
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from atlas.github import IssueChanges, RateLimited, fetch_issue_changes
@@ -53,8 +54,8 @@ def test_later_poll_sees_new_updated_and_closed_issues_only() -> None:
     changes = poll(tracker, since=first.newest_update, etag=first.etag)
 
     assert changes.closed_numbers == [1]
-    # Issue 2 was last updated exactly at `since`, which GitHub includes; storing it again
-    # is harmless. Everything older is not fetched at all.
+    # Issue 2 was last updated exactly at `since`. GitHub's docs don't say whether such an
+    # issue is included; this fake includes it, and storing it again is harmless.
     assert [issue.number for issue in changes.open_issues] == [2, 3]
     assert changes.newest_update == datetime(2026, 11, 5, 11, tzinfo=UTC)
     assert tracker.requests[-1].url.params["state"] == "all"
@@ -68,3 +69,20 @@ def test_rate_limit_says_when_to_try_again() -> None:
         poll(tracker, since=None, etag=None)
 
     assert caught.value.retry_at == datetime.fromtimestamp(1795440000, tz=UTC)
+
+
+def test_secondary_rate_limit_waits_as_long_as_retry_after_says() -> None:
+    def too_fast(request: httpx.Request) -> httpx.Response:
+        message = {"message": "You have exceeded a secondary rate limit."}
+        return httpx.Response(403, json=message, headers={"retry-after": "120"})
+
+    before = datetime.now(UTC)
+    with pytest.raises(RateLimited) as caught:
+        asyncio.run(
+            fetch_issue_changes(
+                "pytorch/ignite", since=None, etag=None, transport=httpx.MockTransport(too_fast)
+            )
+        )
+
+    waited = caught.value.retry_at - before
+    assert timedelta(seconds=119) < waited < timedelta(seconds=125)
