@@ -1,0 +1,514 @@
+---
+title: "5.1 Queues and workers: at-least-once delivery, idempotency, retries, dead letters"
+description: "Move slow work out of requests and into a worker process, see a plain Redis list lose a job when a worker dies, then build a queue that can't lose one, and make running a job twice harmless."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 1 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Common mistakes". The trade-offs section *(deep dive)* compares Redis, SQS, Postgres-only queues and libraries like Celery.
+:::
+
+::: {.callout-note title="Analogy: a restaurant's order rail"}
+A waiter doesn't stand at the stove while your steak cooks. They write a ticket, clip it to the rail, and go back to the dining room. A cook takes the ticket, cooks, and only then throws the ticket away. If the cook walks out halfway, the ticket is still on the rail and the next cook picks it up. Sometimes two cooks grab the same ticket, so the kitchen has a rule: before cooking, check the board of finished orders.
+
+The waiter is the API. The rail is the **queue**. The cooks are **workers**. "Throw the ticket away only when done" is **acknowledgement**. "Check the board first" is **idempotency**.
+:::
+
+## The problem
+
+Atlas has had `POST /repos` for adding repositories to track since lesson 4.6, but nothing ever fetches their code. An admin adds `pytorch/ignite` with `POST /repos`, and the repository sits there with `indexed_at: null` until someone runs `atlas index` by hand.
+
+The obvious fix is to clone and index inside the request. Here's what that costs, measured with the code this lesson builds (the first sync of `pytorch/ignite` at commit `0abbcab`, 3 November 2026):
+
+```text
+first sync (clone + full index): 403 files, 2437 chunks in 3.74s
+```
+
+Almost four seconds with the admin's browser waiting, for a small repository on a fast network. A large repository takes minutes, and every web server and load balancer in front of Atlas gives up on a request long before that (AWS's load balancer's default idle timeout is 60 seconds; lesson 7.5b meets it). Worse, while one request is busy cloning, the work is tied to that request: if the client disconnects or the server restarts for a deploy, the half-done clone is simply abandoned and nobody knows.
+
+So the work has to happen somewhere else, later, in a separate process. That raises the real question of this lesson: **how do you hand work to another process without ever losing it?**
+
+Here's the first attempt most people make: a Redis list as a to-do list. The API pushes a job id onto it; a worker pops one off and does the work. Below, a worker pops job `42` and is then killed with `kill -9`, the way a machine dies in a power cut or an out-of-memory kill (the scripts are in "In the project"):
+
+```text
+--- plain list ---
+worker: took job 42, working...
+after kill -9, jobs waiting: 0
+```
+
+Job 42 is gone. It was removed from the list the moment the worker took it, and the only record of it was in the memory of a process that no longer exists. No error, no log line, nothing to retry. Someone, some day, will ask why their repository never got indexed.
+
+Now the same thing with the queue this lesson builds:
+
+```text
+--- RedisQueue ---
+worker: received job 42, working...
+after kill -9, ready: 0, in flight: 1
+next worker receives: 42
+```
+
+The job wasn't deleted when it was received, only moved to an "in flight" list with a deadline. Nobody acknowledged it, the deadline passed, and the next worker got it.
+
+## Theory
+
+### Producers, queues, consumers
+
+A **queue** is a list of messages waiting to be processed, held by a separate service so that it outlives any one process. The process that adds messages is the **producer** (the API, and later the scheduler). The process that takes and handles them is the **consumer**, usually called a **worker**. They never talk to each other directly, which is the point: the API can answer in milliseconds, and workers can be slow, restarted, or scaled to ten copies without the API noticing.
+
+Atlas's messages are tiny: just a **job id**, a number. Everything about the job (what kind, which repository, how many attempts, the last error) lives in a Postgres table, `jobs`. Two reasons. Postgres is where Atlas keeps state it can't afford to lose, with transactions and backups (lesson 7.7a). And a message that is only an id can be delivered twice, or late, without carrying stale instructions: the worker always reads the job's current state.
+
+### Delivery guarantees
+
+What can a queue promise about each message? There are three possible answers, and only two are achievable:
+
+- **At most once**: each message is delivered once or not at all. The plain list above: popping removes it, so a crash loses it.
+- **At least once**: each message is delivered until someone confirms it's done, so it's never lost, but it may be delivered *more than once*. The `RedisQueue` above, and Amazon SQS, which Atlas uses in production (Part 7).
+- **Exactly once**: impossible over an unreliable network, in general. A worker can finish the work and then die a microsecond before saying so; the queue can't tell that apart from dying a microsecond after starting. It must either redeliver (risking a duplicate) or not (risking a loss).
+
+Atlas chooses at least once, and then makes duplicates harmless. That second half is what makes the system correct, and it's the part people forget.
+
+### Visibility timeout and acknowledgement
+
+The mechanism behind at least once has two parts, named as in SQS:
+
+- **Visibility timeout.** A received message isn't deleted; it's hidden from other workers for a fixed time (Atlas uses 5 minutes) and recorded as **in flight**.
+- **Acknowledgement** ("ack"). When the worker has finished, it tells the queue, and only then is the message deleted. If the visibility timeout passes without an ack, the queue assumes the worker died and makes the message visible again.
+
+The order matters: the worker acknowledges *after* the work, never before. Acknowledge first and you're back to at most once.
+
+### Idempotency
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. Setting a value is idempotent (`status = 'succeeded'`); adding to it isn't (`count = count + 1`). Lesson 4.16 met idempotency keys for HTTP requests. Here the same idea protects jobs. Atlas uses two layers:
+
+1. **The job row guards the job.** Before running, a worker *claims* the job with one `UPDATE ... WHERE status = 'queued'`. A duplicate delivery of a job that's already running or finished matches no row and is skipped.
+2. **The work itself converges.** Syncing a repository means "make the stored index match commit X". Doing that twice leaves the same result. This covers the one gap in layer 1: a worker that dies after doing the work but before recording success. The next delivery redoes the work, harmlessly.
+
+### Retries, backoff and dead jobs
+
+Jobs fail: GitHub times out, a disk fills, a bug. Most failures are temporary, so the job should be tried again. But not immediately, and not forever:
+
+- **Backoff.** Wait longer after each failure: up to 30 seconds after the first, 60 after the second, 120 after the third, capped at an hour. A service that is struggling gets room to recover.
+- **Jitter.** Pick a *random* wait between zero and that ceiling ("full jitter"). If GitHub has a five-minute outage and 200 jobs fail together, fixed backoff makes all 200 retry at the same instant and knock it over again. Randomness spreads them out.
+- **Dead jobs.** After `MAX_ATTEMPTS` (5) failures, stop. The job is marked `dead` with its last error, for a person to read. Queues call this a **dead-letter queue**; Atlas keeps the dead jobs in the same table, with `status = 'dead'`, so one query finds them.
+
+### Leases
+
+One more failure: a worker claims a job (status `running`) and then dies. The queue will redeliver the message after the visibility timeout, but the claim says "running", so the next worker would skip it forever. The fix is a **lease**: a claim is only valid for a limited time (10 minutes). A `running` job whose `started_at` is older than that is treated as abandoned and can be claimed again.
+
+```{mermaid}
+sequenceDiagram
+    participant API
+    participant PG as Postgres jobs
+    participant Q as Redis queue
+    participant W as Worker
+    API->>PG: INSERT job (queued) and COMMIT
+    API->>Q: send(job id)
+    W->>Q: receive()
+    Q-->>W: job id (now in flight, hidden 5 min)
+    W->>PG: UPDATE to running WHERE queued (the claim)
+    W->>W: do the work
+    W->>PG: UPDATE to succeeded (same transaction as the work)
+    W->>Q: ack(job id)
+    Note over Q,W: no ack within 5 min means the id is delivered again
+```
+
+## In the project
+
+Redis joins Postgres in `compose.yml` (`redis:7.4-alpine`, published on `127.0.0.1:6379`); `docker compose up -d` starts both. The Python client is `redis` (8.1.0), added with `uv add redis`.
+
+### Red: what the queue must guarantee
+
+The queue's promises are written down as tests before any queue exists, in `tests/test_queue.py`. They run against a real Redis (a fixture skips them unless `TEST_REDIS_URL` is set, as the database tests need `TEST_DATABASE_URL`), each under a unique queue name. Time is the tricky part: nobody wants a test that waits five minutes for a visibility timeout. So the queue takes its clock as a parameter, and tests pass a `FakeClock` they move by hand:
+
+```python
+def test_an_unacknowledged_message_comes_back_after_its_visibility_timeout(
+    queue: RedisQueue, clock: FakeClock
+) -> None:
+    queue.send(7)
+    assert queue.receive(wait_seconds=0) == 7
+
+    clock.advance(59)
+    assert queue.receive(wait_seconds=0) is None  # still hidden
+    clock.advance(2)
+    assert queue.receive(wait_seconds=0) == 7  # the worker died; someone else gets it
+```
+
+The other three tests check that an acknowledged message never returns, that a delayed message waits, and that messages come out oldest first.
+
+### Green: `atlas/queue.py`
+
+A queue in Redis uses four keys:
+
+| Key | Redis type | Holds |
+|---|---|---|
+| `atlas:jobs:ready` | list | ids waiting to be received |
+| `atlas:jobs:in-flight` | list | ids received but not acknowledged |
+| `atlas:jobs:deadlines` | sorted set | in-flight id, scored by when its timeout ends |
+| `atlas:jobs:delayed` | sorted set | id, scored by when it becomes ready (retries) |
+
+A **sorted set** keeps members ordered by a number, their score; here the score is a time, so "everything due by now" is one range query.
+
+```python
+def receive(self, wait_seconds: int = WAIT_SECONDS) -> int | None:
+    """The next job id, hidden from other workers until ack() or its timeout."""
+    self._release_due_messages()
+    # LMOVE is atomic: the id is never in neither list, so a crash here can't lose it.
+    if wait_seconds > 0:
+        raw = self.client.blmove(self.ready, self.in_flight, wait_seconds, "RIGHT", "LEFT")
+    else:
+        raw = self.client.lmove(self.ready, self.in_flight, "RIGHT", "LEFT")
+    if raw is None:
+        return None
+    job_id = as_text(raw)
+    self.client.zadd(self.deadlines, {job_id: self.clock() + self.visibility_timeout})
+    return int(job_id)
+```
+
+`LMOVE` takes the oldest id from the right end of `ready` and pushes it onto `in-flight` in one step. Redis runs each command atomically, so there's no moment when the id is in neither list: that's the whole difference from the plain list's `RPOP`. `BLMOVE` is the blocking version: it waits up to `wait_seconds` for an id to arrive, so an idle worker isn't hammering Redis in a loop.
+
+`_release_due_messages` runs at the start of every receive. It moves due delayed ids, and in-flight ids whose deadline passed, back to `ready`. Several workers may try that at once, so each move starts with `ZREM`, which only one of them can win:
+
+```python
+for job_id in self._due(self.deadlines, now):
+    if self.client.zrem(self.deadlines, job_id):
+        self.client.lrem(self.in_flight, 1, job_id)
+        self.client.lpush(self.ready, job_id)
+```
+
+`ack` deletes the id from `in-flight` and `deadlines`. `send` pushes onto `ready`, or, with a delay, adds to `delayed` scored by when it's due.
+
+Part 7 adds an SQS version of the queue with the same three methods, and API tests use a stand-in that only records what was sent. To let type checking accept any of them, `queue.py` declares a **protocol**: a class from Python's `typing` module that lists method signatures and nothing else.
+
+```python
+class JobQueue(Protocol):
+    """What Atlas needs from a queue. RedisQueue provides it locally; Part 7 adds SQS."""
+
+    def send(self, job_id: int, delay_seconds: float = 0) -> None: ...
+    def receive(self, wait_seconds: int = WAIT_SECONDS) -> int | None: ...
+    def ack(self, job_id: int) -> None: ...
+```
+
+No class inherits from it. mypy accepts any object whose methods match, which is called **structural typing** ("if it has these methods, it fits"). Code that needs a queue asks for a `JobQueue`; `RedisQueue` fits without mentioning `JobQueue` at all.
+
+### A bug found by running it
+
+All five queue tests passed. Then the real worker ran for the first time, and was stopped with `kill -TERM` a few seconds later. It died with a traceback ending:
+
+```text
+redis.exceptions.TimeoutError: Timeout reading from socket
+```
+
+The stop signal turned out to be a red herring. A worker on an *empty* queue, with no signal at all, fails the same way:
+
+```text
+socket_timeout: 5
+TimeoutError Timeout reading from socket 59.13
+```
+
+redis-py 8 gives every client a 5-second **socket timeout** by default: if Redis says nothing for 5 seconds, the client assumes the connection is dead. The worker was waiting 5 seconds in `BLMOVE` for a message, so whenever the queue was empty, the two timeouts raced; the client lost, retried with backoff for about a minute, and raised. The tests never noticed because they all use `wait_seconds=0`. A regression test that waits for real:
+
+```python
+def test_waiting_on_an_empty_queue_returns_none_instead_of_timing_out(
+    queue: RedisQueue,
+) -> None:
+    # Regression (lesson 5.1): a 5-second wait on redis-py 8's default 5-second socket
+    # timeout raised TimeoutError after a minute of retries, and the worker crashed.
+    # This test takes WAIT_SECONDS of real time, because the bug only shows in real time.
+    assert queue.receive() is None
+```
+
+With the wait at 5 seconds it fails (`1 failed ... TimeoutError`). The fix is a named constant with the reason next to it:
+
+```python
+# How long receive() waits for a message before returning None. It must stay below the
+# Redis client's socket timeout (5 seconds by default in redis-py 8): a blocking command
+# that outlasts it fails with TimeoutError instead of returning empty (lesson 5.1).
+WAIT_SECONDS = 2
+```
+
+The lesson generalises: anything that waits (a blocking read, a long poll, a database lock) has to wait less than whatever is timing *it*.
+
+### The jobs table
+
+Migration `0004` adds the table (model in `models.py`):
+
+```python
+class Job(Base):
+    """A unit of background work (lesson 5.1). The queue carries only the job's id."""
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        CheckConstraint("kind IN ('sync_repo', 'sync_issues')", name="jobs_kind_valid"),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'dead')", name="jobs_status_valid"
+        ),
+        # At most one pending job per kind and repository (lesson 5.2).
+        Index(
+            "ix_jobs_one_pending", "kind", "repo_id", unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(10), default="queued", server_default="queued")
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+```
+
+The partial unique index is lesson 5.2's subject. The two job kinds, `sync_repo` and `sync_issues`, are lesson 5.3's; for now, all that matters is that each is a function that brings stored data up to date.
+
+### Red: what running a job must guarantee
+
+`tests/test_jobs.py` uses a `worker` fixture: real Postgres (one outer transaction, rolled back after the test, as in lesson 3.11, but shared by every session the job code opens), real Redis, a local Git repository standing in for GitHub, and a fake GitHub API that lesson 5.3 builds. Three of its tests define this lesson's rules:
+
+```python
+def test_duplicate_delivery_of_a_finished_job_is_skipped(
+    worker: WorkerContext, upstream: Path
+) -> None:
+    job_id = queue_job(worker, "sync_repo", add_repo(worker))
+    run_job(worker, job_id)
+
+    assert run_job(worker, job_id) == "skipped"
+    assert load_job(worker, job_id).attempts == 1
+
+
+def test_failed_job_is_retried_with_backoff_then_dead(
+    worker: WorkerContext, clock: FakeClock
+) -> None:
+    # No upstream fixture: the clone fails every time.
+    job_id = queue_job(worker, "sync_repo", add_repo(worker))
+    assert worker.queue.receive(wait_seconds=0) == job_id
+
+    outcomes = []
+    for _ in range(jobs.MAX_ATTEMPTS):
+        outcomes.append(run_job(worker, job_id))
+        clock.advance(4000)  # past the longest backoff
+
+    assert outcomes == ["retrying"] * (jobs.MAX_ATTEMPTS - 1) + ["dead"]
+    job = load_job(worker, job_id)
+    assert job.status == "dead"
+    assert job.last_error is not None and "CalledProcessError" in job.last_error
+
+
+@pytest.mark.parametrize(("started_minutes_ago", "outcome"), [(1, "skipped"), (30, "succeeded")])
+def test_running_job_is_taken_over_only_after_its_lease_ends(
+    worker: WorkerContext, upstream: Path, started_minutes_ago: int, outcome: str
+) -> None:
+    job_id = queue_job(worker, "sync_repo", add_repo(worker))
+    started = datetime.now(UTC) - timedelta(minutes=started_minutes_ago)
+    with worker.session_factory() as session, session.begin():
+        # As if another worker claimed it and then died.
+        session.execute(
+            update(Job).where(Job.id == job_id).values(status="running", started_at=started)
+        )
+
+    assert run_job(worker, job_id) == outcome
+```
+
+The failing job is real: there's no Git repository at the address the worker clones from, so `git clone` fails, and `CalledProcessError` is the exception Python raises when a program it started (here `git`, run through the standard library's `subprocess` module, shown in lesson 5.3) exits with an error.
+
+### Green: `atlas/jobs.py`
+
+`run_job` runs one delivery and returns what happened, as a word the logs and tests can check:
+
+```python
+def run_job(ctx: WorkerContext, job_id: int) -> str:
+    job = _claim(ctx, job_id)
+    if job is None:
+        return "skipped"
+
+    try:
+        with ctx.session_factory() as session, session.begin():
+            _run_handler(ctx, session, job)
+            # Same transaction as the handler's writes: either both happen or neither does.
+            # If the worker dies before this commits, the next delivery redoes the work.
+            session.execute(
+                update(Job)
+                .where(Job.id == job.id)
+                .values(status="succeeded", finished_at=datetime.now(UTC), last_error=None)
+            )
+    except github.RateLimited as error:
+        delay = (error.retry_at - datetime.now(UTC)).total_seconds() + 1
+        _requeue(ctx, job, str(error), delay, undo_attempt=True)
+        return "deferred"
+    except Exception as error:
+        logger.exception("job failed", extra={"job_id": job.id, "kind": job.kind})
+        if job.attempts >= MAX_ATTEMPTS:
+            _mark_dead(ctx, job, describe(error))
+            return "dead"
+        _requeue(ctx, job, describe(error), backoff_seconds(job.attempts))
+        return "retrying"
+    return "succeeded"
+```
+
+`except Exception` is usually a smell; here it's the job of this function. A worker must survive any one job's failure, record it, and move on. The traceback still reaches the logs through `logger.exception`, in the JSON format from lesson 4.15. The `RateLimited` branch is lesson 5.3's.
+
+The claim is one statement, so two workers can't both win it:
+
+```python
+def _claim(ctx: WorkerContext, job_id: int) -> Job | None:
+    now = datetime.now(UTC)
+    is_waiting = Job.status == "queued"
+    is_abandoned = (Job.status == "running") & (Job.started_at < now - LEASE)
+    with ctx.session_factory() as session, session.begin():
+        job = session.scalar(
+            update(Job)
+            .where(Job.id == job_id, is_waiting | is_abandoned)
+            .values(status="running", started_at=now, attempts=Job.attempts + 1)
+            .returning(Job)
+        )
+        if job is not None:
+            session.expunge(job)
+        return job
+```
+
+In SQLAlchemy expressions, `&` means SQL `AND` and `|` means `OR` (Python's `and` and `or` can't be redefined, so the library uses these operators). `RETURNING` (lesson 3.2) hands back the updated row, or nothing if the `WHERE` matched no row. Postgres locks the row while updating it, so if two workers race, the second waits, then re-checks the `WHERE` against the committed row, finds `running`, and matches nothing. `expunge` detaches the object from the session, so it can be read after the session closes.
+
+Backoff with full jitter is three lines:
+
+```python
+def backoff_seconds(attempts: int, base: float = 30, cap: float = 3600) -> float:
+    ceiling = min(cap, base * 2 ** (attempts - 1))
+    return random.uniform(0, ceiling)
+```
+
+`_requeue` sets the job back to `queued` with its error, commits, and *then* sends the id with a delay. Commit-then-send is deliberate: a worker that received the id before the commit would find the job still `running` and skip it.
+
+### The worker loop
+
+`atlas/worker.py` holds the loop. It acknowledges after running, never before:
+
+```python
+def work(ctx, stop, wait_seconds=WAIT_SECONDS, stop_when_idle=False) -> int:
+    handled = 0
+    while not stop.is_set():
+        job_id = ctx.queue.receive(wait_seconds=wait_seconds)
+        if job_id is None:
+            if stop_when_idle:
+                break
+            continue
+
+        outcome = run_job(ctx, job_id)
+        # Acknowledge after running, never before: if this process dies mid-job, the
+        # message reappears after the visibility timeout and another worker finishes it.
+        ctx.queue.ack(job_id)
+        handled += 1
+        logger.info("job handled", extra={"job_id": job_id, "outcome": outcome})
+    return handled
+```
+
+`stop` is a `threading.Event`, a flag that is safe to set from a signal handler. `stop_on_signals()` sets it on Ctrl+C or `SIGTERM`, the signal Docker and ECS send before killing a container, so a job that has started gets to finish (lesson 2.1's graceful stop, now for real). The real signature has type hints; they're trimmed here.
+
+The command line gains `atlas worker`, `atlas sync <repo>` (queue a sync now) and `atlas jobs` (recent jobs). A real session against the development database:
+
+```text
+$ atlas sync pytorch/ignite
+sync_repo: job 23
+sync_issues: job 24
+$ atlas worker          # stopped with kill -TERM after 4 seconds
+{"time": "2026-11-19T13:08:08.659503+00:00", "level": "INFO", "logger": "atlas", "message": "worker started", "request_id": null}
+{"time": "2026-11-19T13:08:09.301603+00:00", "level": "INFO", "logger": "atlas.worker", "message": "job handled", "request_id": null, "job_id": 23, "outcome": "succeeded"}
+{"time": "2026-11-19T13:08:09.443862+00:00", "level": "ERROR", "logger": "atlas.jobs", "message": "job failed", "request_id": null, "job_id": 24, "kind": "sync_issues", "exception": "Traceback ..."}
+{"time": "2026-11-19T13:08:09.450936+00:00", "level": "INFO", "logger": "atlas.worker", "message": "job handled", "request_id": null, "job_id": 24, "outcome": "retrying"}
+{"time": "2026-11-19T13:08:12.060409+00:00", "level": "INFO", "logger": "atlas.worker", "message": "stopping after the current job", "request_id": null, "signal": 15}
+$ atlas jobs
+   24  sync_issues  queued     1  pytorch/ignite  GitHubError: GitHub answered 403: {"message":"GitHub access to this re...
+   23  sync_repo    succeeded  1  pytorch/ignite
+```
+
+The issues sync failed for a real reason: the machine this lesson was written on could clone from GitHub but was not allowed to call GitHub's API (its network proxy answered 403). That's exactly the kind of failure retries exist for. The job went back to `queued` with its error recorded and one attempt used, and the worker carried on. The exit code after `SIGTERM` was 0.
+
+## Trade-offs: which queue? *(deep dive)*
+
+- **A Redis list with in-flight bookkeeping** (Atlas locally). Fast, already needed for caching (lesson 5.5), and small enough to read in full. The cost: the visibility timeout is Atlas's own code, and Redis keeps data in memory, so a Redis restart without persistence loses queued messages. Atlas covers that from the other side: the job rows are in Postgres, and lesson 5.2's scheduler re-sends jobs that never started.
+- **Amazon SQS** (Atlas on AWS, Part 7). Visibility timeouts, delays and dead-letter queues are built in, it's durable, and there's nothing to run. It can't be run locally exactly, which is why Atlas has the small `JobQueue` protocol.
+- **Postgres only** (`SELECT ... FOR UPDATE SKIP LOCKED`). The jobs table *is* the queue; workers poll it. One fewer service, and job state and queue can't disagree. It costs database load and polling latency, and it's a fine choice for small systems. Atlas uses a separate queue because SQS is what the AWS part teaches.
+- **Celery, RQ, Dramatiq, arq.** Libraries that bundle a queue protocol, workers, retries and scheduling. They save code, and hide exactly the mechanisms this lesson is about. After this lesson you can read their documentation and know what each setting means; their defaults are not always at least once (Celery acknowledges *before* running a task unless `acks_late` is set).
+
+## Common mistakes
+
+- **Acknowledging before the work.** One crash and the job is lost. Ack last.
+- **Putting the job's data in the message.** A retried message carries yesterday's instructions; put an id in the message and the state in the database.
+- **Assuming exactly once.** Every consumer of an at-least-once queue must cope with duplicates. Ask "what if this runs twice?" of every job.
+- **Retrying immediately and forever.** Backoff with jitter, and a limit after which a person looks.
+- **Counting on `status = 'running'` alone.** Without a lease, a worker that dies mid-job blocks that job forever.
+- **Waiting longer than your own timeouts.** The `BLMOVE` bug above.
+- **Sending before committing.** The worker gets an id whose row doesn't exist yet (or isn't visible), skips it, and acknowledges it.
+
+## Check yourself
+
+**1.** The plain-list worker in "The problem" used `RPOP`; the safe one uses `LMOVE`. Why is the difference about *when* the job leaves Redis?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`RPOP` deletes the id as it's taken, so from that moment the only copy is in the worker's memory, and a crash loses it. `LMOVE` moves it to the in-flight list in the same atomic step; it leaves Redis only when the worker acknowledges, after the work. A crash in between leaves it in flight, and the visibility timeout brings it back.
+:::
+
+**2.** A worker finishes syncing a repository, commits `status = 'succeeded'`, and dies before calling `ack`. What happens next, and is anything done twice?
+
+::: {.callout-tip collapse="true" title="Answer"}
+After the visibility timeout, the id is delivered again. The next worker's claim (`UPDATE ... WHERE status = 'queued'`) matches no row because the job is `succeeded`, so `run_job` returns `"skipped"` and the worker acknowledges it. Nothing is done twice. If it had died *before* the commit, the work's writes would have been rolled back with it, and the next delivery would redo all of it.
+:::
+
+**3.** Why does the backoff choose a random delay instead of exactly 30, 60, 120 seconds?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Jobs that fail together (in one outage) would otherwise retry together, at the same moments, and hit the recovering service as one burst each time. Random delays spread the retries out.
+:::
+
+## Exercise
+
+Write a test for a job that fails twice and then succeeds: it should end `succeeded` with `attempts == 3` and no `last_error`. Hint: don't use the `upstream` fixture; create the Git repository at `tmp_path / "remotes" / "pytorch" / "ignite.git"` after the second run, with `git init` and the `git_commit` helper from `tests/conftest.py`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_job_that_fails_twice_then_succeeds(worker: WorkerContext, tmp_path: Path) -> None:
+    job_id = queue_job(worker, "sync_repo", add_repo(worker))
+    first, second = run_job(worker, job_id), run_job(worker, job_id)
+
+    path = tmp_path / "remotes" / "pytorch" / "ignite.git"
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    (path / "engine.py").write_text("x = 1\n")
+    git_commit(path, "first")
+    third = run_job(worker, job_id)
+
+    job = load_job(worker, job_id)
+    assert (first, second, third) == ("retrying", "retrying", "succeeded")
+    assert (job.status, job.attempts, job.last_error) == ("succeeded", 3, None)
+```
+It passes against the reference code: `last_error` is cleared by the same `UPDATE` that sets `succeeded`.
+:::
+
+## Stretch
+
+Dead jobs wait for a person. Write `revive(ctx, job_id) -> bool`, which puts a dead job back in the queue with its attempts reset, and returns `False` (doing nothing) for a job that isn't dead. Test first.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def revive(ctx: WorkerContext, job_id: int) -> bool:
+    with ctx.session_factory() as session, session.begin():
+        revived = session.scalar(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "dead")
+            .values(status="queued", attempts=0, finished_at=None)
+            .returning(Job.id)
+        )
+    if revived is None:
+        return False
+    ctx.queue.send(job_id)  # after the commit, as always
+    return True
+```
+The test marks a job dead with an `UPDATE`, revives it, runs it to `succeeded`, then checks that a second `revive` returns `False`. One catch: if a new pending job of the same kind was created for the repository meanwhile, the `UPDATE` breaks the one-pending-job rule from lesson 5.2 and raises `IntegrityError`; deciding what should happen then is part of the stretch. Not in the reference code.
+:::
+
+## What changed in the project
+
+Redis in `compose.yml` and CI; new `atlas/queue.py` (`RedisQueue`, `JobQueue`, `WAIT_SECONDS`), `atlas/jobs.py` (create, claim, run, retry, dead), `atlas/worker.py` (worker loop, graceful stop); `jobs` table (migration `0004`); `atlas worker`, `atlas sync`, `atlas jobs`; tests in `test_queue.py`, `test_jobs.py`, `test_worker.py`. Commits: `feat: Added a Redis job queue with at-least-once delivery, and replaced MinIO with SeaweedFS in the plans`, `feat: Added background jobs with a worker, scheduler, sync routes and GitHub webhooks`, `fix: Kept the worker's queue wait below the Redis socket timeout`.

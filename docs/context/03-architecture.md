@@ -33,7 +33,7 @@ flowchart LR
 | Postgres | All durable state, full-text search, vectors (pgvector) | One database keeps the course simpler than adding a vector DB |
 | Redis | Local queue, cache, rate limits | Fast shared state between processes |
 
-The queue carries only ids (`{"job": "ingest", "repo_id": 3}`); the job's state lives in Postgres. This makes jobs idempotent and inspectable.
+The queue carries only a job id; the job's kind, repository, status, attempts and last error live in the Postgres `jobs` table. This makes jobs idempotent and inspectable (lessons 5.1 to 5.3, decision D26).
 
 ## LLM and embedding providers
 

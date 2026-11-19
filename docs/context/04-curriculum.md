@@ -68,7 +68,7 @@ Parts 1 to 8 end with a **Review and practice** lesson: mixed exercises without 
 
 ## Part 4: Building APIs with FastAPI (20)
 
-This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources. Its depth pass ([08-depth-pass.md](08-depth-pass.md)) makes lessons failure-first and test-first from 4.5, and adds "Attack it" sections to the security lessons.
+This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources. Its depth pass (decision D22, `docs/context/08-depth-pass.md`) makes lessons failure-first and test-first from 4.5, and adds "Attack it" sections to the security lessons.
 
 | Id | Lesson | Builds |
 |---|---|---|

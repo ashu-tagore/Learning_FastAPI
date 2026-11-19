@@ -26,10 +26,12 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 ```bash
 cd atlas && docker compose up -d                           # local Postgres (Part 3 onward)
 export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
-cd atlas && uv sync && uv run pytest                       # reference tests (DB tests skip without TEST_DATABASE_URL)
+export TEST_REDIS_URL=redis://localhost:6379/15             # queue tests (Part 5 onward)
+cd atlas && uv sync && uv run pytest                       # reference tests (DB and Redis tests skip without their URLs)
 cd atlas && uv run atlas init-db                           # run migrations (needs DATABASE_URL)
 cd atlas && uv run alembic revision --autogenerate -m "..."  # new migration; review it, rename the revision to the next number
 cd atlas && SECRET_KEY=dev-only-key-at-least-32-characters-long WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload --no-access-log  # API + web UI at /app; JSON request logs (lesson 4.15)
+cd atlas && uv run atlas worker                            # background jobs (lesson 5.1); `atlas scheduler` queues syncs (5.2)
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)

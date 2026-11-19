@@ -1,0 +1,551 @@
+---
+title: "5.3 Syncing with GitHub properly: conditional requests, rate limits, incremental sync by commit"
+description: "Stop re-fetching and re-indexing everything every fifteen minutes: ask GitHub only for what changed, let unchanged polls cost nothing, wait out rate limits instead of fighting them, and re-index only the files a commit touched."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 3 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers watermarks, clocks, partial clones and what a fake can't prove.
+:::
+
+::: {.callout-note title="Analogy: the newspaper and the bookmark"}
+Reading the whole newspaper archive every morning to find today's news would be absurd. You keep a bookmark at the last page you read, and start from there. And if the paper boy can tell you "nothing new since yesterday" at the door, you don't even open it.
+
+The **bookmark** is a watermark: the last commit Atlas indexed, and the newest issue update it has seen. "Nothing new" at the door is a `304 Not Modified`.
+:::
+
+## The problem
+
+Lessons 5.1 and 5.2 made syncing automatic: every repository, every 15 minutes, plus a webhook per push. Two costs come with that.
+
+**Re-indexing everything.** The simplest sync job would do what `atlas index` does: re-index the whole repository each time. For `pytorch/ignite` that's 403 files and 2,437 chunks, every run, even when nothing changed, and each run deletes and rewrites every row in `documents` and `chunks`. Measured on the development machine with the real job code:
+
+```text
+full re-index of the same clone: 403 files, 2437 chunks in 1.47s
+```
+
+A second and a half isn't much once. It's 96 times a day per repository, plus every push, and it grows with the repository: a codebase ten times larger costs ten times as much, to find that three files changed.
+
+**Fetching every issue.** The issues fetch from lesson 2.5 asks GitHub for every matching open issue each time. Every request counts against GitHub's **rate limit**: 60 requests an hour without a token, 5,000 with one. One repository with a few hundred open issues needs several pages of 100 each; poll ten repositories every 15 minutes and much of the hour's budget goes on downloading data Atlas already has.
+
+The obvious fix for issues is to ask GitHub only for issues updated since the last poll (its API has a `since` parameter for exactly this). But Atlas's storage code was written for complete lists. `save_issues` makes the stored issues *match* the list it's given, deleting anything not in it. Here's what happens when it receives only the changed issues, run against a real database:
+
+```text
+save_issues: stored before: [1, 2, 3]
+save_issues: stored after:  [2]
+```
+
+Issue 2's title was edited, so the incremental poll returned only issue 2, and `save_issues` concluded that 1 and 3 no longer exist. Two perfectly good issues deleted, silently. Incremental sync needs different storage rules, not just a different request.
+
+## Theory
+
+### Watermarks
+
+A **watermark** is a saved marker of how far a process has got, so the next run starts there. Atlas keeps two, on the `repos` row:
+
+- `indexed_commit`: the commit the stored index reflects.
+- `issues_synced_until`: the newest `updated_at` among issues seen so far.
+
+The issues watermark is a time from **GitHub's** clock, read from the data, never from Atlas's clock. If Atlas used "now" from its own server, and its clock ran two minutes fast, every issue updated in those two minutes would be skipped forever. Taking the time from the data means the two machines' clocks never need to agree.
+
+### Asking for changes only
+
+GitHub's issues endpoint takes:
+
+| Parameter | Atlas sends | Why |
+|---|---|---|
+| `since` | the watermark | only issues updated at or after it (the docs say "after"; Atlas assumes either and copes) |
+| `state` | `open` on the first sync, `all` after | an issue *closed* since the last poll has to be seen, so it can be removed |
+| `sort`, `direction` | `updated`, `asc` | oldest changes first, explained below |
+
+With `state=all`, each issue in the answer is either open (store or update it) or closed (delete it). Issues that didn't change aren't in the answer at all, so they must be left alone. Those are the storage rules `save_issues` broke.
+
+Why oldest first? Atlas stops after `max_pages` pages (10, so 1,000 issues) to keep one job bounded. If the answer were newest first and got cut off, the watermark would jump to the newest update while the older changes on later pages were never fetched: a permanent gap. Oldest first, a cut-off leaves the watermark at the last change actually seen, and the next poll carries on from there.
+
+### Conditional requests
+
+HTTP has a built-in way to ask "has this changed?". A response can carry an **ETag** header: an identifier for that exact version of the content, like a fingerprint. The client saves it and sends it back on its next request for the same URL, in an `If-None-Match` header. If the content still has that ETag, the server answers **`304 Not Modified`** with no body: "what you have is current".
+
+GitHub's REST documentation adds the part that matters most here: a conditional request that gets `304` **does not count against the primary rate limit**, as long as it was made with an `Authorization` header. A poll that finds nothing new is free.
+
+For this to work, the URL must be identical. Atlas's watermark only moves when something changes, so on a quiet repository the URL stays the same poll after poll, and so does the ETag.
+
+### Rate limits
+
+When the limit is used up, GitHub answers `403` or `429` with `x-ratelimit-remaining: 0` and `x-ratelimit-reset` set to the moment the limit resets, in **epoch seconds** (seconds since 1 January 1970, UTC). A **secondary** rate limit, for too many requests too quickly, may instead send `retry-after`, a number of seconds to wait.
+
+The documentation is explicit: don't retry before then. Hitting a rate limit isn't the job's fault, so it shouldn't use up one of its five attempts either. Atlas raises a specific exception, `RateLimited`, carrying the time to retry, and the job runner re-queues the job for exactly then, with the attempt given back.
+
+### Incremental indexing by commit
+
+Git already knows what changed between two commits:
+
+```text
+git diff --name-status --no-renames <old> <new>
+```
+
+prints one line per changed file: a letter (`A` added, `M` modified, `D` deleted) and the path. `--no-renames` reports a renamed file as a delete plus an add, which is exactly what re-indexing needs: the old path's chunks go, the new path's come in. On the Ignite clone, the 30 commits before `0abbcab`:
+
+```text
+HEAD~30..HEAD: 82 changed, 0 deleted
+```
+
+Re-indexing means deleting the stored documents for those paths, and re-reading the ones that still exist and are wanted (the right extension, not in a skipped folder like `.git` or `node_modules`). Everything else is untouched.
+
+If the old commit isn't in the clone at all (the worker's disk was replaced and upstream history was rewritten), there's nothing to diff against. Then Atlas falls back to a full index. Correct first, fast when possible.
+
+```{mermaid}
+flowchart TD
+    A[sync_repo job] --> B[git fetch and reset to origin/HEAD]
+    B --> C{indexed_commit?}
+    C -->|same as HEAD| D[nothing to do]
+    C -->|known to the clone| E[git diff old..HEAD]
+    E --> F[re-index changed, drop deleted]
+    C -->|missing or unknown| G[full index]
+    D --> H[indexed_commit = HEAD]
+    F --> H
+    G --> H
+```
+
+## In the project
+
+### Red: new storage rules for issues
+
+The fix for the deleted issues is a storage function with the incremental rules, `apply_issue_changes(session, repo, open_issues, closed_numbers)`, and `save_issues` becomes a thin caller of it for the complete-list case. The same experiment as in "The problem", through the new function:
+
+```text
+apply_issue_changes: stored before: [1, 2, 3]
+apply_issue_changes: stored after:  [1, 2, 3]
+```
+
+```python
+def apply_issue_changes(
+    session: Session,
+    repo_full_name: str,
+    open_issues: list[github.Issue],
+    closed_numbers: list[int],
+) -> None:
+    """Store new and updated open issues, and remove closed ones (lesson 5.3)."""
+    repo = get_or_create_repo(session, repo_full_name)
+    labels_by_name = {
+        label.name: label
+        for label in session.scalars(select(Label).where(Label.repo_id == repo.id))
+    }
+    stored_by_number = {
+        issue.number: issue
+        for issue in session.scalars(select(Issue).where(Issue.repo_id == repo.id))
+    }
+
+    for number in closed_numbers:
+        stored = stored_by_number.get(number)
+        if stored is not None:
+            session.delete(stored)
+
+    for fetched in open_issues:
+        row = stored_by_number.get(fetched.number)
+        if row is None:
+            row = Issue(repo_id=repo.id, number=fetched.number)
+            session.add(row)
+        row.title = fetched.title
+        # ... the other fields, as save_issues did ...
+
+    session.flush()
+
+
+def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:
+    """Make the stored open issues match the fetched list; return how many are stored."""
+    repo = get_or_create_repo(session, repo_full_name)
+    stored_numbers = set(session.scalars(select(Issue.number).where(Issue.repo_id == repo.id)))
+    no_longer_open = stored_numbers - {issue.number for issue in issues}
+    apply_issue_changes(session, repo_full_name, issues, list(no_longer_open))
+    return len(issues)
+```
+
+One storage rule, two callers: `save_issues` works out which issues disappeared (it has the complete list) and hands them over as closed. All existing storage and API tests pass unchanged.
+
+### A fake that behaves like GitHub
+
+Testing conditional requests needs a GitHub that changes over time and honours `since`, `state` and `If-None-Match`. The development machine for this course couldn't reach GitHub's API (its network allowed cloning from GitHub but not API calls), and tests shouldn't depend on the internet anyway. So `tests/fake_github.py` gains `FakeIssueTracker`, an in-memory repository of issues answering through `httpx.MockTransport` (lesson 2.6's tool; a fake at the process boundary, as lesson 4.19 recommends):
+
+```python
+def handle(self, request: httpx.Request) -> httpx.Response:
+    self.requests.append(request)
+    if self.rate_limited_until is not None:
+        reset = str(self.rate_limited_until)
+        headers = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}
+        return httpx.Response(403, json={"message": "API rate limit exceeded"}, headers=headers)
+    # ... 404 for other paths ...
+
+    wanted_state = request.url.params.get("state", "open")
+    since = request.url.params.get("since", "")
+    matching = [
+        issue
+        for issue in self.issues.values()
+        if (wanted_state == "all" or issue["state"] == wanted_state)
+        and str(issue["updated_at"]) >= since  # ISO 8601 in UTC sorts as text
+    ]
+    matching.sort(key=lambda issue: str(issue["updated_at"]))
+
+    body = httpx.Response(200, json=matching).content
+    etag = f'"{hashlib.sha256(request.url.query + body).hexdigest()[:16]}"'
+    if request.headers.get("If-None-Match") == etag:
+        return httpx.Response(304, headers={"etag": etag})
+    return httpx.Response(200, content=body, headers={"etag": etag})
+```
+
+Its ETag is a hash of the query and the answer, so it changes exactly when either does, as GitHub's does. Be clear about what this proves: that Atlas uses the protocol correctly *as GitHub documents it*. It can't prove GitHub behaves as documented. The `304`-is-free rule, for example, comes from GitHub's documentation, not from a measurement here.
+
+### Red: what a poll must return
+
+`tests/test_github_changes.py`:
+
+```python
+def test_unchanged_repository_answers_304_and_changes_nothing() -> None:
+    tracker = FakeIssueTracker()
+    tracker.put(1, "Open", "2026-11-01T10:00:00Z")
+    first = poll(tracker, since=None, etag=None)
+    second = poll(tracker, since=first.newest_update, etag=None)
+
+    third = poll(tracker, since=second.newest_update, etag=second.etag)
+
+    assert third.not_modified
+    assert third.newest_update == second.newest_update
+    assert tracker.requests[-1].headers["If-None-Match"] == second.etag
+
+
+def test_later_poll_sees_new_updated_and_closed_issues_only() -> None:
+    tracker = FakeIssueTracker()
+    tracker.put(1, "Will be closed", "2026-11-01T10:00:00Z")
+    tracker.put(2, "Untouched", "2026-11-01T11:00:00Z")
+    first = poll(tracker, since=None, etag=None)
+
+    tracker.put(1, "Will be closed", "2026-11-05T10:00:00Z", state="closed")
+    tracker.put(3, "Brand new", "2026-11-05T11:00:00Z")
+    changes = poll(tracker, since=first.newest_update, etag=first.etag)
+
+    assert changes.closed_numbers == [1]
+    # Issue 2 was last updated exactly at `since`. GitHub's docs don't say whether such an
+    # issue is included; this fake includes it, and storing it again is harmless.
+    assert [issue.number for issue in changes.open_issues] == [2, 3]
+    assert changes.newest_update == datetime(2026, 11, 5, 11, tzinfo=UTC)
+    assert tracker.requests[-1].url.params["state"] == "all"
+```
+
+Two more check the first poll and both kinds of rate limit. The secondary limit's test was added after reading the rate-limit documentation for this lesson: the first version of `check_response` only knew about `x-ratelimit-remaining`, and the test failed with `GitHubError: GitHub answered 403: {"message":"You have exceeded a secondary rate limit."}`, a plain error that would have been retried after a random 0 to 30 seconds, sooner than GitHub allows.
+
+### Green: `github.fetch_issue_changes`
+
+```python
+@dataclass(frozen=True)
+class IssueChanges:
+    not_modified: bool  # GitHub answered 304: nothing changed, and the poll cost no quota
+    open_issues: list[Issue]  # new or updated, still open: store them
+    closed_numbers: list[int]  # closed since the last poll: remove them
+    etag: str | None  # send back as If-None-Match next time
+    newest_update: datetime | None  # the next poll asks for changes since this moment
+```
+
+```python
+params: dict[str, str | int] = {"sort": "updated", "direction": "asc", "per_page": 100}
+if since is None:
+    params["state"] = "open"
+else:
+    # state=all: an issue closed since the last poll must be seen, to be removed.
+    params["state"] = "all"
+    params["since"] = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+conditional = {"If-None-Match": etag} if etag else {}
+
+async with httpx.AsyncClient(...) as client:
+    response = await client.get(f"/repos/{repo}/issues", params=params, headers=conditional)
+    if response.status_code == 304:
+        return IssueChanges(True, [], [], etag, since)
+    check_response(response)
+    first_page_etag = response.headers.get("etag")
+
+    open_issues: list[Issue] = []
+    closed_numbers: list[int] = []
+    newest_update = since
+    for _ in range(max_pages):
+        for item in response.json():
+            updated_at = datetime.fromisoformat(item["updated_at"])
+            if newest_update is None or updated_at > newest_update:
+                newest_update = updated_at
+            # The issues endpoint also returns pull requests; they carry this key.
+            if "pull_request" in item:
+                continue
+            if item["state"] == "closed":
+                closed_numbers.append(item["number"])
+            else:
+                open_issues.append(parse_issue(item))
+
+        next_page = response.links.get("next")
+        if next_page is None:
+            break
+        response = await client.get(next_page["url"])
+        check_response(response)
+
+return IssueChanges(False, open_issues, closed_numbers, first_page_etag, newest_update)
+```
+
+The ETag saved is the first page's, because the first page's URL is the one the next poll repeats. Pull requests still move the watermark (they were seen) but are never stored. `response.links` is httpx's parsed `Link` header, which `fetch_issues` has followed since lesson 2.5.
+
+`check_response` gains the rate-limit cases:
+
+```python
+out_of_requests = response.headers.get("x-ratelimit-remaining") == "0"
+if out_of_requests:
+    reset_epoch = int(response.headers.get("x-ratelimit-reset", "0"))
+    reset_at = datetime.fromtimestamp(reset_epoch, tz=UTC)
+    message = f"GitHub rate limit reached; it resets at {reset_at:%H:%M UTC}"
+    raise RateLimited(message, retry_at=reset_at)
+
+# A secondary rate limit (too many requests too quickly) may name its own wait instead.
+retry_after = response.headers.get("retry-after")
+if retry_after is not None:
+    retry_at = datetime.now(UTC) + timedelta(seconds=int(retry_after))
+    raise RateLimited(f"GitHub asked to wait {retry_after} seconds", retry_at=retry_at)
+```
+
+`RateLimited` is a subclass of `GitHubError`, so the CLI's existing `except GitHubError` still prints a friendly message, and only the job runner treats it specially.
+
+### The `sync_issues` job
+
+```python
+def sync_issues(session, repo, settings, transport=None) -> github.IssueChanges:
+    token = settings.github_token.get_secret_value() if settings.github_token else None
+    changes = asyncio.run(
+        github.fetch_issue_changes(
+            repo.full_name,
+            since=repo.issues_synced_until,
+            etag=repo.issues_etag,
+            token=token,
+            transport=transport,
+        )
+    )
+    if changes.not_modified:
+        return changes
+
+    storage.apply_issue_changes(
+        session, repo.full_name, changes.open_issues, changes.closed_numbers
+    )
+    repo.issues_etag = changes.etag
+    repo.issues_synced_until = changes.newest_update
+    return changes
+```
+
+The worker is synchronous, so `asyncio.run` (lesson 2.6) runs the async GitHub client to completion. The watermark and the issues are written in the same transaction as the job's `succeeded` (lesson 5.1), so they can never disagree: if the job dies before committing, neither moved, and the next poll asks again from the old watermark.
+
+`run_job` already handles `RateLimited` (lesson 5.1 showed the branch): re-queue for `retry_at`, attempts unchanged. Its test:
+
+```python
+def test_rate_limited_job_waits_for_the_reset_without_using_an_attempt(
+    worker: WorkerContext, issue_tracker: FakeIssueTracker, clock: FakeClock
+) -> None:
+    reset_in = 600
+    issue_tracker.rate_limited_until = int(datetime.now(UTC).timestamp()) + reset_in
+    job_id = queue_job(worker, "sync_issues", add_repo(worker))
+    worker.queue.receive(wait_seconds=0)
+
+    assert run_job(worker, job_id) == "deferred"
+    worker.queue.ack(job_id)
+
+    job = load_job(worker, job_id)
+    assert (job.status, job.attempts) == ("queued", 0)
+    clock.advance(reset_in - 10)
+    assert worker.queue.receive(wait_seconds=0) is None
+    clock.advance(20)
+    assert worker.queue.receive(wait_seconds=0) == job_id
+```
+
+The test first forgot the `ack` line and failed: the original delivery, never acknowledged, came back after the 60-second test visibility timeout, before the deferral was due. That's the worker loop's job (it always acks after `run_job`), and the test now does what the loop does.
+
+### Incremental code sync
+
+`atlas/gitrepo.py` wraps the few Git commands Atlas needs. It runs them with `subprocess.run` from Python's standard library, which starts another program and waits for it; `capture_output=True` collects what it prints, and `check=True` raises `CalledProcessError` if it exits with an error. All of the commands only read: Atlas never writes to GitHub.
+
+```python
+def clone_or_update(url: str, path: Path) -> str:
+    """Make path a copy of url's default branch at its newest commit; return that commit."""
+    is_cloned = (path / ".git").exists()
+    if is_cloned:
+        git("fetch", "--quiet", "origin", cwd=path)
+        # The clone is only ever read, so throwing away local state is safe.
+        git("reset", "--quiet", "--hard", "origin/HEAD", cwd=path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # blob:none: full history of commits and trees, file contents fetched only when
+        # needed. Diffing two commits by file name needs history but no contents.
+        git("clone", "--quiet", "--filter=blob:none", url, str(path), cwd=path.parent)
+    return git("rev-parse", "HEAD", cwd=path)
+```
+
+`changes_between` parses `git diff --name-status --no-renames` into `Changes(changed, deleted)`, and `has_commit` asks `git cat-file -e <commit>^{commit}` whether the clone knows a commit. In `storage.py`, the part of `index_folder` that reads one file became `read_document`, so a new `update_index` can reuse it for just the changed paths:
+
+```python
+def update_index(session, repo_full_name, root, *, changed, deleted, extensions=..., chunk_lines=40):
+    """Re-index only the files a commit changed (lesson 5.3); every other file is untouched."""
+    repo = get_or_create_repo(session, repo_full_name)
+    session.execute(
+        delete(Document).where(Document.repo_id == repo.id, Document.path.in_([*changed, *deleted]))
+    )
+
+    for relative in changed:
+        path = root / relative
+        is_wanted = path.suffix in extensions and not is_in_skipped_folder(Path(relative))
+        if not is_wanted:
+            continue
+        document = read_document(repo, root, path, chunk_lines)
+        # ... count it, or count it as skipped if it isn't text ...
+```
+
+The `sync_repo` job decides between the three cases from the diagram:
+
+```python
+def sync_repo(session: Session, repo: Repo, settings: Settings) -> storage.IndexSummary:
+    path = Path(settings.repos_dir) / repo.full_name
+    url = f"{settings.git_base_url}/{repo.full_name}.git"
+    head = gitrepo.clone_or_update(url, path)
+
+    previous = repo.indexed_commit
+    can_diff = previous is not None and gitrepo.has_commit(path, previous)
+    if previous == head:
+        summary = storage.IndexSummary(documents=0, chunks=0, skipped=0)
+    elif can_diff:
+        assert previous is not None  # can_diff implies it; this tells mypy
+        changes = gitrepo.changes_between(path, previous, head)
+        summary = storage.update_index(
+            session, repo.full_name, path, changed=changes.changed, deleted=changes.deleted
+        )
+    else:
+        # First sync, or history was rewritten upstream: nothing to diff against.
+        summary = storage.index_folder(session, repo.full_name, path)
+    repo.indexed_commit = head
+    return summary
+```
+
+`REPOS_DIR` (default `~/.cache/atlas/repos`) is where clones live; `GIT_BASE_URL` (default `https://github.com`) is where they come from, so tests can point it at a local folder of Git repositories. The test, with real Git:
+
+```python
+def test_second_sync_indexes_only_what_changed(worker: WorkerContext, upstream: Path) -> None:
+    repo_id = add_repo(worker)
+    run_job(worker, queue_job(worker, "sync_repo", repo_id))
+    (upstream / "engine.py").write_text("class Engine:\n    def run(self):\n        return 1\n")
+    (upstream / "README.md").unlink()
+    (upstream / "metrics.py").write_text("def accuracy():\n    return 1.0\n")
+    head = git_commit(upstream, "second commit")
+
+    with worker.session_factory() as session:
+        untouched_before = session.scalars(select(Document.id)).all()
+    run_job(worker, queue_job(worker, "sync_repo", repo_id))
+
+    assert indexed_paths(worker) == ["engine.py", "metrics.py"]
+    with worker.session_factory() as session:
+        assert session.get_one(Repo, repo_id).indexed_commit == head
+        # engine.py changed, so its row was replaced: no id survives from the first index.
+        assert set(session.scalars(select(Document.id))).isdisjoint(untouched_before)
+```
+
+And on the real Ignite clone, with `indexed_commit` set 30 commits back:
+
+```text
+first sync (clone + full index): 403 files, 2437 chunks in 3.74s
+HEAD~30..HEAD: 82 changed, 0 deleted
+sync after 30 commits (incremental): 66 files, 559 chunks in 0.72s
+sync with nothing new: 0 files, 0 chunks in 0.35s
+full re-index of the same clone: 403 files, 2437 chunks in 1.47s
+```
+
+Of 82 changed files, 66 had wanted extensions. The incremental sync took half the time of a full re-index, and most of what's left is `git fetch` talking to GitHub, which is also all that "nothing new" costs. On a typical 15-minute interval, with zero to a few commits, Atlas now does almost no work. And the database writes shrink from every row to the changed ones, which matters more than the seconds: other queries (searches) no longer compete with a full rewrite of the index.
+
+## Trade-offs *(deep dive)*
+
+**Watermark by time vs by cursor.** Some APIs give an opaque "changes since token" instead of a time. Times are simpler and readable, but ties are possible (two issues updated in the same second). Atlas asks for updates *at or after* the watermark and accepts seeing the boundary issue twice; storing it again is idempotent. Asking for strictly *after* would risk missing the second of two same-second updates.
+
+**Polling with ETags vs only webhooks.** The `issues` webhook from lesson 5.2 tells Atlas immediately; the poll catches what webhooks miss. With ETags, the poll on a quiet repository is one free request, so keeping it costs almost nothing.
+
+**Partial clones.** `--filter=blob:none` skips file contents in the initial clone and fetches them when checked out. For Atlas, which checks out the default branch, the gain is in not downloading every *old* version of every file. Note that cloning from a local folder ignores the filter (Git prints `filtering not recognized by server, ignoring`), so the tests use full clones; GitHub supports it.
+
+**Rewritten history.** If upstream force-pushes, the old `indexed_commit` may still be in the worker's clone (Git keeps unreachable commits until it cleans up), in which case the diff still works: `git diff` compares two snapshots, not the path between them. Only when the clone truly doesn't know the commit, for example on a fresh worker disk, does Atlas fall back to a full index.
+
+**What the fake can't tell you.** The fake encodes the documentation. When the course's Part 7 deployment runs against the real API, the first real `304`s and rate-limit headers in the logs are the check that the docs and the fake agree.
+
+## Common mistakes
+
+- **Using your own clock for the watermark.** Clock skew loses updates. Use the data's timestamps.
+- **Asking for `state=open` with `since`.** Closed issues never come back, so they're never removed.
+- **Applying a partial list with "make it match" rules.** The deleted issues in "The problem".
+- **Newest-first with a page limit.** A cut-off leaves a permanent gap behind the watermark.
+- **Retrying a rate limit with ordinary backoff.** It wastes attempts and may extend the limit. Wait until the reset.
+- **Updating the watermark in a different transaction from the data.** A crash between them skips changes forever, or re-applies them; one transaction avoids both.
+- **Diffing with renames on.** A rename then shows as one line with two paths, and the old path's chunks are never deleted.
+
+## Check yourself
+
+**1.** Why must the issues watermark come from GitHub's `updated_at`, not from Atlas's `datetime.now()` at the time of the poll?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The two clocks differ. If Atlas's runs ahead of GitHub's, issues updated in that gap have an `updated_at` earlier than the saved watermark and are never asked for again. A watermark read from the data is on GitHub's own clock, so the next `since` is compared on the same clock.
+:::
+
+**2.** A quiet repository is polled every 15 minutes with a token. How many requests a day count against the rate limit for its issues?
+
+::: {.callout-tip collapse="true" title="Answer"}
+None, once the first poll has an ETag and as long as nothing changes: each poll repeats the same URL with `If-None-Match`, gets `304`, and GitHub's documentation says an authorized `304` doesn't count against the primary limit. (Without a token, the rule doesn't apply.)
+:::
+
+**3.** In `sync_repo`, why is `repo.indexed_commit = head` set in the same transaction as the index changes?
+
+::: {.callout-tip collapse="true" title="Answer"}
+If the index were committed and the worker died before the watermark was, the next sync would diff from the old commit and redo work (harmless). If the watermark were committed first and the index changes lost, the next sync would diff from the *new* commit and never re-index those files (harmful). One transaction makes both happen or neither.
+:::
+
+## Exercise
+
+What does `sync_repo` do when `indexed_commit` names a commit the clone doesn't have? Write a test: sync once, then set `indexed_commit` to `"0" * 40` (a commit that can't exist), sync again, and check that every document was re-created and `indexed_commit` is a real commit again.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_unknown_commit_means_a_full_index(worker: WorkerContext, upstream: Path) -> None:
+    repo_id = add_repo(worker)
+    run_job(worker, queue_job(worker, "sync_repo", repo_id))
+    with worker.session_factory() as session, session.begin():
+        session.get_one(Repo, repo_id).indexed_commit = "0" * 40
+        before = set(session.scalars(select(Document.id)))
+
+    assert run_job(worker, queue_job(worker, "sync_repo", repo_id)) == "succeeded"
+
+    with worker.session_factory() as session:
+        after = set(session.scalars(select(Document.id)))
+        head = session.get_one(Repo, repo_id).indexed_commit
+    assert len(after) == 2 and before.isdisjoint(after) and head != "0" * 40
+```
+It passes against the reference code: `has_commit` is false, so `index_folder` replaces every document. A first attempt that force-pushed a rewritten commit upstream and deleted the clone *didn't* trigger the fallback: the local upstream repository still had the old commit, and so did the new clone. Real history rewrites are less tidy than they sound.
+:::
+
+## Stretch
+
+Prove with a test, using `FakeIssueTracker.requests`, that polling an unchanged repository costs exactly one request once the ETag is known.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_unchanged_poll_costs_one_request() -> None:
+    tracker = FakeIssueTracker()
+    tracker.put(1, "Open", "2026-11-01T10:00:00Z")
+    first = poll(tracker, None, None)
+    second = poll(tracker, first.newest_update, None)
+    before = len(tracker.requests)
+
+    third = poll(tracker, second.newest_update, second.etag)
+
+    assert third.not_modified
+    assert len(tracker.requests) - before == 1
+```
+Why two polls before the measured one? The first poll's URL has `state=open` and no `since`; every later poll has `state=all&since=...`, a different URL, so the first poll's ETag can't match it. From the second poll on, the URL is stable. Passes against the reference code.
+:::
+
+## What changed in the project
+
+`github.py`: `RateLimited` (primary and secondary limits), `IssueChanges`, `fetch_issue_changes`; `storage.py`: `apply_issue_changes`, `read_document`, `update_index`; `search.py`: `is_in_skipped_folder`; new `gitrepo.py`; `repos` gains `indexed_commit`, `issues_etag`, `issues_synced_until` (migration `0004`); settings `REPOS_DIR`, `GIT_BASE_URL`, `SYNC_INTERVAL_MINUTES`; `FakeIssueTracker` and `test_github_changes.py`. Commits: `feat: Added the jobs table, sync state, git helpers and incremental index updates`, `feat: Handled GitHub's secondary rate limit`.

@@ -78,7 +78,9 @@ website:
       - section: "Part 5: Background work and integrations"
         href: part-5-background-work/index.qmd
         contents:
-          []
+          - part-5-background-work/01-queues-and-workers.qmd
+          - part-5-background-work/02-scheduling-and-webhooks.qmd
+          - part-5-background-work/03-syncing-with-github.qmd
       - section: "Part 6: AI engineering: Atlas"
         href: part-6-atlas-rag/index.qmd
         contents:

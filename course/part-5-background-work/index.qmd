@@ -8,9 +8,9 @@ title: "Part 5: Background work and integrations"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 5.1 | Queues and workers: at-least-once delivery, idempotency, retries, dead letters *(coming soon)* | Worker + Redis queue |
-| 5.2 | Scheduling and webhooks: cron, GitHub webhooks, HMAC signature checks *(coming soon)* | Scheduled sync, webhook route |
-| 5.3 | Syncing with GitHub properly: conditional requests, rate limits, incremental sync by commit *(coming soon)* | Incremental sync |
+| 5.1 | [Queues and workers: at-least-once delivery, idempotency, retries, dead letters](01-queues-and-workers.qmd) | Worker + Redis queue |
+| 5.2 | [Scheduling and webhooks: cron, GitHub webhooks, HMAC signature checks](02-scheduling-and-webhooks.qmd) | Scheduled sync, webhook route |
+| 5.3 | [Syncing with GitHub properly: conditional requests, rate limits, incremental sync by commit](03-syncing-with-github.qmd) | Incremental sync |
 | 5.4 | Object storage with the S3 API (SeaweedFS locally) *(coming soon)* | Repo snapshots |
 | 5.5 | Caching and rate limiting with Redis *(coming soon)* | Cache, per-user limits |
 | 5.6 | Publish/subscribe and event streams: Redis Streams, Kafka concepts, consumer groups *(coming soon)* | `issue.updated` events |

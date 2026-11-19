@@ -4,6 +4,11 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D26. Background jobs as built in M5 block A (2026-11-19)
+**Decision:** the queue message is a bare job id; job state is a `jobs` row with a partial unique index allowing one pending job per kind and repository. Workers claim a job with one conditional `UPDATE` and a 10-minute lease, run it in the same transaction that marks it succeeded, retry with full-jitter backoff up to 5 attempts, then mark it dead. A GitHub rate limit defers the job to the reset time without using an attempt. Producers commit before sending; the scheduler re-sends jobs that never started after 5 minutes. Webhooks are checked with HMAC-SHA256 on the raw body. Code sync is incremental by `git diff --name-status --no-renames` from `repos.indexed_commit`; issue sync uses `since`, `state=all`, oldest-first ordering and ETags. The worker's blocking queue wait (2 seconds) stays below redis-py 8's default 5-second socket timeout.
+**Why:** at-least-once delivery plus idempotent jobs is the only combination that neither loses nor double-applies work; the database is the one place a uniqueness rule holds across processes; the reference code had to survive real failures found while building it (a lost job on a plain list, a 20-request race, the socket-timeout crash).
+**Rejected:** job data in the message (stale on redelivery); check-then-insert deduplication (races); acknowledging before running (loses jobs); time-based watermarks from Atlas's own clock (skew loses updates); Celery or RQ (hide the mechanisms the lessons teach, per D7).
+
 ### D25. SeaweedFS replaces MinIO for local object storage (2026-11-19)
 **Decision:** the local S3-compatible server in `compose.yml` and CI is SeaweedFS. Atlas talks to it only through the S3 API, so code and lessons are the same against AWS S3 (Part 7).
 **Why:** MinIO deleted its community images from Docker Hub in September 2026 and ships the community edition as source code only; its Quay mirror is unreliable and unreachable from this project's build environment. SeaweedFS is Apache-2.0, long maintained, and runs as one container with an S3 gateway.

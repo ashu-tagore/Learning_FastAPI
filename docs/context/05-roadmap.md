@@ -12,7 +12,7 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 | M3 | Part 3 | 12 lessons; Postgres schema, query tuning, concurrency, SQL search | Done (tag `checkpoint-03` pending: this environment cannot push tags) |
 | M4 | Part 4 | 16 lessons (12 ported from the original tutorial); GitHub sign-in; async API v1; web UI v1 | Done (tag `checkpoint-04` pending: this environment cannot push tags) |
 | D1 | Part 4 depth pass | Part 4 grows to 20 lessons, failure-first and test-first; Part 7 designed in depth ([08-depth-pass.md](08-depth-pass.md)) | Part 4 done (20 lessons, 126 tests, 94% coverage); Part 7 design fixed, written in M7 |
-| M5 | Part 5 | 7 lessons; worker, queue, webhooks, storage, cache, event streams | In progress: block A (5.1 to 5.3) first, then block B (5.4 to 5.7) |
+| M5 | Part 5 | 7 lessons; worker, queue, webhooks, storage, cache, event streams | In progress: block A (5.1 to 5.3: queue, worker, scheduler, webhooks, incremental sync; 163 tests) done; block B (5.4 to 5.7) next |
 | M6 | Part 6 | 9 lessons; providers, ingestion, hybrid search, `/ask`, evals | Not started |
 | M7 | Part 7 | 14 lessons; Terraform, ECS deploy, CI/CD, database operations, observability, security, privacy, incident response | Not started |
 | M8 | Part 8 | 10 lessons; agent runs, sandbox, Issue Briefs, web UI v2 | Not started |
