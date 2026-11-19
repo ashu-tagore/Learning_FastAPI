@@ -147,7 +147,7 @@ async def test_missing_issue_is_404(client: httpx.AsyncClient) -> None:
     response = await client.get("/issues/999999")
 
     assert response.status_code == 404
-    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["error"]["code"] == "issue_not_found"
 
 
 async def test_saving_is_idempotent_and_private(

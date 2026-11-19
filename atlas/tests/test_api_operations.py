@@ -39,5 +39,5 @@ async def test_ready_answers_503_when_the_database_is_unreachable(
         health = await client.get("/health")
 
     assert ready.status_code == 503
-    assert ready.json()["error"]["code"] == "service_unavailable"
+    assert ready.json()["error"]["code"] == "database_unavailable"
     assert health.status_code == 200

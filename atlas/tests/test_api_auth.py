@@ -45,7 +45,7 @@ async def test_duplicate_email_is_a_conflict_in_the_standard_error_shape(
 
     assert response.status_code == 409
     error = response.json()["error"]
-    assert error["code"] == "conflict"
+    assert error["code"] == "email_taken"
     assert error["message"] == "An account with this email exists"
     assert error["request_id"] == response.headers["X-Request-ID"]
 

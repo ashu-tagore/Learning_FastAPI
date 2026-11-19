@@ -4,7 +4,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select, update
@@ -14,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from atlas import github_oauth
 from atlas.api.deps import SessionDep, SettingsDep
+from atlas.api.errors import ApiError
 from atlas.api.schemas import RefreshRequest, TokenPair, UserCreate, UserOut, normalise_email
 from atlas.config import ApiSettings
 from atlas.github import GitHubError
@@ -66,7 +67,9 @@ async def register(body: UserCreate, session: SessionDep) -> User:
     except IntegrityError:
         # The unique constraint on email decides, so two simultaneous sign-ups can't both win.
         await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email exists") from None
+        raise ApiError(
+            status.HTTP_409_CONFLICT, "email_taken", "An account with this email exists"
+        ) from None
     await session.refresh(user)
     return user
 
@@ -83,8 +86,9 @@ async def login(
 
     # Same message whether the email is unknown or the password is wrong,
     # so the endpoint can't be used to discover who has an account.
-    wrong_credentials = HTTPException(
+    wrong_credentials = ApiError(
         status.HTTP_401_UNAUTHORIZED,
+        "wrong_credentials",
         "Incorrect email or password",
         headers={"WWW-Authenticate": "Bearer"},
     )
@@ -108,7 +112,9 @@ async def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsD
             RefreshToken.token_hash == hash_refresh_token(body.refresh_token)
         )
     )
-    rejected = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token")
+    rejected = ApiError(
+        status.HTTP_401_UNAUTHORIZED, "invalid_refresh_token", "Invalid refresh token"
+    )
     if stored is None:
         raise rejected
 
@@ -152,7 +158,9 @@ async def logout(body: RefreshRequest, session: SessionDep) -> Response:
 
 def github_client_id(settings: ApiSettings) -> str:
     if settings.github_client_id is None or settings.github_client_secret is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "GitHub sign-in is not configured")
+        raise ApiError(
+            status.HTTP_404_NOT_FOUND, "github_sign_in_disabled", "GitHub sign-in is not configured"
+        )
     return settings.github_client_id
 
 
@@ -190,7 +198,11 @@ async def github_callback(
     # secrets.compare_digest takes the same time whatever the input, leaking nothing via timing.
     state_matches = bool(expected_state) and secrets.compare_digest(state, expected_state)
     if not state_matches:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Sign-in expired or was not started here")
+        raise ApiError(
+            status.HTTP_400_BAD_REQUEST,
+            "sign_in_not_started_here",
+            "Sign-in expired or was not started here",
+        )
 
     assert settings.github_client_secret is not None  # checked by github_client_id
     try:
@@ -203,7 +215,7 @@ async def github_callback(
             transport=request.app.state.github_transport,
         )
     except GitHubError as error:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from None
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "github_sign_in_failed", str(error)) from None
 
     user = await session.scalar(select(User).where(User.github_id == identity.github_id))
     if user is None:

@@ -2,12 +2,13 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, Query, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload
 
 from atlas.api.deps import CurrentUser, SessionDep
+from atlas.api.errors import ApiError
 from atlas.api.schemas import (
     IssueCursor,
     IssueOut,
@@ -70,7 +71,7 @@ async def get_issue_or_404(session: SessionDep, issue_id: int) -> Issue:
         Issue, issue_id, options=[selectinload(Issue.labels), selectinload(Issue.repo)]
     )
     if issue is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Issue {issue_id} not found")
+        raise ApiError(status.HTTP_404_NOT_FOUND, "issue_not_found", f"Issue {issue_id} not found")
     return issue
 
 

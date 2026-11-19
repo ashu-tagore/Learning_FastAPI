@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,9 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from atlas import __version__
 from atlas.api.deps import SessionDep
+from atlas.api.errors import ApiError
 from atlas.api.routes import auth, issues, notes, repos, search, users
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
@@ -93,8 +95,17 @@ def create_app(
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
     )
 
-    @app.exception_handler(HTTPException)
-    async def http_error(request: Request, error: HTTPException) -> JSONResponse:
+    @app.exception_handler(ApiError)
+    async def api_error(request: Request, error: ApiError) -> JSONResponse:
+        """Errors routes raise on purpose: their own code and message."""
+        body = error_body(error.code, error.message, request)
+        return JSONResponse(body, status_code=error.status_code, headers=error.headers)
+
+    # Starlette's class, not FastAPI's subclass: unknown routes (404) and wrong methods (405)
+    # are raised by Starlette's router, and FastAPI's class wouldn't catch them (lesson 4.14).
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, error: StarletteHTTPException) -> JSONResponse:
+        """Errors raised by the framework itself: a code derived from the status."""
         body = error_body(status_code_name(error.status_code), str(error.detail), request)
         return JSONResponse(body, status_code=error.status_code, headers=error.headers)
 
@@ -113,7 +124,10 @@ def create_app(
             "unhandled error, request_id=%s", getattr(request.state, "request_id", None)
         )
         body = error_body("internal_server_error", "Something went wrong on our side", request)
-        return JSONResponse(body, status_code=500)
+        # This handler runs outside the request_id middleware, so it adds the header itself.
+        request_id = getattr(request.state, "request_id", None)
+        headers = {"X-Request-ID": request_id} if request_id else None
+        return JSONResponse(body, status_code=500, headers=headers)
 
     @app.get("/health", tags=["operations"])
     async def health() -> dict[str, str]:
@@ -128,8 +142,10 @@ def create_app(
         except OperationalError:
             # 503, not 500: nothing is broken in this process, it just can't serve yet.
             # Load balancers stop sending traffic on 503 and retry later (lesson 7.9).
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "The database is unreachable"
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "The database is unreachable",
             ) from None
         return {"status": "ready"}
 
