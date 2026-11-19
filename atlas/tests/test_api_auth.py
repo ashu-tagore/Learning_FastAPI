@@ -5,6 +5,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from atlas import security
+from atlas.api.routes import auth
 from atlas.models import User
 from tests.conftest import sign_up
 
@@ -74,6 +76,25 @@ async def test_login_failures_look_identical(client: httpx.AsyncClient) -> None:
 
     assert wrong_password.status_code == unknown_email.status_code == 401
     assert wrong_password.json()["error"]["message"] == unknown_email.json()["error"]["message"]
+
+
+async def test_unknown_emails_cost_one_hash_like_real_ones(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards against the timing attack in lesson 4.7 without measuring time (which is flaky)."""
+    await sign_up(client, "ada@example.com")
+    hashed: list[str] = []
+
+    def counting_verify(password: str, password_hash: str) -> bool:
+        hashed.append(password_hash)
+        return security.verify_password(password, password_hash)
+
+    monkeypatch.setattr(auth, "verify_password", counting_verify)
+
+    for email in ("ada@example.com", "nobody@example.com"):
+        await client.post("/auth/login", data={"username": email, "password": "wrong-password"})
+
+    assert len(hashed) == 2
 
 
 async def test_me_requires_a_valid_token(client: httpx.AsyncClient) -> None:
