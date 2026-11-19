@@ -169,6 +169,23 @@ async def test_missing_issue_is_404(client: httpx.AsyncClient) -> None:
     assert response.json()["error"]["code"] == "issue_not_found"
 
 
+async def test_reading_an_issue_loads_everything_it_needs(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    """Async code can't load relationships lazily (lesson 4.17), so the route must ask up front.
+
+    expunge_all() empties the session's memory of objects, as a fresh request's session
+    would be; without it, the repository loaded while storing would hide a missing load.
+    """
+    ids = await store_numbers(async_session, [7])
+    async_session.expunge_all()
+
+    response = await client.get(f"/issues/{ids[7]}")
+
+    assert response.status_code == 200
+    assert response.json()["repo"] == "pytorch/ignite"
+
+
 async def test_saving_is_idempotent_and_private(
     client: httpx.AsyncClient, async_session: AsyncSession
 ) -> None:
