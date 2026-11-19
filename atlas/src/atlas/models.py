@@ -8,10 +8,12 @@ repos ──< documents ──< chunks
 users ──< refresh_tokens
   ├──< saved_issues >── issues
   ├──< issue_notes             (point at repo + issue number, so they survive an issue closing)
-  └──< idempotency_keys
+  ├──< idempotency_keys
+  ├──< notifications           (also by repo name + number: the issue may be gone)
+  └──< digests                 (one per user per day)
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -256,3 +258,42 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Notification(Base):
+    """Something a user should know about an issue they saved (lesson 5.6)."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        # One notification per user per change, however often the event is delivered.
+        UniqueConstraint("user_id", "event_key"),
+        CheckConstraint("change IN ('relabelled', 'closed')", name="notifications_change_valid"),
+        # Serves "my newest notifications", the query behind GET /notifications.
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    repo_full_name: Mapped[str] = mapped_column(String(200))
+    issue_number: Mapped[int]
+    title: Mapped[str] = mapped_column(String(500))
+    change: Mapped[str] = mapped_column(String(20))
+    labels: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    event_key: Mapped[str] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Digest(Base):
+    """One user's summary of one day (lesson 5.7). Built once a day by `atlas digest`."""
+
+    __tablename__ = "digests"
+    # One per user per day: running the command twice for a day changes nothing.
+    __table_args__ = (UniqueConstraint("user_id", "day"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    day: Mapped[date]
+    # A copy of each issue as it was that day, so the digest still reads right later.
+    issues: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    notification_count: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

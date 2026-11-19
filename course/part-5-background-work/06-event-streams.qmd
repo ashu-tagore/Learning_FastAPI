@@ -1,0 +1,461 @@
+---
+title: "5.6 Publish/subscribe and event streams: Redis Streams, Kafka concepts, consumer groups"
+description: "Announce issue changes as events instead of calling every interested feature directly, see pub/sub lose an event nobody was listening for, then use a Redis Stream with a consumer group that survives a crashed consumer and ignores duplicates."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 6 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers Kafka, ordering and the outbox.
+:::
+
+::: {.callout-note title="Analogy: a radio broadcast and a ship's logbook"}
+A radio broadcast reaches whoever happens to be tuned in at that moment. Switch on five minutes late and the news is gone. A ship's logbook is written once and kept: every officer reads it at the start of their watch, from where they last left off, and initials each entry they've dealt with. A new officer can start from page one.
+
+Redis **pub/sub** is the broadcast. A Redis **stream** is the logbook. The officers on one watch, sharing the work, are a **consumer group**; their initials are **acknowledgements**.
+:::
+
+## The problem
+
+Learners save issues they want to work on (lesson 4.11). When a saved issue is closed or relabelled, they should hear about it. The issues sync (lesson 5.3) is the first to know.
+
+The direct approach: at the end of `sync_issues`, look up who saved each changed issue and write their notifications. It works, and it starts a habit. Next week the daily digest (lesson 5.7) also wants to know about new issues; then Part 6's ranking wants to re-score relabelled ones; then a chat integration. Each one adds code to `sync_issues`, which now knows about every feature in Atlas, and a bug in any of them fails the sync for all. The sync's job is to record what changed on GitHub. Who cares about that is somebody else's business.
+
+The usual fix is to **publish an event**, "issue 12 was closed", and let anyone interested **subscribe**. Redis has a feature named exactly that, publish/subscribe. Here's what happens when the notifier is down for a deploy at the moment an issue closes, against real Redis:
+
+```text
+--- pub/sub
+published while nobody listened: delivered to 0 subscribers
+notifier back, waiting 1 s: None
+```
+
+`PUBLISH` reported zero receivers, and when the notifier came back there was nothing for it. The event was gone, and with it a user's notification. Pub/sub is a broadcast: fire and forget. The same event appended to a **stream** instead:
+
+```text
+--- stream
+appended while nobody listened: 1795099204346-0
+notifier back: [['demo:stream', [('1795099204346-0', {'event': 'pytorch/ignite#12 closed'})]]]
+```
+
+The stream kept it until someone read it.
+
+## Theory
+
+### Events
+
+An **event** is a record of something that happened, named in the past tense: `issue.updated`, with what changed. The **producer** publishes it and doesn't know or care who reads it. **Consumers** react to it. Adding a consumer changes nothing in the producer, which is the decoupling the problem needed.
+
+An event is different from a job (lesson 5.1). A job says "do this", and exactly one worker should do it. An event says "this happened", and *every* interested feature should hear it.
+
+### Streams
+
+A **stream** is an append-only log: entries are added at the end and never changed. Each entry gets an id: in Redis, the time in milliseconds plus a sequence number (`1795099204346-0`), so ids are in order. Readers remember how far they've read and continue from there. A stream is kept until it's trimmed; Atlas keeps about the newest 10,000 entries (`XADD ... MAXLEN ~ 10000`, where `~` lets Redis trim in cheap whole blocks).
+
+### Consumer groups
+
+A **consumer group** is a named reader of a stream with its own position. Two groups on the same stream each see every event: that's how the notifier and lesson 5.7's digest both hear about the same change without affecting each other. Inside a group, the events are *shared out* among its **consumers** (processes), so running three notifier processes triples throughput and each event is handled by only one of them.
+
+Each event a group delivers stays **pending** until the consumer **acknowledges** it with `XACK`, which is lesson 5.1's visibility timeout and ack again, in a different form. If a consumer dies holding pending events, another consumer of the group can **claim** them once they've been idle long enough (`XAUTOCLAIM`). Delivery is therefore at least once, and consumers must be idempotent.
+
+### Making consumers idempotent
+
+Atlas's events carry a **key** that's identical for every copy of the same change:
+
+```text
+pytorch/ignite#12:closed:2026-11-19T10:00:00+00:00
+```
+
+Repository, issue, change, and the poll it was found in (named by the sync's starting watermark from lesson 5.3). A redelivered event has the same key; so does an event published again by a sync job that failed and was retried, because the retry starts from the same watermark. The notifications table has a unique constraint on `(user_id, event_key)`, so a duplicate inserts nothing.
+
+### What goes in an event
+
+There was a real design problem here. When an issue is closed, `apply_issue_changes` deletes its row, and the database deletes its `saved_issues` rows with it (`ON DELETE CASCADE`, lesson 3.4). A notifier reading the event a second later can no longer find out who had saved the issue. So the producer puts that into the event, captured before the delete: `saved_by: [26, 31]`. An event should carry what consumers need to know *about the moment it happened*, because by the time they read it, the database has moved on.
+
+### When to publish
+
+Events are published inside the sync job, before its transaction commits. Isn't that the "send before commit" mistake from lesson 5.2? Not here. Those events describe what happened *on GitHub* ("issue 12 was closed"), which is true whether or not Atlas's own write succeeds. If the commit fails, the job is retried, finds the same changes from the same watermark, and publishes them again under the same keys, which consumers ignore. Publishing after the commit would instead risk losing events: a crash between the commit and the publish, and the next sync starts past those changes.
+
+```{mermaid}
+flowchart LR
+    S[sync_issues job] -->|XADD issue.updated| ST[(Redis stream<br/>atlas:events:issues)]
+    ST -->|group: notifications| N1[notifier 1]
+    ST -->|group: notifications| N2[notifier 2]
+    ST -.->|group: digest, lesson 5.7| D[digest]
+    N1 -->|INSERT ... ON CONFLICT DO NOTHING| PG[(notifications)]
+    N2 --> PG
+    PG --> API[GET /notifications]
+```
+
+## In the project
+
+### Red: what the producer reports
+
+```python
+def test_changes_are_reported_with_who_had_saved_the_issue(session: Session) -> None:
+    storage.apply_issue_changes(session, "pytorch/ignite", [fetched(1), fetched(2)], [], poll="a")
+    reader = save_issue(session, "reader@example.com", 1)
+
+    events = storage.apply_issue_changes(
+        session,
+        "pytorch/ignite",
+        [fetched(2, labels=("good first issue", "help wanted")), fetched(3)],
+        [1],
+        poll="b",
+    )
+
+    summary = [(e.number, e.change, e.saved_by, e.key) for e in events]
+    assert summary == [
+        # Closed, and deleted with its saved_issues rows; the event still knows who saved it.
+        (1, "closed", [reader], "pytorch/ignite#1:closed:b"),
+        (2, "relabelled", [], "pytorch/ignite#2:relabelled:b"),
+        (3, "opened", [], "pytorch/ignite#3:opened:b"),
+    ]
+```
+
+### Green: `apply_issue_changes` says what changed
+
+`apply_issue_changes` (lesson 5.3) now returns a list of `IssueEvent`s. It loads the stored issues with their labels in one extra query (`selectinload`, lesson 4.12's answer to N+1) and who saved them in another, then records each change as it applies it:
+
+```python
+for number in closed_numbers:
+    stored = stored_by_number.get(number)
+    if stored is not None:
+        # Recorded before the delete, while who saved it is still known.
+        record(stored, "closed", sorted(label.name for label in stored.labels))
+        session.delete(stored)
+
+for fetched in open_issues:
+    row = stored_by_number.get(fetched.number)
+    is_new = row is None
+    old_labels = set() if row is None else {label.name for label in row.labels}
+    # ... create or update the row, as before ...
+    new_labels = sorted(fetched.labels)
+    if is_new:
+        record(row, "opened", new_labels)
+    elif old_labels != set(new_labels):
+        record(row, "relabelled", new_labels)
+```
+
+`record` is a small function defined inside `apply_issue_changes`, so it can use the function's local `events` list and `savers_by_issue_id` lookup without passing them every time. A title edit or a new comment isn't an event yet: nobody consumes those.
+
+`IssueEvent`, in the new `atlas/events.py`, is a frozen dataclass:
+
+```python
+@dataclass(frozen=True)
+class IssueEvent:
+    """`issue.updated`: something about an issue changed on GitHub."""
+
+    repo: str
+    number: int
+    title: str
+    change: str  # "opened", "relabelled" or "closed"
+    labels: list[str]
+    # Who had saved the issue before the change. Captured by the producer, because a
+    # closed issue's row, and with it who saved it, is deleted in the same transaction.
+    saved_by: list[int]
+    # The same for a retried sync or a redelivered event: consumers deduplicate on it.
+    key: str
+```
+
+And `sync_issues` names the poll and publishes:
+
+```python
+# The poll is named by where it started. A retry of a failed job starts from the same
+# watermark (the failed attempt's update was rolled back), so its events get the same
+# keys and consumers ignore the copies.
+poll = repo.issues_synced_until.isoformat() if repo.issues_synced_until else "first"
+issue_events = storage.apply_issue_changes(
+    session, repo.full_name, changes.open_issues, changes.closed_numbers, poll=poll
+)
+# Published before this job commits: the events describe what happened on GitHub,
+# which is true whether or not Atlas's own write succeeds. If the commit fails, the
+# retry publishes them again under the same keys.
+events.publish(issue_events)
+```
+
+### The stream: `EventStream`
+
+```python
+def publish(self, events: list[IssueEvent]) -> None:
+    for event in events:
+        # approximate=True trims in whole internal blocks, which is much cheaper; the
+        # stream keeps at least max_length events, sometimes a few more.
+        self.client.xadd(
+            self.name,
+            {"type": "issue.updated", "event": json.dumps(asdict(event))},
+            maxlen=self.max_length,
+            approximate=True,
+        )
+```
+
+A stream entry is a set of field/value strings; the event goes in as JSON. `read` gives a consumer abandoned events first, then new ones:
+
+```python
+def read(self, group, consumer, count=10, claim_after_ms=60_000, block_ms=BLOCK_MILLISECONDS):
+    # Events another consumer of the group took but hasn't acknowledged for a minute:
+    # it probably crashed. XAUTOCLAIM hands them to this consumer.
+    reply = self.client.xautoclaim(
+        self.name, group, consumer, min_idle_time=claim_after_ms, start_id="0-0", count=count
+    )
+    claimed = cast(list[Entry], reply[1])
+    if claimed:
+        return [self._parse(entry_id, fields) for entry_id, fields in claimed]
+
+    # ">" means events never delivered to anyone in this group. BLOCK 0 would mean
+    # "wait forever" to Redis, so a zero wait is sent as no BLOCK at all (lesson 5.6).
+    block = block_ms if block_ms > 0 else None
+    response = self.client.xreadgroup(
+        group, consumer, {self.name: ">"}, count=count, block=block
+    )
+    if not response:
+        return []
+    _, entries = cast(list[tuple[object, list[Entry]]], response)[0]
+    return [self._parse(entry_id, fields) for entry_id, fields in entries]
+```
+
+`cast` (from `typing`) tells mypy what shape a value has, without changing it at run time; redis-py describes its replies too loosely for mypy to know.
+
+The `BLOCK 0` comment marks a bug the tests found. The first version passed `block=block_ms` straight through, and tests asked for `block_ms=0`, meaning "don't wait". Two tests then hung for five seconds and failed:
+
+```text
+E               redis.exceptions.TimeoutError: Timeout reading from socket
+```
+
+To Redis, `BLOCK 0` means *wait forever*. The socket timeout from lesson 5.1 is what ended the wait. The default wait, 2 seconds, stays under that timeout for the same reason as the queue's.
+
+The stream tests, on real Redis:
+
+```python
+def test_every_group_gets_every_event(stream: EventStream) -> None:
+    stream.ensure_group("notifications")
+    stream.ensure_group("digest")
+    stream.publish([event("k1")])
+
+    for_notifications = stream.read("notifications", "a", block_ms=0)
+    for_digest = stream.read("digest", "b", block_ms=0)
+
+    assert [e.key for _, e in for_notifications] == [e.key for _, e in for_digest] == ["k1"]
+
+
+def test_an_event_its_consumer_never_acknowledged_is_claimed_by_another(
+    stream: EventStream,
+) -> None:
+    stream.ensure_group("g")
+    stream.publish([event("k1")])
+    taken = stream.read("g", "crashed-worker", block_ms=0)
+
+    still_fresh = stream.read("g", "worker-2", block_ms=0, claim_after_ms=60_000)
+    time.sleep(0.1)  # Redis measures idle time on its own clock
+    claimed = stream.read("g", "worker-2", block_ms=0, claim_after_ms=50)
+
+    assert [e.key for _, e in taken] == ["k1"]
+    assert still_fresh == []
+    assert [e.key for _, e in claimed] == ["k1"]
+```
+
+The second test sleeps for real: unlike the queue, where Atlas computes deadlines itself, Redis tracks how long an entry has been idle on its own clock, which a test can't move.
+
+### The notifier
+
+`atlas/notifier.py` is the consumer. Its core is one statement:
+
+```python
+def notify(session: Session, event: IssueEvent) -> int:
+    """Create the event's notifications; return how many are new (0 for a duplicate)."""
+    if event.change not in WORTH_NOTIFYING or not event.saved_by:
+        return 0
+    rows = [
+        {
+            "user_id": user_id,
+            "repo_full_name": event.repo,
+            "issue_number": event.number,
+            "title": event.title,
+            "change": event.change,
+            "labels": event.labels,
+            "event_key": event.key,
+        }
+        for user_id in event.saved_by
+    ]
+    # A redelivered event, or a retried sync, inserts nothing: the (user_id, event_key)
+    # unique constraint turns duplicates into no-ops.
+    statement = (
+        insert(Notification)
+        .values(rows)
+        .on_conflict_do_nothing(index_elements=["user_id", "event_key"])
+        .returning(Notification.id)
+    )
+    return len(session.scalars(statement).all())
+```
+
+The conflict target is a plain unique constraint this time, with no condition, so lesson 5.5's prepared-statement trap doesn't apply. The loop around it commits, *then* acknowledges, so a crash in between redelivers the event and the constraint absorbs the second attempt. Each notifier process names itself after its host and process id within the group.
+
+The `notifications` table (migration `0006`, autogenerated and reviewed) stores the repository name and issue number rather than a foreign key to `issues`, for the same reason as lesson 4.20's notes: the issue row may be gone. `GET /notifications` returns the signed-in user's newest twenty. `atlas notifier` runs the loop.
+
+The end-to-end test runs the real pieces: a fake GitHub reports an issue, a user saves it, GitHub reports it closed, the sync job runs and publishes, the notifier consumes:
+
+```python
+def test_closing_a_saved_issue_notifies_the_reader(
+    worker: WorkerContext, issue_tracker: FakeIssueTracker
+) -> None:
+    issue_tracker.put(1, "Fix docstring typo", "2026-11-01T10:00:00Z")
+    repo_id = add_repo(worker)
+    run_job(worker, queue_job(worker, "sync_issues", repo_id))
+    with worker.session_factory() as session, session.begin():
+        reader = save_issue(session, "reader@example.com", 1)
+
+    issue_tracker.put(1, "Fix docstring typo", "2026-11-03T10:00:00Z", state="closed")
+    run_job(worker, queue_job(worker, "sync_issues", repo_id))
+    handled = run_notifier(
+        worker.session_factory, worker.events, threading.Event(), "test", stop_when_idle=True
+    )
+
+    with worker.session_factory() as session:
+        notifications = session.scalars(select(Notification)).all()
+    # Two syncs: the first issue's "opened" and its "closed"; only the second concerns anyone.
+    assert handled == 2
+    assert [(n.user_id, n.issue_number, n.change) for n in notifications] == [
+        (reader, 1, "closed")
+    ]
+```
+
+### Running it for real
+
+On the development database, a user saved issue 20, and GitHub's closing of it was applied with the same `apply_issue_changes` and `publish` the sync uses (this machine can't reach GitHub's API, so the script played the sync's part):
+
+```text
+published pytorch/ignite#20:closed:demo-5.6 saved_by=[26, 31]
+```
+
+Two users had saved it. `atlas notifier`, stopped with `SIGTERM` after four seconds:
+
+```text
+{"time": "2026-11-19T14:40:28.489795+00:00", "level": "INFO", "logger": "atlas.notifier", "message": "event handled", "request_id": null, "entry_id": "1795099227399-0", "key": "pytorch/ignite#20:closed:demo-5.6", "notifications": 2}
+```
+
+The reader's `GET /notifications`:
+
+```text
+[{"id":2,"repo_full_name":"pytorch/ignite","issue_number":20,"title":"Support new metric","change":"closed","labels":["help wanted"],"created_at":"2026-11-19T14:40:28.482157Z"}]
+```
+
+And Redis's view of the group (`XINFO GROUPS`):
+
+```text
+name	notifications
+consumers	1
+pending	0
+last-delivered-id	1795099227399-0
+entries-read	1
+lag	0
+```
+
+`pending 0`: everything delivered was acknowledged. `lag 0`: nothing is waiting. **Lag**, the number of events a group hasn't read yet, is the number to watch in production: if it grows, the consumers aren't keeping up.
+
+### A crashed consumer
+
+A notifier takes the event and is killed with `SIGKILL` before acknowledging it. Then another one starts:
+
+```text
+notifier-a took pytorch/ignite#12:closed:demo, writing notifications...
+/bin/bash: line 105: 32357 Killed                  .venv/bin/python $S/crashed_consumer.py $step
+pending: 1 held by {'notifier-a': 1}
+notifier-b, claiming after 60 s idle: []
+notifier-b, claiming after 1 s idle:  ['pytorch/ignite#12:closed:demo']
+pending after ack: 0
+```
+
+`XPENDING` shows the event held by the dead consumer. Within the claim time it stays there, in case `notifier-a` is only slow; after it, `notifier-b` claims it, handles it, acknowledges it. (The demo used a one-second claim time so as not to wait a minute.)
+
+## Trade-offs *(deep dive)*
+
+**Kafka.** Apache Kafka is the best-known event-streaming system, and Redis Streams borrowed its main ideas. A Kafka **topic** is a stream, split into **partitions** so it can be spread over many machines; events with the same **key** go to the same partition, which keeps them in order relative to each other. Consumer groups work as here, each group with an **offset** (position) per partition. Kafka keeps events for a configured time or size and replicates them across machines, so it's built for very large volumes and long retention. It's also a cluster to run. For Atlas's volume (a few events per sync), a Redis stream on the Redis it already has is enough; on AWS, the managed choices are Amazon MSK (Kafka), Kinesis (similar ideas), or SNS fanning out to an SQS queue per consumer.
+
+**Ordering.** One Redis stream is totally ordered. But with several consumers in a group, event 2 can be handled before event 1 finishes on another consumer. Atlas's notifications don't depend on order. Consumers that do must either have one consumer per group or partition events by key, as Kafka does.
+
+**The outbox, again.** Publishing before commit was right here because the events are facts about GitHub. For an event about Atlas's *own* change ("a note was created"), publishing before commit could announce something that then rolled back, and publishing after could lose it. That's the transactional outbox from lesson 5.2: write the event to a table in the same transaction, and publish from there.
+
+**Fat vs thin events.** Atlas's events carry everything the notifier needs (a "fat" event). A "thin" event carries only ids and makes consumers look the rest up, which here is impossible: the issue is deleted. Fat events cost size and expose more data to every consumer; thin events cost lookups and can't describe the past.
+
+**Retention.** `MAXLEN ~ 10000` caps memory, so a consumer group that falls more than 10,000 events behind loses some. Alert on lag well before that.
+
+## Common mistakes
+
+- **Pub/sub for events that matter.** It delivers only to whoever is listening right now.
+- **Acknowledging before handling.** A crash loses the event.
+- **Consumers that can't handle duplicates.** Delivery is at least once; give events a key and make writes idempotent.
+- **`BLOCK 0` meaning "don't wait".** To Redis it means "wait forever".
+- **Thin events about things that get deleted.** Capture what consumers will need at the moment of the change.
+- **One consumer group for unrelated features.** They'd share events out instead of each getting all of them.
+- **Never watching lag.** A stuck consumer is silent until users notice.
+
+## Check yourself
+
+**1.** The notifier and the digest both need every `issue.updated` event. Should they be two consumers in one group, or two groups? Why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Two groups. Within a group, events are shared out, so each consumer would see only some of them. Each group gets every event and keeps its own position, so the digest falling behind never delays notifications.
+:::
+
+**2.** A sync job publishes three events and then fails to commit. It's retried and succeeds. How many notifications does a user who saved one of those issues get?
+
+::: {.callout-tip collapse="true" title="Answer"}
+One. The retry starts from the same watermark (the failed attempt's update was rolled back), finds the same changes, and publishes events with the same keys. The notifier handles both copies, but the unique `(user_id, event_key)` constraint makes the second insert a no-op.
+:::
+
+**3.** Why does each event carry `saved_by`, instead of the notifier looking it up?
+
+::: {.callout-tip collapse="true" title="Answer"}
+For a closed issue, the same transaction that produced the event deleted the issue row, and the cascade deleted its `saved_issues` rows. By the time the notifier reads the event, nothing in the database says who had saved it.
+:::
+
+## Exercise
+
+Show that two notifiers in one group share the work: publish ten events, then let consumers `a` and `b` take turns reading up to three at a time and acknowledging, until neither gets anything. Check that every event was handled exactly once, and that both consumers did some of the work.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_two_consumers_share_a_group(stream: EventStream) -> None:
+    stream.ensure_group("notifications")
+    stream.publish([event(f"k{n}") for n in range(10)])
+    seen = {"a": [], "b": []}
+    while True:
+        got_any = False
+        for name in ("a", "b"):
+            for entry_id, e in stream.read("notifications", name, count=3, block_ms=0):
+                seen[name].append(e.key)
+                stream.ack("notifications", entry_id)
+                got_any = True
+        if not got_any:
+            break
+
+    assert sorted(seen["a"] + seen["b"]) == sorted(f"k{n}" for n in range(10))
+    assert seen["a"] and seen["b"]
+```
+Against the reference code, `a` handled 6 and `b` 4 (three, three, then the last ones). Not in the reference code.
+:::
+
+## Stretch
+
+Add a second consumer group, `activity`, that counts events by change type, and prove it doesn't take events away from `notifications`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def count_changes(stream: EventStream, group: str = "activity") -> dict[str, int]:
+    stream.ensure_group(group)
+    counts: dict[str, int] = {}
+    while True:
+        batch = stream.read(group, "counter", block_ms=0)
+        if not batch:
+            return counts
+        for entry_id, e in batch:
+            counts[e.change] = counts.get(e.change, 0) + 1
+            stream.ack(group, entry_id)
+```
+Create the `notifications` group, publish two events, run `count_changes` (it returns `{"closed": 2}`), then read from `notifications`: both events are still there for it. A real activity feature would store the counts (a Redis hash with `HINCRBY`, or a table) and deduplicate by key, since this counter would count a redelivered event twice. Checked against the reference code. Not in the reference code.
+:::
+
+## What changed in the project
+
+New `atlas/events.py` (`IssueEvent`, `EventStream`: publish, groups, read with claim, ack) and `atlas/notifier.py` (`notify`, `run_notifier`); `apply_issue_changes` returns events, with who had saved each issue; `sync_issues` publishes them; `notifications` table (migration `0006`); `GET /notifications`; `atlas notifier`; `as_text` decodes UTF-8; `tests/test_events.py`. Commit: `feat: Added issue events on a Redis Stream and a notifier for saved issues`.

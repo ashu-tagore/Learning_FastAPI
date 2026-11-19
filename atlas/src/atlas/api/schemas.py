@@ -7,7 +7,7 @@ separate is what keeps fields like password_hash out of every response.
 import base64
 import binascii
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, EmailStr, Field
@@ -111,6 +111,34 @@ class SnapshotOut(BaseModel):
     commit: str
     url: str  # works without a token, for anyone who has it, until expires_at
     expires_at: datetime
+
+
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    repo_full_name: str
+    issue_number: int
+    title: str
+    change: Literal["relabelled", "closed"]
+    labels: list[str]
+    created_at: datetime
+
+
+class DigestIssue(BaseModel):
+    repo: str
+    number: int
+    title: str
+    url: str
+    labels: list[str]
+
+
+class DigestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    day: date
+    issues: list[DigestIssue]
+    notification_count: int
 
 
 # ---------- Background jobs ----------

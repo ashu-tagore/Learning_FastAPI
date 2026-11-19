@@ -90,7 +90,8 @@ class RedisQueue:
 
 
 def as_text(raw: object) -> str:
-    """Redis returns bytes unless the client decodes them; job ids are handled as text."""
+    """Redis returns bytes unless the client decodes them; ids and events are handled as text."""
     if isinstance(raw, bytes):
-        return raw.decode("ascii")
+        # UTF-8, not ASCII: events carry issue titles, which can be in any language.
+        return raw.decode("utf-8")
     return str(raw)
