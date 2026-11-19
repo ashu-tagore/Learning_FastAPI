@@ -41,7 +41,8 @@ jobs:
       - name: Types
         run: uv run mypy src tests
       - name: Tests
-        run: uv run pytest -v
+        # Coverage is reported, not enforced: it shows what no test runs (lesson 4.19).
+        run: uv run pytest -v --cov --cov-report=term-missing
       # Migrations run from empty on their own database, then `alembic check` fails the build
       # if a model changed without a migration (lesson 4.13).
       - name: Migrations

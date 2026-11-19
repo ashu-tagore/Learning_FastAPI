@@ -1,5 +1,7 @@
 """Sign in with GitHub (lesson 4.9), including the two attacks it must stop."""
 
+from collections.abc import AsyncIterator
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -8,6 +10,9 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from atlas.api.app import create_app
+from atlas.api.deps import get_session
+from atlas.config import ApiSettings
 from atlas.models import User
 from tests.conftest import browser
 from tests.fake_github import FakeGitHubSignIn
@@ -105,3 +110,31 @@ async def test_a_stolen_code_is_useless_without_its_verifier(
 
     assert response.status_code == 502
     assert await async_session.scalar(select(User).where(User.github_id == 4242)) is None
+
+
+async def test_the_web_ui_gets_tokens_in_the_fragment_only(
+    api_settings: ApiSettings,
+    async_session: AsyncSession,
+    github: FakeGitHubSignIn,
+    tmp_path: Path,
+) -> None:
+    """Found by coverage (lesson 4.19): the redirect to the web UI had no test."""
+    settings = api_settings.model_copy(update={"web_dir": str(tmp_path)})
+    app = create_app(settings, github_transport=github.transport)
+
+    async def test_session() -> AsyncIterator[AsyncSession]:
+        yield async_session
+
+    app.dependency_overrides[get_session] = test_session
+    async with browser(app) as client:
+        authorize_url, state = await start_sign_in(client)
+        code = github.approve(authorize_url)
+        response = await client.get("/auth/github/callback", params={"code": code, "state": state})
+
+    location = urlparse(response.headers["location"])
+    assert response.status_code == 302
+    assert location.path == "/app/"
+    # Tokens in the fragment never reach a server or its logs; a query string would.
+    assert location.query == ""
+    assert {"access_token", "refresh_token"} <= set(parse_qs(location.fragment))
+    assert 'atlas_oauth=""' in response.headers["set-cookie"]
