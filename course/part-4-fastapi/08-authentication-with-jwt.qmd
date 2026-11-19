@@ -1,31 +1,49 @@
 ---
 title: "4.8 Authentication with JWT"
-description: "Log users in with signed, short-lived JSON Web Tokens, protect routes with a get_current_user dependency, and know what a token does and doesn't hide."
+description: "Log users in with signed, short-lived JSON Web Tokens, protect routes with a get_current_user dependency, and forge tokens yourself to see exactly which checks stop an attacker."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 8 · About 90 minutes
+Part 4 · Lesson 8 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Attack it". The trade-offs section *(deep dive)* compares tokens with server-side sessions.
 :::
 
 ::: {.callout-note title="Analogy: a festival wristband"}
 At a festival you show your ticket and ID once, at the gate. You get a wristband, and from then on every stage just glances at it. Stage staff don't phone the ticket office; the wristband itself is hard to forge, and it's only valid today.
 
-A **JSON Web Token** is a wristband for your API. You prove who you are once (email and password) and get a token. Each later request shows the token, and the API checks it's genuine and unexpired without asking the database who you are.
+A **JSON Web Token** is a wristband for your API. You prove who you are once (email and password) and get a token. Each later request shows the token, and the API checks it's genuine and unexpired without looking anything up. And like a wristband, it's only as good as the checks at each stage: a guard who doesn't look closely lets in anyone wearing anything vaguely similar.
 :::
+
+## The problem
+
+Lesson 4.7 can check a password. But HTTP is **stateless** (lesson 2.3): each request stands alone, and the server doesn't remember that you checked a password a moment ago. Sending the password with every request would mean an expensive Argon2 check on every click, and the password travelling far more often than it needs to.
+
+So after one successful password check, Atlas hands the client a **token**: a string it sends with each later request instead of the password. The question this lesson answers is what goes in that string so that:
+
+- the server can trust it without a database lookup per request,
+- nobody can make one up, or change one to become someone else,
+- a stolen one stops working soon.
+
+Getting any of those wrong is one of the most common serious bugs in web APIs. So after building it, we'll attack it: forge tokens five different ways and see which checks stop each one, then show what happens with a weak key, which Atlas, as first written, accepted.
 
 ## Theory
 
-HTTP is **stateless** (lesson 2.3): each request stands alone; the server doesn't remember that you logged in a moment ago. So every request must carry proof of identity. Atlas uses a **bearer token**: a string sent in the header `Authorization: Bearer <token>`. "Bearer" means whoever holds (bears) it is treated as the user, which is why tokens must be kept secret and short-lived.
+### Bearer tokens
+
+Atlas uses a **bearer token**: a string sent in the header `Authorization: Bearer <token>`. "Bearer" means whoever holds (bears) it is treated as the user, which is why tokens must be kept secret and short-lived.
 
 ### What's in a JWT
 
-A **JWT** (JSON Web Token, RFC 7519) is three parts, base64url-encoded and joined by dots: `header.payload.signature`.
+A **JWT** (JSON Web Token, RFC 7519) is three parts, each base64url-encoded (lesson 2.3) and joined by dots: `header.payload.signature`.
 
 - **Header**: which algorithm signed it, e.g. `{"alg": "HS256", "typ": "JWT"}`.
 - **Payload**: **claims**, statements about the user. Standard ones: `sub` (subject: who it's about), `iat` (issued at), `exp` (expires). Atlas adds `type: "access"`.
-- **Signature**: computed from header and payload with a secret key. **HS256** is HMAC with SHA-256: only someone who knows the key can produce a valid signature.
+- **Signature**: computed from the header and payload with a secret key. **HS256** is HMAC with SHA-256: a way of combining a message with a secret key so that only someone who knows the key can produce the right signature, and any change to the message changes the signature completely.
 
-Here is a real Atlas token's payload, decoded with nothing but `base64`:
+A real Atlas token's payload, decoded with nothing but `base64`:
 
 ```text
 $ echo $TOKEN | cut -d. -f2 | base64 -d
@@ -34,10 +52,22 @@ $ echo $TOKEN | cut -d. -f2 | base64 -d
 
 Two lessons in that output:
 
-1. **A JWT is signed, not encrypted.** Anyone can read the payload. Never put secrets or personal data in it.
-2. Changing the payload (say `"sub":"1"`) breaks the signature, and the server rejects it. That's what makes it trustworthy.
+1. **A JWT is signed, not encrypted.** Anyone holding it can read the payload. Never put secrets or personal data in it.
+2. **The signature is the only thing that makes it trustworthy.** Everything else in the token is chosen by whoever sent it. The server's checks, all of them, are what separate a token from a forgery.
 
-`exp - iat` is 900 seconds: 15 minutes. A short life limits the damage if a token leaks, because a JWT can't easily be revoked before it expires. Lesson 4.10 adds long-lived **refresh tokens** so users don't have to log in every 15 minutes.
+`exp - iat` is 900 seconds: 15 minutes. A JWT is checked without the database, so it can't easily be revoked before it expires; a short life limits the damage if one leaks. Lesson 4.10 adds long-lived **refresh tokens**, which *can* be revoked, so users don't have to log in every 15 minutes.
+
+### The checks a server must make
+
+To accept a token, the server must confirm all of:
+
+| Check | Stops |
+|---|---|
+| The signature matches, using **our** key | edited payloads; tokens signed by someone else |
+| The algorithm is the one **we** chose, not what the header says | `"alg": "none"` and algorithm-swap tricks |
+| `exp` is in the future | old, leaked tokens |
+| `type` is `"access"` | other kinds of token used in the wrong place |
+| The user in `sub` still exists | tokens of deleted accounts |
 
 ### The OAuth2 password flow
 
@@ -52,7 +82,7 @@ sequenceDiagram
   A->>DB: find user, verify Argon2 hash
   A-->>C: access_token (JWT, 15 min)
   C->>A: GET /users/me + Authorization: Bearer JWT
-  A->>A: check signature and expiry
+  A->>A: signature, algorithm, expiry, type
   A->>DB: load user by id from "sub"
   A-->>C: 200 user
 ```
@@ -63,7 +93,61 @@ sequenceDiagram
 uv add pyjwt python-multipart
 ```
 
-### Creating and checking tokens
+### Red: what the server must refuse
+
+Test first, and since this is security code, the tests carry out the attacks. `tests/test_api_tokens.py` starts from an attacker's own valid token and builds five forgeries:
+
+```python
+def encode_part(data: dict[str, object]) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+
+def forge(kind: str, real_token: str, secret_key: str) -> str:
+    """A token an attacker could build, starting from their own valid one."""
+    header, payload, signature = real_token.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+    someone_else = {**claims, "sub": str(int(claims["sub"]) + 1)}
+    if kind == "tampered payload":
+        return ".".join([header, encode_part(someone_else), signature])
+    if kind == "alg none":
+        return ".".join([encode_part({"alg": "none", "typ": "JWT"}), encode_part(someone_else), ""])
+    if kind == "wrong key":
+        return jwt.encode(someone_else, "a-guessed-key-that-is-long-enough-for-hs256", "HS256")
+    if kind == "expired":
+        expired = {**claims, "exp": datetime.now(UTC) - timedelta(minutes=1)}
+        return jwt.encode(expired, secret_key, "HS256")
+    if kind == "not an access token":
+        return jwt.encode({**claims, "type": "refresh"}, secret_key, "HS256")
+    raise ValueError(kind)
+
+
+@pytest.mark.parametrize(
+    "kind", ["tampered payload", "alg none", "wrong key", "expired", "not an access token"]
+)
+def test_forged_tokens_are_rejected(
+    client: TestClient, api_settings: ApiSettings, kind: str
+) -> None:
+    sign_up(client, "mallory@example.com")
+    sign_up(client, "victim@example.com")
+    login = client.post(
+        "/auth/login", data={"username": "mallory@example.com", "password": "a-long-password"}
+    )
+    secret_key = api_settings.secret_key.get_secret_value()
+    token = forge(kind, login.json()["access_token"], secret_key)
+
+    response = client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401
+```
+
+- **Tampered payload**: Mallory changes `sub` to the next user's id and keeps her old signature.
+- **Alg none**: a header claiming "no signature needed", and no signature at all.
+- **Wrong key**: a properly signed token, but with a key the attacker guessed.
+- **Expired** and **not an access token**: signed with the *real* key (as if leaked), but past `exp`, or of the wrong `type`.
+
+Two tests here use the real key to sign: an attacker can't do that, but a token that leaked from a real user can be old, or can be a different kind of token. Those tests check that the server looks at more than the signature.
+
+### Green: creating and checking tokens
 
 `security.py`:
 
@@ -103,7 +187,7 @@ def decode_access_token(token: str, secret_key: str) -> int:
     return int(payload["sub"])
 ```
 
-`jwt.decode` checks the signature *and* `exp`. `algorithms=[...]` matters: some old libraries trusted the header's `alg`, and an attacker could set it to `"none"`. Pinning the list closes that hole.
+`jwt.decode` (from **PyJWT**) checks the signature and `exp` together. `algorithms=[...]` is the list of algorithms *we* accept, whatever the header says.
 
 ### Logging in
 
@@ -148,7 +232,7 @@ $ curl -s -X POST http://localhost:8000/auth/login -d 'username=ada@example.com&
 
 ### Protecting routes: `get_current_user`
 
-In `deps.py`, a dependency that turns the header into a `User`, or refuses:
+In `deps.py`, a dependency (lesson 4.4) that turns the header into a `User`, or refuses:
 
 ```python
 # tokenUrl tells the interactive docs where to send the login form.
@@ -180,7 +264,7 @@ def get_current_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 ```
 
-`OAuth2PasswordBearer` reads the `Authorization: Bearer ...` header (and answers 401 itself if it's missing). Now any route that declares `user: CurrentUser` is protected:
+`OAuth2PasswordBearer` reads the `Authorization: Bearer ...` header, and answers 401 itself if it's missing. Any route that declares `user: CurrentUser` is now protected, with no checks inside the route:
 
 ```python
 @router.get("/me", response_model=UserOut)
@@ -194,33 +278,145 @@ $ curl -s http://localhost:8000/users/me
 
 $ curl -s http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN"
 {"id":3,"email":"ada@example.com","github_login":null,"role":"user","skills_profile":"","created_at":"2026-11-18T03:10:48.623999Z"}
+
+$ uv run pytest tests/test_api_tokens.py -v
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[tampered payload] PASSED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[alg none] PASSED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[wrong key] PASSED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[expired] PASSED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[not an access token] PASSED
+============================== 5 passed in 1.97s ===============================
 ```
+
+## Attack it
+
+### A careless decoder
+
+A common mistake, often made while debugging "why won't my token decode?", is to turn the signature check off:
+
+```python
+payload = jwt.decode(token, options={"verify_signature": False})
+```
+
+With that one change, the same five tests:
+
+```text
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[tampered payload] FAILED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[alg none] FAILED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[wrong key] FAILED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[expired] FAILED
+tests/test_api_tokens.py::test_forged_tokens_are_rejected[not an access token] PASSED
+========================= 4 failed, 1 passed in 2.19s ==========================
+```
+
+Four forgeries now get in, as someone else. Note "expired" among them: in PyJWT, turning off signature verification also turns off the expiry check. Only the `type` check, which Atlas does itself, still holds. This is exactly why the tests exist: the code looks almost the same, and the failure is total.
+
+### A guessable key
+
+The other way in: the key itself. Here are the five forgeries again as a script against two running copies of Atlas. Mallory registers, logs in, and tries to become the victim (user 9). The first copy runs with a random 43-character key; the second was started with `SECRET_KEY=changeme`:
+
+```text
+== Atlas with a random SECRET_KEY
+Mallory's own token says: {'sub': '8', 'type': 'access', 'iat': 1795074143, 'exp': 1795075043}
+the victim's user id: 9
+tampered payload         -> 401 Could not validate credentials
+alg none                 -> 401 Could not validate credentials
+signed with 'changeme'   -> 401 Could not validate credentials
+expired                  -> 401 Could not validate credentials
+== Atlas started with SECRET_KEY=changeme
+Mallory's own token says: {'sub': '8', 'type': 'access', 'iat': 1795074143, 'exp': 1795075043}
+the victim's user id: 9
+tampered payload         -> 401 Could not validate credentials
+alg none                 -> 401 Could not validate credentials
+signed with 'changeme'   -> 200 victim@example.com
+expired                  -> 401 Could not validate credentials
+```
+
+With a guessable key, every check in the code passed, because the forgery *was* correctly signed. Mallory is the victim. An HMAC key is as hard to guess as a password made of random bytes would be, and "changeme" is on every attacker's list. The only sign of trouble was a warning PyJWT printed in the server log:
+
+```text
+InsecureKeyLengthWarning: The HMAC key is 8 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+```
+
+A warning in a log that nobody reads protects nobody. So Atlas now refuses to start with a short key, test first (in `tests/test_config.py`, next to lesson 4.2's tests):
+
+```python
+def test_a_short_secret_key_stops_startup() -> None:
+    # A short key can be guessed, and then anyone can sign tokens for any user (lesson 4.8).
+    with pytest.raises(ValidationError) as failure:
+        ApiSettings(database_url="postgresql+psycopg://x/y", secret_key=SecretStr("changeme"))
+
+    assert failure.value.errors()[0]["loc"] == ("secret_key",)
+```
+
+and in `config.py`:
+
+```python
+    # At least 32 characters (256 bits for HS256 keys, RFC 7518): a short key can be
+    # guessed, and whoever knows it can sign tokens for any user (lesson 4.8).
+    secret_key: SecretStr = Field(min_length=32)
+```
+
+```text
+$ SECRET_KEY=changeme uv run uvicorn atlas.api.app:create_app --factory
+...
+secret_key
+  Value should have at least 32 items after validation, not 8 [type=too_short]
+```
+
+Length isn't the same as randomness (32 "a"s is long and terrible), so the key must still come from `secrets.token_urlsafe(32)`, as lesson 4.2 showed. The check stops the commonest accident: a placeholder that reached production.
+
+### A token in a URL
+
+Tokens belong in the `Authorization` header. Some clients put them in the URL instead (`?access_token=...`), because it's easier. Atlas doesn't accept that, but look at what such a request leaves behind, even when refused:
+
+```text
+$ curl -s "http://localhost:8000/users/me?access_token=$TOKEN"
+```
+```text
+INFO:     127.0.0.1:59458 - "GET /users/me?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4IiwidHlwZSI6ImFjY2VzcyIsImlhdCI6MTc5NTA3NDIzNiwiZXhwIjoxNzk1MDc1MTM2fQ.aTyYzRb4JzhEvx0hPDHvLql1... 401 Unauthorized
+```
+
+The server's access log now holds a working token. URLs are also kept in browser history, proxy logs and analytics tools. Headers aren't written to any of those by default.
 
 ### Where the web page keeps tokens
 
 The ready-made web interface (`web/app.js`) keeps tokens in `sessionStorage`, which is cleared when the tab closes. Any script running on the page can read it, so the page loads no third-party scripts. The alternative, an `HttpOnly` cookie that scripts can't read, brings its own problem (cross-site request forgery, lesson 7.10). Both are common; know the trade-off.
 
+## Trade-offs: tokens or sessions? *(deep dive)*
+
+| | Signed tokens (JWT) | Server-side sessions |
+|---|---|---|
+| What the client holds | the claims themselves, signed | a random id |
+| What the server checks per request | signature and claims, no lookup | looks the id up in a table or cache |
+| Revoking one immediately | hard: valid until `exp` | easy: delete the row |
+| Works across many services | yes: any service with the key can check | each service needs the session store |
+| Size | hundreds of bytes | a few dozen bytes |
+
+Atlas takes the common middle path: short-lived JWT access tokens (no lookup on each request) plus long-lived refresh tokens stored in the database (revocable), in lesson 4.10. HS256 means one shared key signs and checks. With many separate services, an asymmetric algorithm such as RS256 or EdDSA lets only the login service hold the signing key while the others hold a public key that can check signatures but not make them.
+
 ## Common mistakes
 
-- **Secrets in the payload.** It's readable by anyone holding the token.
+- **Turning off verification** "temporarily", as shown above.
 - **Not pinning `algorithms`** when decoding.
-- **Long-lived access tokens** (days). Keep them short and use refresh tokens.
 - **A weak or committed `SECRET_KEY`**: anyone with it can mint tokens for any user.
-- **Trusting `sub` without loading the user**: a deleted user's token would still work until it expires. Atlas looks the user up.
-- **Sending tokens in URLs** (`?token=...`): URLs end up in logs and browser history. Use the header.
+- **Secrets in the payload.** It's readable by anyone holding the token.
+- **Long-lived access tokens** (days). Keep them short and use refresh tokens.
+- **Trusting `sub` without loading the user**: a deleted user's token would still work until it expires.
+- **Tokens in URLs**: they land in logs and browser history.
 
 ## Check yourself
 
-**1.** Someone copies your JWT and edits the payload to `"sub":"1"`. What happens?
+**1.** Mallory edits her token's payload to `"sub":"9"`. Exactly which check rejects it, and why can't she fix that?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-The signature no longer matches the edited header and payload, so `jwt.decode` raises and Atlas answers 401. Only someone with the secret key can sign a new payload.
+The signature check: the signature was computed over the original header and payload, so it no longer matches. Making a new valid signature needs the secret key, which only the server has (as long as it's long and random).
 :::
 
-**2.** Why is the access token valid for only 15 minutes?
+**2.** Why did the "expired" forgery get through the careless decoder, even though it had nothing to do with signatures?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-A JWT is checked without the database, so it can't easily be revoked: a stolen token works until it expires. A short life limits that window. Refresh tokens (lesson 4.10), which can be revoked, keep users signed in.
+In PyJWT, `options={"verify_signature": False}` also switches off the checks on claims like `exp`. One "small" change disabled two defences, which only the tests revealed.
 :::
 
 **3.** Why is the login body a form, not JSON?
@@ -231,27 +427,24 @@ It follows OAuth2's password flow, which specifies form fields named `username` 
 
 ## Exercise
 
-Log in on `/docs` with the **Authorize** button, then call `GET /users/me` from the docs page. Afterwards, copy the token, change one character in its signature, and call `/users/me` with curl.
+Add a sixth forgery to `forge`: a token whose `sub` refers to a user that doesn't exist (say `"999999"`), correctly signed with the real key, as if the account had been deleted after the token was issued. Run it red by removing the `if user is None` check from `get_current_user`; then restore the check.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-The docs page sends the form to `/auth/login` (from `tokenUrl`) and attaches the token to later calls. With the tampered token you get 401 `Could not validate credentials`. The test `test_me_requires_a_valid_token` (lesson 4.5) checks exactly this.
+```python
+    if kind == "deleted user":
+        return jwt.encode({**claims, "sub": "999999"}, secret_key, "HS256")
+```
+and add `"deleted user"` to the parametrize list. Without the check, `read_me` returns `None` for the user, and FastAPI raises `ResponseValidationError` while building the `UserOut` response: a 500, not a 401. With the check, it's 401. Not in the reference code.
 :::
 
 ## Stretch
 
-Using PyJWT in a shell, create a token for user 3 that expired a minute ago (`lifetime=timedelta(minutes=-1)`) and decode it with `decode_access_token`. Which exception does PyJWT raise underneath?
+Decode the "expired" forgery from the tests with `jwt.decode(token, key, algorithms=["HS256"])` in a shell. Which exception does PyJWT raise? Then decode it again with `leeway=120` (seconds) and explain when a small leeway is reasonable.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-```python
-from datetime import timedelta
-from atlas.security import create_access_token, decode_access_token
-
-token = create_access_token(3, "some-secret-key-long-enough-for-hs256", timedelta(minutes=-1))
-decode_access_token(token, "some-secret-key-long-enough-for-hs256")
-```
-It raises `InvalidToken("Signature has expired")`, wrapping PyJWT's `ExpiredSignatureError` (a subclass of `InvalidTokenError`).
+It raises `jwt.ExpiredSignatureError: Signature has expired` (a subclass of `jwt.InvalidTokenError`, which Atlas catches). With `leeway=120`, a token that expired a minute ago is accepted. A leeway of a few seconds tolerates clocks that differ slightly between the server that issued the token and the one checking it; a large one quietly extends every token's life.
 :::
 
 ## What changed in the project
 
-`security.py` gains token functions; `deps.py` gains `get_current_user` and `CurrentUser`; new routes `POST /auth/login` and `GET /users/me`. `pyjwt` and `python-multipart` added. Commit: `feat: Added JWT login`.
+`security.py` gains token functions; `deps.py` gains `get_current_user` and `CurrentUser`; new routes `POST /auth/login` and `GET /users/me`; `config.py` requires a 32-character key; `tests/test_api_tokens.py`. `pyjwt` and `python-multipart` added. Commits: `feat: Added JWT login`, `fix: Refused to start with a signing key short enough to guess, and tested forged tokens`.
