@@ -4,6 +4,11 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D24. Testing strategy: coverage reported, contract pinned (2026-11-19)
+**Decision:** CI prints coverage (with greenlet-aware measurement) but sets no threshold; a committed snapshot of the OpenAPI paths, methods and status codes is compared on every run; fakes stand in only for external services. Recorded in [06-conventions.md](06-conventions.md) under "Tests".
+**Why:** coverage found a real untested security property (tokens in the sign-in redirect), but a threshold rewards tests that run lines without checking them; a route rename broke the web UI's contract while every behaviour test could pass.
+**Rejected:** a coverage gate (encourages hollow tests); generated client tests (another toolchain for what one snapshot test covers); automated mutation testing in CI (too slow per commit; done by hand for security rules instead).
+
 ### D23. Stable error codes, JSON logs and strict request bodies (2026-11-19)
 **Decision:** routes raise one `ApiError` class carrying a status and a stable code; Starlette's own HTTP errors and crashes use the same JSON shape; every request is logged as one JSON line with its request id (a `ContextVar` stamped on each record); request schemas refuse unknown fields. Recorded in [06-conventions.md](06-conventions.md) under "API rules".
 **Why:** the depth pass found unknown routes and 405s bypassing the error format, 500s without an `X-Request-ID` header, two different failures sharing one code, logs that couldn't be searched by request id, and unknown fields (such as `"role"`) being silently ignored.
