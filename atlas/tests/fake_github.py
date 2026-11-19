@@ -1,5 +1,10 @@
 """A fake GitHub API for tests: real httpx requests, answered in memory, no network."""
 
+import base64
+import hashlib
+import secrets
+from urllib.parse import parse_qs, urlparse
+
 import httpx
 
 
@@ -75,23 +80,65 @@ def fake_github(request: httpx.Request) -> httpx.Response:
 TRANSPORT = httpx.MockTransport(fake_github)
 
 
-def fake_github_oauth(request: httpx.Request) -> httpx.Response:
-    """GitHub's sign-in endpoints: the code exchange and the "who am I" call."""
-    if request.url.path == "/login/oauth/access_token":
-        form = dict(httpx.QueryParams(request.content.decode()))
-        is_good_code = form.get("code") == "good-code" and bool(form.get("code_verifier"))
-        if not is_good_code:
-            return httpx.Response(
-                200,
-                json={
-                    "error": "bad_verification_code",
-                    "error_description": "The code passed is incorrect or expired.",
-                },
-            )
-        return httpx.Response(200, json={"access_token": "gho_fake", "token_type": "bearer"})
-    if request.url.path == "/user":
-        return httpx.Response(200, json={"id": 4242, "login": "octo-learner"})
-    return httpx.Response(404, json={"message": "Not Found"})
+class FakeGitHubSignIn:
+    """GitHub's sign-in, faked closely enough to test the attacks in lesson 4.9.
+
+    Like GitHub, it issues a code when the user approves, remembers the PKCE challenge
+    that code was issued for, accepts each code once, and only for the matching verifier.
+    """
+
+    def __init__(self) -> None:
+        self.issued: dict[str, tuple[str | None, dict[str, object]]] = {}
+        self.access_tokens: dict[str, dict[str, object]] = {}
+        self.transport = httpx.MockTransport(self.handle)
+
+    def approve(
+        self, authorize_url: str, github_id: int = 4242, login: str = "octo-learner"
+    ) -> str:
+        """What happens at GitHub when the user clicks "Authorize": a code for this request."""
+        query = parse_qs(urlparse(authorize_url).query)
+        code = f"code-{len(self.issued) + 1}"
+        # Without PKCE there is no challenge, and GitHub accepts the code with any verifier.
+        challenge = query["code_challenge"][0] if "code_challenge" in query else None
+        self.issued[code] = (challenge, {"id": github_id, "login": login})
+        return code
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login/oauth/access_token":
+            return self.exchange(dict(httpx.QueryParams(request.content.decode())))
+        if request.url.path == "/user":
+            token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+            user = self.access_tokens.get(token)
+            if user is None:
+                return httpx.Response(401, json={"message": "Bad credentials"})
+            return httpx.Response(200, json=user)
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    def exchange(self, form: dict[str, str]) -> httpx.Response:
+        code = form.get("code", "")
+        issued = self.issued.pop(code, None)  # a code works once, even if this attempt fails
+        if issued is None:
+            return bad_code()
+        challenge, user = issued
+        verifier = form.get("code_verifier", "")
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        verifier_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        verifier_is_wrong = challenge is not None and not secrets.compare_digest(
+            verifier_challenge, challenge
+        )
+        if verifier_is_wrong:
+            return bad_code()
+        access_token = f"gho_fake_{code}"
+        self.access_tokens[access_token] = user
+        return httpx.Response(200, json={"access_token": access_token, "token_type": "bearer"})
 
 
-OAUTH_TRANSPORT = httpx.MockTransport(fake_github_oauth)
+def bad_code() -> httpx.Response:
+    """The shape of GitHub's answer to a code it won't accept."""
+    return httpx.Response(
+        200,
+        json={
+            "error": "bad_verification_code",
+            "error_description": "The code passed is incorrect or expired.",
+        },
+    )
