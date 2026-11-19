@@ -96,19 +96,35 @@ async def async_session(engine: Engine) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
-async def client(
-    async_session: AsyncSession, api_settings: ApiSettings
-) -> AsyncIterator[httpx.AsyncClient]:
-    """The real app, called in-process (no server, no network), on the test's session."""
-    app = create_app(api_settings, github_transport=OAUTH_TRANSPORT)
+def github() -> FakeGitHubSignIn:
+    """A fresh fake GitHub per test, so codes issued in one test can't leak into another."""
+    return FakeGitHubSignIn()
+
+
+@pytest.fixture
+def api_app(
+    async_session: AsyncSession, api_settings: ApiSettings, github: FakeGitHubSignIn
+) -> FastAPI:
+    """The real app, wired to the test's rolled-back session and the fake GitHub."""
+    app = create_app(api_settings, github_transport=github.transport)
 
     async def test_session() -> AsyncIterator[AsyncSession]:
         yield async_session
 
     # Every route that asks for a database session gets the test's rolled-back one.
     app.dependency_overrides[get_session] = test_session
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as test_client:
+    return app
+
+
+def browser(app: FastAPI) -> httpx.AsyncClient:
+    """A client with its own cookies, like a separate browser (lesson 4.9's attacks need two)."""
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture
+async def client(api_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """The real app, called in-process (no server, no network)."""
+    async with browser(api_app) as test_client:
         yield test_client
 ```
 
@@ -164,34 +180,16 @@ Test names state the rule being checked, so a failure explains itself.
 
 ### Faking GitHub sign-in
 
-`tests/fake_github.py` answers GitHub's two sign-in endpoints. The code exchange succeeds only for the code `good-code` *with* a code verifier, so a regression that dropped PKCE would fail:
-
-```python
-def fake_github_oauth(request: httpx.Request) -> httpx.Response:
-    """GitHub's sign-in endpoints: the code exchange and the "who am I" call."""
-    if request.url.path == "/login/oauth/access_token":
-        form = dict(httpx.QueryParams(request.content.decode()))
-        is_good_code = form.get("code") == "good-code" and bool(form.get("code_verifier"))
-        if not is_good_code:
-            ...  # GitHub's real error shape: {"error": "bad_verification_code", ...}
-    ...
-
-
-OAUTH_TRANSPORT = httpx.MockTransport(fake_github_oauth)
-```
-
-And the test drives the real flow, cookie and all:
+`tests/fake_github.py`'s `FakeGitHubSignIn` (lesson 4.9) behaves like GitHub where it matters: `approve(authorize_url)` issues a single-use code tied to the PKCE challenge in that URL, and the code exchange succeeds only with the matching verifier. A fake that accepted any code would let the attack tests pass against broken code. The tests drive the real flow, cookie and all:
 
 ```python
 async def test_github_callback_creates_then_reuses_the_account(
-    client: httpx.AsyncClient, async_session: AsyncSession
+    client: httpx.AsyncClient, async_session: AsyncSession, github: FakeGitHubSignIn
 ) -> None:
     for _ in range(2):
-        start = await client.get("/auth/github/login", follow_redirects=False)
-        state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-        response = await client.get(
-            "/auth/github/callback", params={"code": "good-code", "state": state}
-        )
+        authorize_url, state = await start_sign_in(client)
+        code = github.approve(authorize_url)
+        response = await client.get("/auth/github/callback", params={"code": code, "state": state})
         assert response.status_code == 200
         assert set(response.json()) >= {"access_token", "refresh_token"}
 
@@ -221,31 +219,28 @@ Starlette's `TestClient` drives WebSockets, but it runs the app on its own event
 
 ```text
 $ uv run pytest tests/test_api_auth.py -v
-tests/test_api_auth.py::test_health_and_readiness PASSED
 tests/test_api_auth.py::test_register_never_returns_the_password PASSED
 tests/test_api_auth.py::test_passwords_are_stored_as_argon2_hashes PASSED
 tests/test_api_auth.py::test_duplicate_email_is_a_conflict_in_the_standard_error_shape PASSED
 tests/test_api_auth.py::test_invalid_input_lists_each_problem PASSED
 tests/test_api_auth.py::test_login_failures_look_identical PASSED
+tests/test_api_auth.py::test_unknown_emails_cost_one_hash_like_real_ones PASSED
 tests/test_api_auth.py::test_me_requires_a_valid_token PASSED
 tests/test_api_auth.py::test_patch_changes_only_the_fields_sent PASSED
+tests/test_api_auth.py::test_patch_rejects_null_for_a_field_that_cannot_be_empty PASSED
 tests/test_api_auth.py::test_refresh_rotates_tokens PASSED
 tests/test_api_auth.py::test_reusing_a_refresh_token_signs_out_everywhere PASSED
 tests/test_api_auth.py::test_logout_revokes_the_refresh_token PASSED
-tests/test_api_auth.py::test_github_login_redirects_with_state_and_pkce PASSED
-tests/test_api_auth.py::test_github_callback_rejects_a_state_it_did_not_issue PASSED
-tests/test_api_auth.py::test_github_callback_creates_then_reuses_the_account PASSED
-tests/test_api_auth.py::test_github_callback_reports_a_bad_code PASSED
 tests/test_api_auth.py::test_request_id_is_echoed PASSED
 tests/test_api_auth.py::test_cors_allows_only_configured_origins PASSED
-============================== 17 passed in 2.11s ==============================
+============================== 14 passed in 2.45s ==============================
 
 $ uv run pytest -q
 ...
-81 passed, 1 warning in 5.27s
+111 passed, 1 warning in 7.77s
 ```
 
-81 tests, including Parts 1 to 3, in about five seconds against a real database. The one warning comes from Starlette: its `TestClient` will move from `httpx` to a successor package, `httpx2`. It doesn't affect results; the course will follow when the change settles.
+111 tests, including Parts 1 to 3, in under eight seconds against a real database. The one warning comes from Starlette: its `TestClient` will move from `httpx` to a successor package, `httpx2`. It doesn't affect results; the course will follow when the change settles.
 
 CI also runs the migrations from scratch, down and up again, and `alembic check` (lesson 4.13).
 
@@ -266,10 +261,10 @@ CI also runs the migrations from scratch, down and up again, and `alembic check`
 `app.dependency_overrides[get_session]` replaces the session dependency with one that yields the fixture's `AsyncSession`, which is bound to a connection inside an open transaction. Routes' commits become savepoints, and the fixture rolls the outer transaction back at the end.
 :::
 
-**2.** Why does `fake_github_oauth` insist on a `code_verifier`?
+**2.** Why does `FakeGitHubSignIn` check the verifier against the challenge, instead of accepting any code?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-So the tests would catch a regression that stopped sending PKCE's verifier. The fake encodes the real server's rule; a fake that accepts anything can't catch protocol mistakes.
+So the tests would catch a regression that stopped sending PKCE's verifier, or sent the wrong one. The fake encodes the real server's rule; a fake that accepts anything can't catch protocol mistakes, as lesson 4.9's "remove one defence" runs showed.
 :::
 
 **3.** Why does the WebSocket test commit and clean up instead of rolling back?
@@ -307,4 +302,4 @@ Build a second `MockTransport` whose function returns a good token for `/login/o
 
 ## What changed in the project
 
-`tests/conftest.py` gains `anyio_backend`, `api_settings`, `async_session`, `client` and `sign_up`; `tests/fake_github.py` fakes sign-in; new `test_api_auth.py`, `test_api_resources.py` and `test_api_websocket.py`; CI checks migrations. Commit: `test: Added API tests`.
+`tests/conftest.py` gains `anyio_backend`, `async_session` and the async `client`; `tests/fake_github.py` fakes sign-in; new `test_api_auth.py`, `test_api_resources.py` and `test_api_websocket.py`; CI checks migrations. Commit: `test: Added API tests`.

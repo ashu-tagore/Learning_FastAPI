@@ -19,7 +19,7 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 | 4.7 | [Users and password hashing](07-users-and-password-hashing.qmd) | Users |
 | 4.8 | [Authentication with JWT](08-authentication-with-jwt.qmd) | Login, `get_current_user` |
 | 4.9 | [Sign in with GitHub: OAuth2 and PKCE](09-sign-in-with-github.qmd) | GitHub login |
-| 4.10 | Staying signed in: refresh tokens, logout and roles *(coming soon)* | Refresh tokens, admin role |
+| 4.10 | [Staying signed in: refresh tokens, logout and roles](10-staying-signed-in.qmd) | Refresh tokens, admin role |
 | 4.11 | [Relationships and authorisation](11-relationships-and-authorisation.qmd) | Saved issues, admin-only routes |
 | 4.12 | [Querying: pagination (offset and cursor), filtering, search](12-pagination-filtering-search.qmd) | `/search` (keyword), `/issues` |
 | 4.13 | [Migrations with Alembic](13-migrations-with-alembic.qmd) | Migrations |

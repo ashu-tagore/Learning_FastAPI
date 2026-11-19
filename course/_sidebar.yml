@@ -64,6 +64,7 @@ website:
           - part-4-fastapi/07-users-and-password-hashing.qmd
           - part-4-fastapi/08-authentication-with-jwt.qmd
           - part-4-fastapi/09-sign-in-with-github.qmd
+          - part-4-fastapi/10-staying-signed-in.qmd
           - part-4-fastapi/11-relationships-and-authorisation.qmd
           - part-4-fastapi/12-pagination-filtering-search.qmd
           - part-4-fastapi/13-migrations-with-alembic.qmd
