@@ -1,0 +1,439 @@
+---
+title: "5.4 Object storage with the S3 API (SeaweedFS locally)"
+description: "Store each indexed commit's files as an archive in S3-compatible object storage, upload without holding them in memory, hand out download links that expire, and attack those links to see what the signature protects."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 4 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Attack it". The trade-offs section *(deep dive)* compares object storage with Postgres and with a shared disk.
+:::
+
+::: {.callout-note title="Analogy: a left-luggage office"}
+A station's left-luggage office doesn't care what's in your bag. You hand it over, you get a ticket with a number, and anyone holding that ticket can collect the bag. It's huge, cheap, and it never opens your bag to look inside. It also can't answer questions like "which bags contain a red scarf?": for that you'd need a catalogue, kept somewhere else.
+
+**Object storage** is that office. The ticket number is the object's **key**. A **presigned URL** is a ticket that stops working at a set time. The catalogue is Postgres.
+:::
+
+## The problem
+
+Atlas indexes a commit, but it keeps no copy of the files it indexed. The worker's clone moves on with every sync, and other machines (the API, and in Part 8 the agent's sandbox) can't see the worker's disk at all. Users want the exact files behind a search result, and Part 8 needs them to run an agent against a known commit.
+
+So each indexed commit should be saved as one archive: `git archive` makes a `.tar.gz` of a commit's files, the same thing as GitHub's "Download ZIP". For `pytorch/ignite` at `0abbcab` it's 7.6 MB. Where does a file like that go?
+
+The first answer is "upload it the simple way": read the archive into a Python `bytes` value and send it. Measured with `tracemalloc` (Python's memory tracer) on the real Ignite archive:
+
+```text
+in memory:   archive 7.6 MB, peak 15.2 MB, 0.43s
+```
+
+The peak is twice the archive: the archive itself, plus a copy made on the way out. For Ignite that's harmless. But memory grows with the repository: a 2 GB monorepo would need 4 GB of memory in a worker that runs in a container with a fixed memory limit, and the container is killed when it crosses it. Code that works on the test repository and crashes on the large one is the worst kind, because it passes every test.
+
+Then there's handing the file to a user. Sending it through the API means an API process spends its time streaming megabytes instead of answering requests, and the API needs read access to wherever the files live.
+
+## Theory
+
+### Object storage
+
+**Object storage** keeps **objects** (any bytes, from a few bytes to terabytes) in **buckets** (named containers), each under a **key** (a name, like a file path). You can put an object, get it, delete it, list keys by prefix, and attach a little metadata. You can't change part of an object, rename it cheaply, or search inside it. In exchange it's practically unlimited, very durable, cheap per gigabyte, and reachable over HTTP from any machine.
+
+**S3** is Amazon's object storage, and its HTTP interface, the **S3 API**, has become a standard that many other products speak. Atlas uses **SeaweedFS**, an open-source server with an S3 API, locally and in CI, and real S3 on AWS (Part 7). The Python client is **boto3**, AWS's official SDK. Atlas's code doesn't know which one it's talking to, apart from one setting: the **endpoint URL** (where to send requests). Unset, boto3 talks to AWS.
+
+Keys in S3 are flat strings: `snapshots/pytorch/ignite/0abb....tar.gz` isn't in a folder, the slashes are just characters. Listing "by prefix" (all keys starting with `snapshots/pytorch/ignite/`) gives the feel of folders.
+
+### Immutable objects, keyed by content
+
+Atlas's key for a snapshot includes the commit:
+
+```text
+snapshots/<owner>/<name>/<commit>.tar.gz
+```
+
+A commit never changes, so neither does its archive: `git archive` is deterministic (two runs gave the same MD5 checksum, `8c511a537fdad9af5eac0fed73439625`). That makes the object **immutable**: written once, never updated. Immutable objects make everything easier. Uploading is idempotent (if the key exists, skip it), caches never go stale, and a download can't catch a half-replaced file.
+
+### Streaming and multipart upload
+
+To keep memory flat, the archive never becomes a Python value: `git archive` writes it to a temporary file, and boto3's `upload_file` reads that file in pieces. Above 8 MB (boto3's default threshold), `upload_file` uses **multipart upload**: the file goes up as separate parts, sent in parallel and retried individually, and the server joins them at the end. A 200 MB file of random bytes, uploaded the same way:
+
+```text
+200 MB via upload_file: peak 17.5 MB, 1.0s
+parts: "df3b11f7ea82b45847677d2fb7839a83-24"
+```
+
+The `-24` at the end of the object's ETag is the number of parts (200 MB in 8 MiB parts). Peak memory stayed under 18 MB for a file eleven times larger than the in-memory version's peak.
+
+### Presigned URLs
+
+Atlas's bucket is private: an unsigned request gets `AccessDenied`. To let a user download one object, Atlas makes a **presigned URL**: the object's address plus a signature, computed with Atlas's secret key over the request (method, bucket, key) and an expiry time. Anyone with the URL can make exactly that request until it expires. The server checks the signature with its copy of the key, like the webhook signatures in lesson 5.2, which is no coincidence: AWS's **Signature Version 4** (SigV4) is built from HMAC-SHA256.
+
+Two consequences:
+
+- **Signing needs no network call.** The URL is computed locally from the key, so making one is instant.
+- **The URL is the permission.** Whoever has it can download, without an Atlas account, until it expires. So links are short-lived (Atlas uses 5 minutes) and only handed to signed-in users.
+
+The bytes then go straight from object storage to the user. The API only hands out tickets.
+
+```{mermaid}
+sequenceDiagram
+    participant U as User
+    participant API as Atlas API
+    participant S3 as Object storage
+    participant W as Worker
+    W->>S3: upload_file snapshots/repo/commit.tar.gz (multipart)
+    U->>API: GET /repos/1/snapshot (bearer token)
+    API->>S3: HEAD the key (does it exist?)
+    API-->>U: url signed for 5 minutes
+    U->>S3: GET url
+    S3-->>U: 7.6 MB archive (the API never sees it)
+```
+
+### Retention
+
+Snapshots pile up: one per indexed commit. Atlas keeps the newest three per repository (`SNAPSHOTS_KEPT`) and deletes the rest after each upload. S3 can also do this by itself with **lifecycle rules** ("delete objects under `snapshots/` after 30 days"); SeaweedFS accepted such a rule in testing, but Atlas prunes in code because "keep the newest three" isn't a time rule, and code is testable here.
+
+## In the project
+
+### SeaweedFS in compose
+
+```yaml
+  # S3-compatible object storage for repository snapshots (lesson 5.4). On AWS: real S3.
+  # `weed mini` runs every SeaweedFS part in one process, which is plenty for development.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.54
+    command: ["mini", "-dir=/data", "-bucket=atlas-snapshots"]
+    environment:
+      # Throwaway local credentials, like the database password above.
+      AWS_ACCESS_KEY_ID: atlas
+      AWS_SECRET_ACCESS_KEY: atlas-dev-secret-key
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - atlas-objects:/data
+```
+
+`weed mini` creates the bucket at startup and reads its admin credentials from the two variables; its log confirms it: `Added admin identity from AWS environment variables: name=admin-atlas, accessKey=atlas`. Atlas reads the same two variables, under the same names, because boto3 looks for them itself. That's deliberate: Atlas's settings gain `S3_ENDPOINT_URL`, `S3_REGION`, `SNAPSHOT_BUCKET` and `SNAPSHOTS_KEPT`, but no key. On AWS, the worker gets temporary credentials from its IAM role (lesson 7.3) and no key exists to configure or leak.
+
+In CI, SeaweedFS starts in a step with `docker run`, because GitHub Actions' `services` can't pass a command.
+
+### `atlas/snapshots.py`
+
+```python
+class SnapshotStore:
+    def __init__(self, client: S3Client, bucket: str) -> None:
+        self.client = client
+        self.bucket = bucket
+
+    @staticmethod
+    def key(repo: str, commit: str) -> str:
+        return f"snapshots/{repo}/{commit}.tar.gz"
+
+    def exists(self, repo: str, commit: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=self.key(repo, commit))
+        except ClientError as error:
+            is_missing = error.response.get("Error", {}).get("Code") in ("404", "NoSuchKey")
+            if is_missing:
+                return False
+            raise
+        return True
+```
+
+`head_object` asks for an object's metadata without its bytes. boto3 reports a missing object as a `ClientError` whose code is `404`; any other error (wrong credentials, storage down) is re-raised rather than mistaken for "missing". `@staticmethod` marks a method that uses no instance data, so it can be called on the class: `SnapshotStore.key(...)`.
+
+`upload` is the streaming version:
+
+```python
+def upload(self, repo: str, commit: str, clone: Path) -> bool:
+    if self.exists(repo, commit):
+        return False
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive:
+        subprocess.run(
+            ["git", "archive", "--format=tar.gz", commit],
+            cwd=clone,
+            stdout=archive,
+            check=True,
+        )
+        archive.flush()
+        committed_at = subprocess.run(
+            ["git", "show", "-s", "--format=%cI", commit],
+            cwd=clone, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.client.upload_file(
+            archive.name,
+            self.bucket,
+            self.key(repo, commit),
+            # Stored with the object as an x-amz-meta-committed-at header; prune() sorts
+            # by it, because LastModified is only accurate to the second.
+            ExtraArgs={"Metadata": {"committed-at": committed_at}},
+        )
+    return True
+```
+
+`stdout=archive` sends Git's output straight into the temporary file (lesson 5.3 met `subprocess.run`). `NamedTemporaryFile` deletes the file when the `with` block ends, even after an error. The same measurement as in "The problem", through this code:
+
+```text
+in memory:   archive 7.6 MB, peak 15.2 MB, 0.43s
+via a file:  peak 2.3 MB, 0.39s
+```
+
+The metadata line came from a failing test. Pruning first sorted snapshots by their `LastModified` time. Listing three objects uploaded in a row showed why that's unreliable:
+
+```text
+t/a 2026-11-19T14:18:00+00:00
+t/b 2026-11-19T14:18:00+00:00
+t/c 2026-11-19T14:18:00+00:00
+```
+
+One-second resolution: "newest" was a coin toss. The commit's own time, stored as **user metadata** (`x-amz-meta-*` headers kept with the object), is both precise enough and the right meaning of "newest". `prune` reads it with `head_object` for each snapshot of the repository, sorts, and deletes all but the newest `keep`.
+
+### Red, then green: links signed with the right version
+
+The first version made the boto3 client with only an endpoint and a region. Its links worked, but a check of the attack in "Attack it" below behaved strangely: editing the link's expiry changed nothing. The reason was in the URL:
+
+```text
+...0abbcab445634b98efcdc6e2d19e3235c0e13e3d.tar.gz?AWSAccessKeyId=atlas&Signature=CW5CWSoZ...&Expires=1795098467
+```
+
+`AWSAccessKeyId`, `Signature`, `Expires`: that's **Signature Version 2**, an older scheme AWS has deprecated. boto3 1.44.6 chose it for presigned URLs unless told otherwise, so there was no `X-Amz-Expires` parameter to edit. Regression tests:
+
+```python
+def test_download_links_use_signature_version_4(
+    snapshot_store: SnapshotStore, upstream: Path
+) -> None:
+    # Regression (lesson 5.4): without an explicit config, boto3 signed with Version 2.
+    url, _ = snapshot_store.download_url("pytorch/ignite", head_commit(upstream))
+
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
+    assert "X-Amz-Expires=300" in url
+
+
+def test_editing_a_signed_link_breaks_it(snapshot_store: SnapshotStore, upstream: Path) -> None:
+    commit = head_commit(upstream)
+    snapshot_store.upload("pytorch/ignite", commit, upstream)
+    url, _ = snapshot_store.download_url("pytorch/ignite", commit)
+
+    longer = url.replace("X-Amz-Expires=300", "X-Amz-Expires=604800")
+
+    assert httpx.get(url).status_code == 200
+    assert httpx.get(longer).status_code == 403
+```
+
+Red with the old client (`AssertionError: assert 'X-Amz-Algorithm=AWS4-HMAC-SHA256' in '...?AWSAccessKeyId=atlas&Signature=...'`). Green with one explicit setting:
+
+```python
+# Signature Version 4, always. Left to itself, boto3 1.44 signed download links with the
+# older Version 2 (AWSAccessKeyId, Signature and Expires in the URL), which AWS has
+# deprecated (lesson 5.4).
+S3_CONFIG = Config(signature_version="s3v4")
+
+
+def make_s3_client(settings: Settings) -> S3Client:
+    # Credentials are not passed: boto3 finds them in the environment, or on AWS from the
+    # task's IAM role. Code that never handles a key can't leak one.
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        region_name=settings.s3_region,
+        config=S3_CONFIG,
+    )
+```
+
+The lesson: "it works" and "it does what you think" are different claims. A test that reads the URL catches the difference.
+
+### A job of its own
+
+Snapshots are a third job kind, `snapshot_repo`, not a step at the end of `sync_repo`:
+
+```python
+def snapshot_repo(repo: Repo, settings: Settings, snapshots: SnapshotStore) -> bool:
+    """Store a snapshot of the indexed commit, unless it's stored already; prune old ones.
+
+    A separate job from sync_repo on purpose: if object storage is down, indexing carries
+    on, and only snapshots wait for their retries.
+    """
+    commit = repo.indexed_commit
+    if commit is None:
+        return False  # never indexed: nothing to snapshot yet
+    path = Path(settings.repos_dir) / repo.full_name
+    url = f"{settings.git_base_url}/{repo.full_name}.git"
+    gitrepo.clone_or_update(url, path)
+    uploaded = snapshots.upload(repo.full_name, commit, path)
+    snapshots.prune(repo.full_name, keep=settings.snapshots_kept)
+    return uploaded
+```
+
+The scheduler queues it with the two syncs. If it runs before the first code sync, it does nothing, and the next scheduler run catches up: each job converges on its own, so their order doesn't matter (lesson 5.1's idempotency, again).
+
+### A migration autogenerate can't see
+
+The new kind has to pass the `jobs_kind_valid` CHECK constraint. Changing the model and asking Alembic for a migration (lesson 4.13), on a database at revision `0004`:
+
+```text
+$ alembic check
+No new upgrade operations detected.
+$ alembic revision --autogenerate -m "snapshot jobs"
+```
+```python
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    pass
+    # ### end Alembic commands ###
+```
+
+Empty. Autogenerate doesn't compare CHECK constraints, and CI's `alembic check` passes too. Deployed like that, the first snapshot job fails:
+
+```text
+ERROR:  new row for relation "jobs" violates check constraint "jobs_kind_valid"
+DETAIL:  Failing row contains (1, snapshot_repo, 1, queued, 0, null, 2026-11-19 14:20:50.782194+00, null, null).
+```
+
+So migration `0005` is written by hand: drop the constraint, create the wider one. Its downgrade deletes `snapshot_repo` jobs first, because they'd break the narrower rule. Run up, down to empty and up again on a fresh database, then checked with `pg_get_constraintdef`, which showed the three kinds.
+
+### The download route
+
+```python
+@router.get("/{repo_id}/snapshot", response_model=SnapshotOut)
+async def read_snapshot(
+    repo_id: int, user: CurrentUser, session: SessionDep, snapshots: SnapshotsDep
+) -> SnapshotOut:
+    repo = await get_repo_or_404(session, repo_id)
+    commit = repo.indexed_commit
+    not_found = ApiError(
+        status.HTTP_404_NOT_FOUND, "snapshot_not_found", "No snapshot of this repository yet"
+    )
+    if commit is None:
+        raise not_found
+    # boto3 is synchronous and this asks the storage server: keep it off the event loop.
+    stored = await run_in_threadpool(snapshots.exists, repo.full_name, commit)
+    if not stored:
+        raise not_found
+    url, expires_at = snapshots.download_url(repo.full_name, commit)
+    return SnapshotOut(commit=commit, url=url, expires_at=expires_at)
+```
+
+`download_url` makes no network call, so it runs directly; `exists` does, so it goes to a thread (lesson 5.2's `run_in_threadpool`). The route returns the link as JSON rather than redirecting to it: a redirect would make some clients re-send the `Authorization` header to the storage server, which neither needs nor should see Atlas's token.
+
+The store reaches the route as a dependency, like the queue; tests point it at a bucket created for the test (`test-<random hex>`, emptied and deleted afterwards) on the real SeaweedFS, through `TEST_S3_URL`.
+
+A real run on the development database: the scheduler queued three jobs, the worker ran them (the issues sync still fails here for lack of GitHub API access, as in lesson 5.1), and the snapshot was stored:
+
+```text
+   28  snapshot_repo  succeeded  1  pytorch/ignite
+   27  sync_issues  queued     1  pytorch/ignite  GitHubError: GitHub answered 403: ...
+   26  sync_repo    succeeded  1  pytorch/ignite
+snapshots/pytorch/ignite/0abbcab445634b98efcdc6e2d19e3235c0e13e3d.tar.gz 7556842
+```
+
+And through the API:
+
+```text
+{
+  "commit": "0abbcab445634b98efcdc6e2d19e3235c0e13e3d",
+  "url": "http://localhost:8333/atlas-snapshots/snapshots/pytorch/ignite/0abbcab445634b98efcdc6e2d19e3235c0e13e3d.tar.gz?X-Amz-Alg...",
+  "expires_at": "2026-11-19T14:28:14.079054Z"
+}
+--- signed
+200 7556842 bytes
+```
+
+The URL's query parameters, with the secret parts shortened:
+
+```text
+X-Amz-Algorithm=AWS4-HMAC-SHA256
+X-Amz-Credential=atlas%2F...
+X-Amz-Date=20261119T142314Z
+X-Amz-Expires=300
+X-Amz-SignedHeaders=host
+X-Amz-Signature=...
+```
+
+## Attack it
+
+Someone has a real link (it leaked into a chat, a log, a browser history). What else can they do with it?
+
+```text
+--- no signature: <Code>AccessDenied</Code>
+--- another commit: <Code>SignatureDoesNotMatch</Code>
+--- expiry stretched to a week: <Code>SignatureDoesNotMatch</Code>
+--- expired link: 403 <Code>AccessDenied</Code><Message>Request has expired
+--- without a token
+{"error":{"code":"unauthorized","message":"Not authenticated","request_id":"c6327524a0834c7593ca257beca48d04"}}
+```
+
+Removing the signature, pointing it at another key, or extending its expiry all fail: the key and `X-Amz-Expires` are part of what's signed, so any change breaks the signature, and producing a new one needs Atlas's secret key. After five minutes the link itself is dead. Asking Atlas for a fresh link needs a signed-in user.
+
+What the attacker *can* do: download that one snapshot, repeatedly, for up to five minutes. That's the deal a presigned URL makes, and why its lifetime should be as short as the use allows.
+
+## Trade-offs *(deep dive)*
+
+**Postgres instead.** A `bytea` column can hold the archive, with transactions and one fewer service. But large values make the database bigger, its backups slower (lesson 7.7a), and every download would pass through the API and a database connection. Databases are for data you query; object storage is for bytes you fetch whole.
+
+**A shared disk.** A network file system mounted on every machine (Amazon EFS, say) looks like local files. It's more expensive per gigabyte, needs mounting everywhere, and can't hand a browser a link. Object storage is reached over HTTP from anywhere, with permissions per request.
+
+**Proxying downloads.** Streaming the file through the API lets Atlas log and authorise every byte. Presigned URLs give that up for five minutes in exchange for an API that never carries the bytes. For private source code you'd shorten the lifetime further, or proxy.
+
+**Local endpoint in links.** The link names the endpoint the API was configured with. Locally that's `localhost:8333`, which works because the browser and SeaweedFS are on the same machine. On AWS it's the S3 address. If the API ran in a container and signed links for `seaweedfs:8333`, a browser outside couldn't resolve that name: the signing endpoint must be the one users can reach.
+
+## Common mistakes
+
+- **Reading large files into memory.** Stream through a file and `upload_file`.
+- **Putting access keys in settings or code.** Let the SDK find them; on AWS use roles.
+- **Long-lived presigned URLs.** They're bearer tokens for the object.
+- **Mutable objects under one key.** Readers can see old and new versions mixed across caches; key by content or version.
+- **Trusting `LastModified` for ordering.** One-second resolution; store what you mean.
+- **Assuming autogenerate sees every change.** It misses CHECK constraints; write those migrations by hand.
+- **Treating every `ClientError` as "missing".** Check the code; wrong credentials aren't a 404.
+
+## Check yourself
+
+**1.** Why can `upload` skip the work when the key exists, and why would that be wrong if the key were `snapshots/<repo>/latest.tar.gz`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The key contains the commit, and a commit's archive never changes, so an existing object is already correct. Under `latest.tar.gz` the content changes with every commit; skipping would leave an old archive under a name that claims to be the newest.
+:::
+
+**2.** Making a presigned URL needs no network call. What does the storage server use to check it later?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Its own copy of the secret key for the access key named in `X-Amz-Credential`. It recomputes the HMAC-based signature over the request (method, bucket, key, the signed query parameters including the expiry) and compares it with `X-Amz-Signature`, then checks the expiry against its own clock.
+:::
+
+**3.** Why does the snapshot route check `exists` before signing, if signing would succeed anyway?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Signing never fails: it's a local computation and doesn't know whether the object exists. Without the check, the API would hand out a link that answers 404 from the storage server, and the client would get an unexplained error from a different service. The check lets the API answer with its own `snapshot_not_found`.
+:::
+
+## Exercise
+
+Let clients ask for a shorter or longer link: `GET /repos/{id}/snapshot?expires_in=60`, allowed from 60 to 3600 seconds, default 300. Test that `expires_in=60` gives a URL with `X-Amz-Expires=60` and `expires_in=10` gives 422.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Add a query parameter with bounds (lesson 4.12's `Query`) and pass it on:
+```python
+expires_in: Annotated[int, Query(ge=60, le=3600)] = 300,
+...
+url, expires_at = snapshots.download_url(repo.full_name, commit, expires_in)
+```
+The test overrides `get_snapshots` with the `snapshot_store` fixture, as `test_api_gives_a_download_link_once_the_snapshot_exists` does. Checked against the reference code: `X-Amz-Expires=60&` is in the URL, and `expires_in=10` answers 422. Not in the reference code.
+:::
+
+## Stretch
+
+Allow downloading the snapshot of an older commit, `?commit=<sha>`, as long as it hasn't been pruned. Then attack your own code: what happens with `?commit=../../other/repo/aaaa...`?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+commit_sha: Annotated[str | None, Query(alias="commit", pattern="^[0-9a-f]{40}$")] = None,
+...
+commit = commit_sha or repo.indexed_commit
+```
+`alias` lets the parameter be called `commit` in the URL while the Python name differs. The `pattern` is the defence: a commit id is exactly 40 hexadecimal characters, so `../../other/repo/...` is rejected with 422 `validation_error` before it can become part of a key (lesson 4.3's "parse, don't validate"). Without it, the key would be built from user input and the signed link could point at another repository's objects. S3 keys aren't file paths, so `..` doesn't climb anything, but another repository's prefix is reachable all the same. Checked against the reference code: an older stored commit returns its own link, and the hostile value gets 422. Not in the reference code.
+:::
+
+## What changed in the project
+
+SeaweedFS in `compose.yml` and CI; `boto3` (and `boto3-stubs[s3]` for mypy); new `atlas/snapshots.py` (`SnapshotStore`: `exists`, `upload`, `download_url`, `prune`; `make_s3_client` with SigV4); job kind `snapshot_repo`, queued by the scheduler; migration `0005` (hand-written); settings `S3_ENDPOINT_URL`, `S3_REGION`, `SNAPSHOT_BUCKET`, `SNAPSHOTS_KEPT`; `GET /repos/{id}/snapshot`; `tests/test_snapshots.py`. Commit: `feat: Added repository snapshots in S3-compatible object storage`.
