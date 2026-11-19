@@ -69,6 +69,8 @@ website:
           - part-4-fastapi/12-pagination-filtering-search.qmd
           - part-4-fastapi/13-migrations-with-alembic.qmd
           - part-4-fastapi/14-error-handling.qmd
+          - part-4-fastapi/15-observability.qmd
+          - part-4-fastapi/16-browsers-and-retries.qmd
           - part-4-fastapi/17-async-fastapi.qmd
           - part-4-fastapi/18-api-styles.qmd
           - part-4-fastapi/19-testing-strategy.qmd

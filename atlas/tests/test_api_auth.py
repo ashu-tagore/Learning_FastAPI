@@ -45,7 +45,7 @@ async def test_duplicate_email_is_a_conflict_in_the_standard_error_shape(
 
     assert response.status_code == 409
     error = response.json()["error"]
-    assert error["code"] == "conflict"
+    assert error["code"] == "email_taken"
     assert error["message"] == "An account with this email exists"
     assert error["request_id"] == response.headers["X-Request-ID"]
 
@@ -133,6 +133,18 @@ async def test_patch_rejects_null_for_a_field_that_cannot_be_empty(
     assert response.status_code == 422
     me = await client.get("/users/me", headers=headers)
     assert me.json()["skills_profile"] == "metrics"
+
+
+async def test_patch_cannot_change_the_role(client: httpx.AsyncClient) -> None:
+    """Mass assignment (lesson 4.11): fields the schema doesn't list are refused, not ignored."""
+    headers = await sign_up(client, "mallory@example.com")
+
+    response = await client.patch("/users/me", json={"role": "admin"}, headers=headers)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"][0]["location"] == ["body", "role"]
+    me = await client.get("/users/me", headers=headers)
+    assert me.json()["role"] == "user"
 
 
 async def login_tokens(client: httpx.AsyncClient) -> dict[str, str]:

@@ -1,30 +1,58 @@
 ---
 title: "4.11 Relationships and authorisation"
-description: "Model a many-to-many 'saved issues' relationship, enforce who may do what with role and ownership checks, and answer 401, 403 and 404 correctly."
+description: "Model a many-to-many 'saved issues' relationship, enforce who may do what with role and ownership checks, answer 401, 403 and 404 correctly, and stop the two commonest authorisation attacks: reading other people's data by id, and mass assignment."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 11 · About 75 minutes
+Part 4 · Lesson 11 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Attack it". The trade-offs section *(deep dive)* compares ways of expressing permissions as systems grow.
 :::
 
 ::: {.callout-note title="Analogy: a library card and the staff room"}
-With a library card you can borrow books and see your own borrowing list, but not anyone else's. Some doors (the staff room) need a staff badge, and showing a library card there gets a polite "no".
+With a library card you can borrow books and see your own borrowing list, but not anyone else's. Some doors (the staff room) need a staff badge, and showing a library card there gets a polite "no". And when you hand in a change-of-address form, the clerk copies only the address boxes, even if you also wrote "promote me to head librarian" in the margin.
 
-Two separate checks are at work: *who* you are (your card) and *what that lets you do* (your list only; staff doors only with a badge). Atlas does the same with **ownership** (your saved issues, your notes) and **roles** (admins add repositories).
+Atlas needs the same three habits: **ownership** (your saved issues are yours), **roles** (admins add repositories), and **only accepting the fields a form lists**.
 :::
+
+## The problem
+
+Lessons 4.7 to 4.10 answered "who are you?". Now every request has a signed-in user, and the next question is "what may this user do?". Getting it wrong is the most common serious security bug in web APIs: it heads the OWASP Top 10 (a widely used list of the most critical web application risks) as **Broken Access Control**.
+
+Here are two versions of that bug, in a copy of Atlas with two plausible-looking changes:
+
+- a route `GET /users/{user_id}/saved-issues` that lists any user's saved issues, because "the web page needs it", and checks only that the caller is signed in;
+- a `PATCH /users/me` that accepts any JSON object and copies every key onto the user, because "it's more flexible than a schema".
+
+Mallory, an ordinary user, runs a short script against it:
+
+```text
+== vulnerable copy
+Mallory reads user 22's saved issues -> 200 [{"id":1,"repo":"pytorch/ignite","number":20,"title":"Support new metric",...}]
+Mallory PATCHes role=admin -> 200 role is now admin
+Mallory adds a repository -> 201 {"id":5,"full_name":"mallory/evil","indexed_at":null}
+```
+
+She read someone else's data by changing a number in the URL, then made herself an administrator with one field, then used her new powers. Every request carried a valid token; authentication worked perfectly. Authorisation didn't exist.
 
 ## Theory
 
 ### Many-to-many, again
 
-A user can save many issues, and an issue can be saved by many users: a **many-to-many** relationship. Lesson 3.4 modelled one already (issues and labels) with a **join table**: a table whose rows each link one of each. `saved_issues` has `(user_id, issue_id, saved_at)`, and its primary key is the pair, so the same issue can't be saved twice by the same user.
+First, the data. A user can save many issues, and an issue can be saved by many users: a **many-to-many** relationship. Lesson 3.4 modelled one already (issues and labels) with a **join table**: a table whose rows each link one of each. `saved_issues` has `(user_id, issue_id, saved_at)`, and its primary key is the pair, so the same issue can't be saved twice by the same user.
 
-### Authorisation checks
-
-After authentication (lesson 4.8) every request has a user. Authorisation decides what that user may do. Two common forms:
+### Three kinds of authorisation check
 
 - **Role-based**: "only admins may add repositories". Check the user's role.
-- **Ownership-based**: "you may edit only your own notes". Check the row's owner. The cleanest way is to put the owner into the query itself: `WHERE id = :note_id AND user_id = :me`. A row that isn't yours is simply not found.
+- **Ownership-based**: "you may see only your own saved issues". The cleanest way is to put the owner into the query itself: `WHERE user_id = :me`. A row that isn't yours is simply not found. Better still, where possible, leave the id out of the URL entirely: `/users/me/saved-issues` has nothing to change.
+- **Field-based**: "you may change your skills profile, not your role". The request schema (lesson 4.3) lists the fields a client may send, and refuses anything else.
+
+The two attacks above have names:
+
+- **IDOR** (Insecure Direct Object Reference): the server uses an id from the request to fetch an object without checking it belongs to the caller.
+- **Mass assignment**: the server copies all fields of a request onto a stored object, so a client sets fields it was never meant to touch (`role`, `id`, `created_at`).
 
 ### Which status code?
 
@@ -32,15 +60,17 @@ After authentication (lesson 4.8) every request has a user. Authorisation decide
 |---|---|---|
 | **401 Unauthorized** | "Who are you?" No valid credentials. | no token on `PUT /issues/1/saved` |
 | **403 Forbidden** | "I know who you are, and you may not." | a non-admin calls `POST /repos` |
-| **404 Not Found** | It doesn't exist, *or* you mayn't know it exists. | someone else's note |
+| **404 Not Found** | It doesn't exist, *or* you may not know it exists. | someone else's note (lesson 4.20) |
 
-Why 404 for someone else's note rather than 403? A 403 confirms the note exists, which leaks information (that note ids are in use, how many there are). For private, per-user data, "not found" is the honest answer from your point of view. GitHub does the same for private repositories.
+Why 404 for someone else's private data rather than 403? A 403 confirms the object exists, which leaks information: which ids are in use, how many there are. For per-user data, "not found" is the honest answer from the caller's point of view. GitHub does the same for private repositories.
 
 ```{mermaid}
 flowchart TB
   Q[request] --> T{valid token?}
   T -->|no| U[401]
-  T -->|yes| R{route needs admin?}
+  T -->|yes| S{body has only<br/>allowed fields?}
+  S -->|no| V[422]
+  S -->|yes| R{route needs admin?}
   R -->|yes, not admin| F[403]
   R -->|no, or admin| O{row belongs to user?}
   O -->|no| N[404]
@@ -49,11 +79,94 @@ flowchart TB
 
 ### Idempotent saving with PUT
 
-"Save issue 42" is naturally idempotent: saving it again should change nothing and still succeed. So it's `PUT /issues/42/saved`, and in SQL it's an insert that ignores conflicts: Postgres's `INSERT ... ON CONFLICT DO NOTHING`. `DELETE /issues/42/saved` is idempotent too: deleting something already gone still leaves it gone. Both answer **204 No Content**: success, nothing to send back.
+"Save issue 42" is naturally idempotent: saving it again should change nothing and still succeed. So it's `PUT /issues/42/saved`, and in SQL an insert that ignores conflicts: Postgres's `INSERT ... ON CONFLICT DO NOTHING`. `DELETE /issues/42/saved` is idempotent too: deleting something already gone still leaves it gone. Both answer **204 No Content**: success, nothing to send back.
 
 ## In the project
 
-The join table in `models.py`, written as a plain `Table` because it has no behaviour of its own:
+### Red: the rules as tests
+
+```python
+def test_saving_is_idempotent_and_private(client: TestClient, session: Session) -> None:
+    ids = store_numbers(session, [1, 2])
+    ada = sign_up(client, "ada@example.com")
+    grace = sign_up(client, "grace@example.com")
+
+    assert client.put(f"/issues/{ids[2]}/saved", headers=ada).status_code == 204
+    assert client.put(f"/issues/{ids[2]}/saved", headers=ada).status_code == 204
+
+    ada_saved = client.get("/users/me/saved-issues", headers=ada).json()
+    assert [issue["number"] for issue in ada_saved] == [2]
+    assert client.get("/users/me/saved-issues", headers=grace).json() == []
+
+    assert client.delete(f"/issues/{ids[2]}/saved", headers=ada).status_code == 204
+    assert client.get("/users/me/saved-issues", headers=ada).json() == []
+
+
+def test_only_admins_may_add_a_repository(client: TestClient, session: Session) -> None:
+    learner = sign_up(client, "ada@example.com")
+    admin = admin_headers(client, session)
+    body = {"full_name": "pytorch/ignite"}
+
+    forbidden = client.post("/repos", json=body, headers=learner)
+    created = client.post("/repos", json=body, headers=admin)
+    duplicate = client.post("/repos", json=body, headers=admin)
+
+    assert forbidden.status_code == 403
+    assert created.status_code == 201 and created.json()["full_name"] == "pytorch/ignite"
+    assert duplicate.status_code == 409
+
+
+def test_patch_cannot_change_the_role(client: TestClient) -> None:
+    """Mass assignment (lesson 4.11): fields the schema doesn't list are refused, not ignored."""
+    headers = sign_up(client, "mallory@example.com")
+
+    response = client.patch("/users/me", json={"role": "admin"}, headers=headers)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"][0]["location"] == ["body", "role"]
+    me = client.get("/users/me", headers=headers)
+    assert me.json()["role"] == "user"
+```
+
+`store_numbers` saves sample issues the way `atlas issues --save` does (lesson 3.8) and returns their ids; `admin_headers` signs up a user and sets their role to `admin` directly in the database through the test session, the way `atlas make-admin` would.
+
+The last test is the interesting one. Lesson 4.3's `UserUpdate` schema only lists `skills_profile`, so Atlas was already safe from Mallory's PATCH, but run against it, the test fails:
+
+```text
+E       assert 200 == 422
+E        +  where 200 = <Response [200 OK]>.status_code
+```
+
+Pydantic's default is to *ignore* fields a model doesn't list. Mallory's `"role"` was dropped, her role stayed `user`, and the answer was 200. Safe, but silent: a client that misspelled `skils_profile` would also get 200 and wonder why nothing changed, and an attack attempt looks exactly like success. Refusing unknown fields makes both visible.
+
+### Green: refusing unknown fields
+
+In `schemas.py`, one shared setting, applied to every *request* schema (`UserCreate`, `UserUpdate`, `RefreshRequest`, `RepoCreate`, and the note schemas of lesson 4.20):
+
+```python
+# Request bodies refuse fields they don't list. Silently ignoring them would hide client
+# mistakes ("skils_profile") and attack attempts ("role": "admin", lesson 4.11) alike.
+REQUEST_BODY = ConfigDict(extra="forbid")
+
+
+class UserUpdate(BaseModel):
+    """PATCH body: a client sends only the fields it wants to change. ..."""
+
+    model_config = REQUEST_BODY
+
+    skills_profile: str = Field(default="", max_length=2000)
+```
+
+Response schemas don't need it: they're built by Atlas from its own objects.
+
+```text
+$ curl -s -X PATCH http://localhost:8000/users/me -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"role": "admin"}'
+{"error":{"code":"validation_error","message":"The request is not valid","request_id":"f8b135f9207e43ea82fd4ce818c74ddf","details":[{"location":["body","role"],"message":"Extra inputs are not permitted"}]}}
+```
+
+### The join table
+
+In `models.py`, a plain `Table` because it has no behaviour of its own:
 
 ```python
 saved_issues = Table(
@@ -67,7 +180,9 @@ saved_issues = Table(
 
 `ondelete="CASCADE"`: when a user or an issue is deleted, their saved rows go too (lesson 3.5).
 
-### Saving and unsaving: `routes/issues.py`
+### Saving and unsaving: ownership from the token
+
+`routes/issues.py`:
 
 ```python
 @router.put("/{issue_id}/saved", status_code=status.HTTP_204_NO_CONTENT)
@@ -81,22 +196,24 @@ def save_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Respons
     )
     session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/{issue_id}/saved", status_code=status.HTTP_204_NO_CONTENT)
+def unsave_issue(issue_id: int, user: CurrentUser, session: SessionDep) -> Response:
+    session.execute(
+        delete(saved_issues).where(
+            saved_issues.c.user_id == user.id, saved_issues.c.issue_id == issue_id
+        )
+    )
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 ```
 
-`insert` here comes from `sqlalchemy.dialects.postgresql`, which adds `on_conflict_do_nothing`. `CurrentUser` makes the route require a login; `user.id` makes the row belong to whoever is signed in. There's no way to save an issue *for someone else*: the user id never comes from the request body.
+`insert` here comes from `sqlalchemy.dialects.postgresql`, which adds `on_conflict_do_nothing`. In both routes the user id comes from `CurrentUser`, the token, and never from the URL or body. There's no way to save or unsave an issue *for someone else*: the request has nowhere to say who that would be. `saved_issues.c.user_id` is how you refer to a column of a plain `Table` (`c` for columns).
 
-```text
-$ curl -s -X PUT http://localhost:8000/issues/1/saved -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
-204
-$ curl -s -X PUT http://localhost:8000/issues/1/saved -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
-204
-$ curl -s http://localhost:8000/users/me/saved-issues -H "Authorization: Bearer $TOKEN"
-[{"id":1,"repo":"pytorch/ignite","number":20,"title":"Support new metric","url":"https://github.com/pytorch/ignite/issues/20","author":"contributor","labels":["help wanted"],"comments":2,"created_at":"2026-11-02T09:14:00Z"}]
-```
+### Listing: no id to tamper with
 
-(`-w "%{http_code}\n"` makes curl print the status code.)
-
-### Listing my saved issues: `routes/users.py`
+`routes/users.py`:
 
 ```python
 @router.get("/me/saved-issues", response_model=list[IssueOut])
@@ -112,7 +229,7 @@ def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
     return [issue_out(issue) for issue in session.scalars(statement)]
 ```
 
-`saved_issues.c.user_id` is how you refer to a column of a plain `Table` (`c` for columns). `selectinload` is explained in lesson 4.12.
+Compare with the vulnerable `/users/{user_id}/saved-issues`: the only change is where the user id comes from. `selectinload` is explained in lesson 4.12.
 
 ### Admin-only routes: a role dependency
 
@@ -129,14 +246,9 @@ def require_admin(user: CurrentUser) -> User:
 AdminUser = Annotated[User, Depends(require_admin)]
 ```
 
-A route that takes `admin: AdminUser` is now admin-only, with no check inside the route. `routes/repos.py`:
+A route that takes `admin: AdminUser` is admin-only, with no check inside the route to forget. `routes/repos.py`:
 
 ```python
-@router.get("", response_model=list[RepoOut])
-def list_repos(session: SessionDep) -> list[Repo]:
-    return list(session.scalars(select(Repo).order_by(Repo.full_name)))
-
-
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=RepoOut)
 def add_repo(body: RepoCreate, admin: AdminUser, session: SessionDep, ...) -> JSONResponse:
     exists = session.scalar(select(Repo.id).where(Repo.full_name == body.full_name)) is not None
@@ -145,58 +257,98 @@ def add_repo(body: RepoCreate, admin: AdminUser, session: SessionDep, ...) -> JS
     ...
 ```
 
-(The full version also handles idempotency keys, lesson 4.16.) A regular user, then the same user after `atlas make-admin`:
+(The full version also handles idempotency keys, lesson 4.16.) Adding a repository only records it; indexing it is slow work for the background worker in Part 5.
 
 ```text
-$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
-{"error":{"code":"forbidden","message":"Administrators only","request_id":"558237a62ed54108bcc617175fdc502d"}}
-
-$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
-{"id":3,"full_name":"sktime/sktime","indexed_at":null}
+$ uv run pytest tests/test_api_auth.py tests/test_api_resources.py -v -k "idempotent_and_private or only_admins or cannot_change_the_role"
+tests/test_api_auth.py::test_patch_cannot_change_the_role PASSED
+tests/test_api_resources.py::test_only_admins_may_add_a_repository PASSED
+tests/test_api_resources.py::test_saving_is_idempotent_and_private PASSED
+======================= 3 passed, 29 deselected in 1.16s =======================
 ```
 
-Adding a repository only records it. Indexing it (downloading and chunking its files) is slow work for the background worker in Part 5.
+`-k` picks tests whose names match the expression.
+
+## Attack it
+
+The same script, against Atlas as built:
+
+```text
+== Atlas
+Mallory reads user 26's saved issues -> 404 {"detail":"Not Found"}
+Mallory PATCHes role=admin -> 422 role is now None
+Mallory adds a repository -> 403 {"error":{"code":"forbidden","message":"Administrators only","request_id":"4c91fc21c2584a63b669014c2afa0968"}}
+```
+
+- The IDOR route doesn't exist: there's no URL that names another user. (That 404 came back in FastAPI's default shape, not Atlas's: a real bug that lesson 4.14 fixes.)
+- The PATCH is refused with 422 and "Extra inputs are not permitted"; nothing changed, so `role` isn't in the response at all.
+- Without the role, adding a repository is 403.
+
+Where a route *must* take an id that could belong to someone else, the defence moves into the query. Lesson 4.20's notes are the example: `PATCH /notes/{note_id}` looks the note up `WHERE id = :note_id AND user_id = :me`, so another user's note is "not found", and its test checks exactly that.
+
+## Trade-offs: expressing permissions *(deep dive)*
+
+| Approach | Example | Good until |
+|---|---|---|
+| Checks in each route | `if user.role != "admin": raise ...` | the third route forgets it |
+| Dependencies (Atlas) | `admin: AdminUser`; owner in every query | rules depend on many attributes at once |
+| A policy function | `can(user, "edit", note)` used everywhere | you need policies stored as data, editable without deploys |
+| A policy engine (OPA, Cedar) | rules in their own language, checked by a service | small apps: one more system to run and learn |
+| Postgres row-level security | the database itself filters rows by the current user | connection pooling and per-request database roles get complicated |
+
+Atlas has two roles and owner-only data, so dependencies plus owner filters cover it. A sign it's time to move up a row: the same permission rule appearing, slightly differently, in several routes.
 
 ## Common mistakes
 
-- **Taking the user id from the request** (`{"user_id": 7, ...}`) instead of from the token. Anyone could act as anyone.
+- **Taking the user id from the request** (`/users/{id}/...`, or `{"user_id": 7}` in a body) instead of from the token.
 - **Checking ownership after loading**, in Python, in some routes and forgetting in others. Filter by owner in the query.
+- **Copying request data onto models wholesale** (`for k, v in body.items(): setattr(...)`): mass assignment.
+- **Ignoring unknown fields silently**: attacks and typos both look like success.
 - **403 for private resources** that should be invisible: it confirms they exist.
 - **401 when the user is known but not allowed**: that's 403.
-- **Role checks copied into each route** instead of one `require_admin` dependency.
-- **Check-then-insert for "save"**: a race. Let `ON CONFLICT DO NOTHING` decide.
 
 ## Check yourself
 
-**1.** Why does `saved_issues` use `(user_id, issue_id)` as its primary key?
+**1.** Mallory's token was valid in every request of the attack. Why didn't authentication stop her?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-Each pair can appear only once, so a user can't save the same issue twice, and the database enforces it. It also gives an index for "is this saved by this user?".
+Authentication only established that she is Mallory, which was true. The vulnerable routes never asked whether *Mallory* may read user 22's data or change her own role. That's authorisation, a separate check that has to be made for every action.
 :::
 
-**2.** A logged-in non-admin calls `POST /repos`. Which status, and why not 401?
+**2.** Atlas's `UserUpdate` already listed only `skills_profile`. Why change it to refuse extra fields?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Ignoring them was safe but silent: the attack and a client's typo both got 200, so neither was noticed. With `extra="forbid"` both get 422 naming the unexpected field, which helps honest clients and makes attack attempts visible (and, in lesson 4.15, logged).
+:::
+
+**3.** A logged-in non-admin calls `POST /repos`. Which status, and why not 401?
 
 ::: {.callout-tip collapse="true" title="Answer"}
 403 Forbidden. The user is authenticated (Atlas knows who they are), just not allowed. 401 would mean the credentials are missing or invalid.
 :::
 
-**3.** Why is "save" a PUT and not a POST?
-
-::: {.callout-tip collapse="true" title="Answer"}
-Saving is idempotent: doing it twice has the same effect as once. PUT promises that; POST doesn't. Clients (and proxies) may safely retry a PUT.
-:::
-
 ## Exercise
 
-Write a test (or a curl session) showing that user B can't see user A's saved issues: A saves issue 1; B lists their saved issues.
+Write a test, red first, that `DELETE /issues/{id}/saved` by one user doesn't remove another user's saved issue. Make it fail by changing the route's `where` to filter by `issue_id` only, then restore it.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-B's list is `[]`. The query filters by `saved_issues.c.user_id == user.id`, and `user` comes from B's token. The reference test `test_saving_is_idempotent_and_private` (lesson 4.5) does exactly this.
+```python
+def test_unsaving_only_affects_me(client: TestClient, session: Session) -> None:
+    ids = store_numbers(session, [3])
+    ada = sign_up(client, "ada@example.com")
+    grace = sign_up(client, "grace@example.com")
+    client.put(f"/issues/{ids[3]}/saved", headers=ada)
+
+    client.delete(f"/issues/{ids[3]}/saved", headers=grace)
+
+    assert [issue["number"] for issue in client.get("/users/me/saved-issues", headers=ada).json()] == [3]
+```
+With the filter on `issue_id` only, Grace's delete removes Ada's row and the test fails with `assert [] == [3]`. Not in the reference code.
 :::
 
 ## Stretch
 
-Add `GET /issues/{issue_id}/saved` that answers `{"saved": true}` or `{"saved": false}` for the signed-in user, in one query.
+Add `GET /issues/{issue_id}/saved` that answers `{"saved": true}` or `{"saved": false}` for the signed-in user, in one query, test first.
 
 ::: {.callout-tip collapse="true" title="Solution"}
 ```python
@@ -210,9 +362,9 @@ def is_saved(issue_id: int, user: CurrentUser, session: SessionDep) -> dict[str,
     )
     return {"saved": bool(session.scalar(statement))}
 ```
-`EXISTS` stops at the first match. Not in the reference code.
+`EXISTS` stops at the first match. The test: save as Ada, check Ada sees `true` and Grace sees `false`. Not in the reference code.
 :::
 
 ## What changed in the project
 
-`saved_issues` table; `require_admin` and `AdminUser` in `deps.py`; routes `PUT`/`DELETE /issues/{id}/saved`, `GET /users/me/saved-issues`, `GET`/`POST /repos`. Commit: `feat: Added saved issues and admin-only repositories`.
+`saved_issues` table; `require_admin` and `AdminUser` in `deps.py`; routes `PUT`/`DELETE /issues/{id}/saved`, `GET /users/me/saved-issues`, `GET`/`POST /repos`; request schemas refuse unknown fields. Commits: `feat: Added saved issues and admin-only repositories`, `fix: Refused request fields a schema doesn't list instead of silently ignoring them`.

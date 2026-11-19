@@ -1,0 +1,186 @@
+---
+title: "4.16 Browsers and retries: CORS, idempotency keys and API conventions"
+description: "Let only the browser origins you choose call the API with CORS, make POST safe to retry with idempotency keys, and follow the conventions that keep an API predictable."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 16 · About 75 minutes
+:::
+
+::: {.callout-warning title="Being deepened"}
+This lesson's content moved here from the old lesson 4.12. Its failure-first rewrite, with a page on another origin calling the API and a double-submitted POST, is the next block of the [depth pass](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/08-depth-pass.md).
+:::
+
+::: {.callout-note title="Analogy: a receptionist and a reference number"}
+A receptionist checks the sender's address before accepting parcels from strangers' couriers. And if you send the same parcel twice by mistake, with the same reference number, a good parcel service notices and doesn't charge you twice.
+
+**CORS** is the receptionist for browsers. An **idempotency key** is the reference number.
+:::
+
+## Theory
+
+### CORS
+
+Browsers enforce the **same-origin policy**: a page from one **origin** (scheme + host + port, like `https://atlas.example`) can't read responses from another origin unless that origin allows it. Otherwise any website you visit could call your bank's API with your cookies and read the results.
+
+**CORS** (Cross-Origin Resource Sharing) is how a server says which other origins may call it. For requests with custom headers like `Authorization`, the browser first sends a **preflight**: an `OPTIONS` request asking "may this origin send a POST with these headers?". The server answers with `Access-Control-Allow-*` headers, or doesn't.
+
+CORS is a browser rule. It doesn't stop curl or scripts, so it isn't authentication. Atlas's web UI is served from the same origin as the API, so it doesn't need CORS at all; the setting exists for a front end hosted elsewhere (Part 7's CloudFront setup).
+
+### Idempotency keys
+
+A client POSTs "add repository", the network drops, and the client never sees the answer. Did it work? Retrying might add it twice. An **idempotency key** fixes this: the client generates a unique `Idempotency-Key` header and sends the same key with each retry. The server stores the response under the key the first time, and replays it for repeats. Stripe's API popularised this; an IETF draft standardises the header.
+
+```{mermaid}
+flowchart LR
+  B[browser on another origin] -->|preflight OPTIONS| CORS[CORS middleware]
+  CORS -->|origin allowed| ROUTE[route]
+  C[client retrying a POST] -->|same Idempotency-Key| ROUTE
+  ROUTE -->|key seen before| REPLAY[stored response replayed]
+  ROUTE -->|new key| WORK[do the work, store the response]
+```
+
+### Conventions Atlas follows
+
+Plural resource nouns; JSON everywhere with `snake_case` fields; times in UTC, ISO 8601 (`2026-11-18T03:10:48Z`); 201 and the created resource for POST; 204 for empty successes; `limit` with a maximum on every list; errors in one shape with stable codes (lesson 4.14); versioning by adding fields, never changing their meaning (a `/v2/` prefix only if a breaking change is ever unavoidable).
+
+## In the project
+
+### CORS
+
+In `create_app`:
+
+```python
+    # Added after request_id, so it wraps it: CORS headers are on every response, errors included.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    )
+```
+
+```text
+$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: http://localhost:8000" -H "Access-Control-Request-Method: POST"
+HTTP/1.1 200 OK
+...
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE
+access-control-allow-headers: Accept, Accept-Language, Authorization, Content-Language, Content-Type, Idempotency-Key, X-Request-ID
+access-control-allow-origin: http://localhost:8000
+
+$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: https://evil.example" -H "Access-Control-Request-Method: POST"
+HTTP/1.1 400 Bad Request
+...
+Disallowed CORS origin
+```
+
+### Idempotency keys: `api/idempotency.py`
+
+The keys live in a table, `idempotency_keys`, unique per `(user_id, key)`:
+
+```python
+def replay(session: Session, user: User, key: str | None, path: str) -> JSONResponse | None:
+    """The stored response for this key, or None if the request is new."""
+    if key is None:
+        return None
+    stored = session.scalar(
+        select(IdempotencyKey).where(IdempotencyKey.user_id == user.id, IdempotencyKey.key == key)
+    )
+    if stored is None:
+        return None
+
+    used_for_another_request = stored.request_path != path
+    if used_for_another_request:
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "idempotency_key_reused",
+            "This Idempotency-Key was already used for a different request",
+        )
+    return JSONResponse(stored.response_body, status_code=stored.response_status)
+
+
+def remember(
+    session: Session, user: User, key: str | None, path: str, status_code: int, body: Any
+) -> None:
+    """Store the response in the same transaction as the change it describes."""
+    if key is None:
+        return
+    session.add(IdempotencyKey(user_id=user.id, key=key, request_path=path,
+                               response_status=status_code, response_body=body))
+```
+
+`POST /repos` uses both, around its work. Storing the response in the *same transaction* as the new repository is the important part: either both are saved or neither, so there's no moment where the repository exists but the key doesn't.
+
+```python
+    previous = idempotency.replay(session, admin, idempotency_key, request.url.path)
+    if previous is not None:
+        return previous
+    ...
+    session.add(repo)
+    session.flush()
+    payload = RepoOut.model_validate(repo).model_dump(mode="json")
+    idempotency.remember(
+        session, admin, idempotency_key, request.url.path, status.HTTP_201_CREATED, payload
+    )
+    session.commit()
+```
+
+`idempotency_key: Annotated[str | None, Header(max_length=100)] = None` in the route's parameters reads the `Idempotency-Key` header (FastAPI converts underscores to hyphens). Retrying with the same key replays; without one, the duplicate is a conflict:
+
+```text
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d '{"full_name": "sktime/sktime"}'
+{"id":6,"full_name":"sktime/sktime","indexed_at":null}
+
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d '{"full_name": "sktime/sktime"}'
+{"id":6,"full_name":"sktime/sktime","indexed_at":null}
+
+$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"full_name": "sktime/sktime"}'
+{"error":{"code":"repo_already_tracked","message":"sktime/sktime is already tracked","request_id":"6f4b610b6d1b476d847bd359b0c18bb1"}}
+```
+
+## Common mistakes
+
+- **`allow_origins=["*"]` with credentials**: browsers refuse the combination, and it's unsafe anyway. List the origins.
+- **Thinking CORS protects the API.** It only restrains browsers. Authentication protects the API.
+- **Storing idempotency keys in a separate transaction** from the change: a crash in between breaks the guarantee.
+- **Idempotency keys shared across users**: one user could replay another's response. Atlas scopes them per user.
+
+## Check yourself
+
+**1.** A script on `https://evil.example` calls Atlas's API with `fetch`. What does CORS do, and what doesn't it do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The browser won't let that page read Atlas's responses (and for requests needing a preflight, won't send the real request). It doesn't stop the same request from curl or a server; that's what authentication is for.
+:::
+
+**2.** Why must the idempotency record be saved in the same transaction as the new repository?
+
+::: {.callout-tip collapse="true" title="Answer"}
+If they were separate, a crash after creating the repository but before storing the key would let a retry create it again (or hit a conflict), which is exactly what the key is meant to prevent. One transaction makes them all-or-nothing.
+:::
+
+**3.** Why are idempotency keys stored per user?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Keys are chosen by clients. If they were global, one user who guessed or reused another's key would be replayed that user's stored response, which can contain their data.
+:::
+
+## Exercise
+
+Send the same `Idempotency-Key` to two *different* paths (for example, `POST /repos`, then `POST /issues/{id}/notes` from lesson 4.20). What happens, and why is that the right answer?
+
+::: {.callout-tip collapse="true" title="Solution"}
+The second request gets 422 with code `idempotency_key_reused`. Replaying the first response would answer a different request with the wrong result; doing the work would break the promise that a key means "this one operation". The reference test `test_note_creation_honours_idempotency_keys` checks this.
+:::
+
+## Stretch
+
+Idempotency keys are kept forever. Add a `created_at` filter so `replay` ignores keys older than 24 hours, and write a test that ages a key with `update(...)`.
+
+::: {.callout-tip collapse="true" title="Solution"}
+In `replay`, add `IdempotencyKey.created_at > datetime.now(UTC) - timedelta(hours=24)` to the `where`. In the test, make a request with a key, set that row's `created_at` to two days ago through the test session, and repeat the request: it now does the work again (and for `POST /repos`, gets `repo_already_tracked`). A real system would also delete old keys on a schedule (Part 5). Not in the reference code.
+:::
+
+## What changed in the project
+
+`app.py` adds CORS; new `api/idempotency.py` and `idempotency_keys` table; `POST /repos` honours `Idempotency-Key`. Commit: `feat: Added CORS and idempotency keys`.

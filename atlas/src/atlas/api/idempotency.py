@@ -8,11 +8,12 @@ response instead of acting again.
 
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from atlas.api.errors import ApiError
 from atlas.models import IdempotencyKey, User
 
 
@@ -30,8 +31,9 @@ async def replay(
 
     used_for_another_request = stored.request_path != path
     if used_for_another_request:
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "idempotency_key_reused",
             "This Idempotency-Key was already used for a different request",
         )
     return JSONResponse(stored.response_body, status_code=stored.response_status)

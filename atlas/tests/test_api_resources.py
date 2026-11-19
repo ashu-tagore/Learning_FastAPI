@@ -134,17 +134,20 @@ async def test_issues_can_be_filtered_by_label(
     assert response.json()["items"][0]["labels"] == ["docs"]
 
 
-async def test_a_garbled_cursor_is_a_client_error(client: httpx.AsyncClient) -> None:
-    response = await client.get("/issues", params={"cursor": "not-a-cursor"})
+@pytest.mark.parametrize("cursor", ["not-a-cursor", "e30=", "eyJiZWZvcmUiOiAieCJ9", "é"])
+async def test_a_garbled_cursor_is_a_client_error(client: httpx.AsyncClient, cursor: str) -> None:
+    # Garbage, {} with no "before", and {"before": "x"}, and text that isn't ASCII.
+    response = await client.get("/issues", params={"cursor": cursor})
 
-    assert response.status_code == 400
+    assert response.status_code == 422
+    assert response.json()["error"]["details"][0]["location"] == ["query", "cursor"]
 
 
 async def test_missing_issue_is_404(client: httpx.AsyncClient) -> None:
     response = await client.get("/issues/999999")
 
     assert response.status_code == 404
-    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["error"]["code"] == "issue_not_found"
 
 
 async def test_saving_is_idempotent_and_private(

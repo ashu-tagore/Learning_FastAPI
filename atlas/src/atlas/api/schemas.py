@@ -4,10 +4,13 @@ Models (models.py) describe tables; schemas describe requests and responses. Kee
 separate is what keeps fields like password_hash out of every response.
 """
 
+import base64
+import binascii
+import json
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, EmailStr, Field
 
 # ---------- Domain types (lesson 4.3) ----------
 # Each type is parsed once, at the edge. Code that receives an Email or a RepoFullName
@@ -31,10 +34,16 @@ RepoFullName = Annotated[
     str, Field(pattern=r"^[\w.-]+/[\w.-]+$", max_length=200, examples=["pytorch/ignite"])
 ]
 
+# Request bodies refuse fields they don't list. Silently ignoring them would hide client
+# mistakes ("skils_profile") and attack attempts ("role": "admin", lesson 4.11) alike.
+REQUEST_BODY = ConfigDict(extra="forbid")
+
 # ---------- Users and authentication ----------
 
 
 class UserCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     email: Email
     password: Password
 
@@ -59,6 +68,8 @@ class UserUpdate(BaseModel):
     column forbids. Routes read model_dump(exclude_unset=True), so defaults never apply.
     """
 
+    model_config = REQUEST_BODY
+
     skills_profile: str = Field(default="", max_length=2000)
 
 
@@ -70,6 +81,8 @@ class TokenPair(BaseModel):
 
 
 class RefreshRequest(BaseModel):
+    model_config = REQUEST_BODY
+
     refresh_token: str
 
 
@@ -77,6 +90,8 @@ class RefreshRequest(BaseModel):
 
 
 class RepoCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     full_name: RepoFullName
 
 
@@ -101,6 +116,25 @@ class IssueOut(BaseModel):
     labels: list[str]
     comments: int
     created_at: datetime
+
+
+def encode_issue_cursor(last_number: int) -> str:
+    # Opaque to clients: they pass it back unchanged, so its format can change later.
+    raw = json.dumps({"before": last_number}).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_issue_cursor(cursor: str) -> int:
+    """The issue number a cursor this API issued points below (lesson 4.12)."""
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        return int(payload["before"])
+    except (binascii.Error, ValueError, KeyError, TypeError, UnicodeEncodeError):
+        raise ValueError("not a cursor this API issued") from None
+
+
+# Parsed at the edge like the other domain types: a route receives the issue number itself.
+IssueCursor = Annotated[int, BeforeValidator(decode_issue_cursor)]
 
 
 class IssuePage(BaseModel):
@@ -131,10 +165,14 @@ class SearchPage(BaseModel):
 
 
 class NoteCreate(BaseModel):
+    model_config = REQUEST_BODY
+
     body: str = Field(min_length=1, max_length=5000)
 
 
 class NoteUpdate(BaseModel):
+    model_config = REQUEST_BODY
+
     body: str = Field(min_length=1, max_length=5000)
 
 

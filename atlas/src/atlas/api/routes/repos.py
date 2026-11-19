@@ -2,12 +2,13 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from atlas.api import idempotency
 from atlas.api.deps import AdminUser, SessionDep
+from atlas.api.errors import ApiError
 from atlas.api.schemas import RepoCreate, RepoOut
 from atlas.models import Repo
 
@@ -35,7 +36,11 @@ async def add_repo(
         await session.scalar(select(Repo.id).where(Repo.full_name == body.full_name)) is not None
     )
     if exists:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"{body.full_name} is already tracked")
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "repo_already_tracked",
+            f"{body.full_name} is already tracked",
+        )
 
     repo = Repo(full_name=body.full_name)
     session.add(repo)

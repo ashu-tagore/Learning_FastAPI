@@ -24,8 +24,8 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 | 4.12 | [Querying: pagination (offset and cursor), filtering, search](12-pagination-filtering-search.qmd) | `/search` (keyword), `/issues` |
 | 4.13 | [Migrations with Alembic](13-migrations-with-alembic.qmd) | Migrations |
 | 4.14 | [Error handling by design](14-error-handling.qmd) | Error format |
-| 4.15 | Observability from day one: structured logs and request tracing *(coming soon)* | JSON logs, request ids |
-| 4.16 | Browsers and retries: CORS, idempotency keys and API conventions *(coming soon)* | CORS, idempotency keys |
+| 4.15 | [Observability from day one: structured logs and request tracing](15-observability.qmd) | JSON logs, request ids |
+| 4.16 | [Browsers and retries: CORS, idempotency keys and API conventions](16-browsers-and-retries.qmd) | CORS, idempotency keys |
 | 4.17 | [Async FastAPI with async SQLAlchemy](17-async-fastapi.qmd) | API converted to async |
 | 4.18 | [API styles: REST, GraphQL, gRPC, WebSockets, and when to use each](18-api-styles.qmd) | WebSocket demo |
 | 4.19 | [Testing strategy](19-testing-strategy.qmd) | Test suite |

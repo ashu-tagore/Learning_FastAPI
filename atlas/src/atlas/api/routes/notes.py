@@ -6,12 +6,13 @@ the issue closing and being removed from the issues table (lesson 3.4's stretch)
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Header, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from atlas.api import idempotency
 from atlas.api.deps import CurrentUser, SessionDep
+from atlas.api.errors import ApiError
 from atlas.api.routes.issues import get_issue_or_404
 from atlas.api.schemas import NoteCreate, NoteOut, NoteUpdate
 from atlas.models import IssueNote, Repo, User
@@ -34,7 +35,7 @@ async def get_own_note(session: SessionDep, note_id: int, user: User) -> IssueNo
     note = await session.get(IssueNote, note_id)
     # Someone else's note gets the same 404 as a missing one: no hint that it exists.
     if note is None or note.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Note {note_id} not found")
+        raise ApiError(status.HTTP_404_NOT_FOUND, "note_not_found", f"Note {note_id} not found")
     return note
 
 

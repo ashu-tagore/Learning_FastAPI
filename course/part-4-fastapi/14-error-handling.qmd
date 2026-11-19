@@ -1,73 +1,241 @@
 ---
-title: "4.14 Errors, middleware, CORS and API conventions"
-description: "Give every error one predictable shape, trace requests with ids in middleware, allow browser origins with CORS, and make POST safe to retry with idempotency keys."
+title: "4.14 Error handling by design"
+description: "Design errors as part of the API: sort failures into kinds, give every error one shape with a stable code, handle the framework's own errors too, and keep internals out of responses while keeping them findable."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 14 · About 90 minutes
+Part 4 · Lesson 14 · About 2 hours
 :::
 
-::: {.callout-warning title="Being restructured"}
-This lesson is being split by the [depth pass](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/08-depth-pass.md). Until then it also covers lessons 4.15 (request ids, logging) and 4.16 (CORS, idempotency keys).
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* compares Atlas's format with the RFC 9457 standard.
 :::
 
-::: {.callout-note title="Analogy: a parcel service's habits"}
-A good parcel service is predictable. Every parcel gets a tracking number you can quote when something goes wrong. Every "we couldn't deliver" card has the same layout, so you know where to look for the reason. A receptionist checks the sender's address before accepting parcels from strangers. And if you send the same parcel twice by mistake, with the same reference number, they notice and don't charge you twice.
+::: {.callout-note title="Analogy: the cards a delivery driver leaves"}
+A good parcel service has one "we couldn't deliver" card with fixed boxes: a reason code from a short printed list ("no one home", "address not found", "refused"), a sentence for people, and a tracking number to quote when you call. You know where to look on every card, the code tells you what to do next, and the depot can find everything about your parcel from the tracking number.
 
-This lesson gives Atlas those habits: one error layout, a request id on everything, a front-door check on browser origins, and idempotency keys.
+That's what an API's errors should be: **one shape**, a **code** clients can act on, a **message** for people, and a **request id** that leads to the full story in the server's logs.
 :::
+
+## The problem
+
+Atlas has given errors a shape since early in Part 4, built one route at a time. Looked at as a whole, with tests written to describe what clients actually need, three failures appear. Each was real in Atlas until this lesson.
+
+**Errors the framework raises skip the format.** Routes that don't exist, and methods a route doesn't accept, are answered by Starlette's router before any Atlas code runs:
+
+```text
+$ curl -s http://localhost:8000/no-such-route
+{"detail":"Not Found"}
+
+$ curl -s -X DELETE http://localhost:8000/health
+{"detail":"Method Not Allowed"}
+```
+
+No `error`, no `code`, no request id. Lesson 4.11's attack script crashed on exactly this (`KeyError: 'error'`).
+
+**Crashes lose their request id header.** When a route fails unexpectedly, the body carries a request id, but the `X-Request-ID` response header, which proxies and clients log, is missing:
+
+```text
+500 {'content-length': '135', 'content-type': 'application/json'} {"error":{"code":"internal_server_error","message":"Something went wrong on our side","request_id":"c4bd2230fea7487597e6e1795b1fa79b"}}
+```
+
+**Different failures share one code.** Both of these are `conflict`:
+
+```text
+{"error":{"code":"conflict","message":"An account with this email exists",...}}
+{"error":{"code":"conflict","message":"sktime/sktime is already tracked",...}}
+```
+
+(Outputs in earlier lessons show these status-derived codes, like `conflict` and `forbidden`: that was the format until this lesson.) A web page that wants to say "that email is taken, log in instead?" must compare the *message* text, which breaks the day someone rewords it. The status code alone (409, 404, 401) says what *kind* of failure happened, not *which* one.
 
 ## Theory
 
-### One error shape
+### Kinds of failure
 
-FastAPI's default errors come in different shapes: `{"detail": "Not Found"}` for one, a list of dicts for validation errors (lesson 4.1). Clients then need special cases. Atlas answers every error with one shape:
+| Kind | Whose fault | Status | What the client should do | Atlas codes |
+|---|---|---|---|---|
+| Invalid input | client | 422 | fix the request; `details` say where | `validation_error` |
+| Not signed in | client | 401 | sign in or refresh the token | `unauthorized`, `wrong_credentials`, `invalid_refresh_token` |
+| Not allowed | client | 403 | nothing; ask an admin | `admins_only` |
+| Doesn't exist (for you) | client | 404 | stop asking | `issue_not_found`, `note_not_found`, `not_found` |
+| Conflicts with current state | client | 409 | change the request | `email_taken`, `repo_already_tracked` |
+| A service we depend on failed | neither | 502, 503 | retry later | `github_sign_in_failed`, `database_unavailable` |
+| A bug | server | 500 | report it, quoting the request id | `internal_server_error` |
+
+Every error answers in one shape:
 
 ```json
-{"error": {"code": "not_found", "message": "Issue 999 not found", "request_id": "8807...", "details": [...]}}
+{"error": {"code": "issue_not_found", "message": "Issue 999 not found", "request_id": "35f5...", "details": [...]}}
 ```
 
-- `code`: a stable, machine-readable name a client can branch on.
-- `message`: for people.
-- `request_id`: quote it in a bug report; the same id is in the server logs.
-- `details`: only for validation errors: which field, what's wrong.
+- **`code`**: what happened, from a fixed list. It's part of the API's **contract**: clients branch on it, so once published it never changes meaning.
+- **`message`**: for people. It can be reworded at any time.
+- **`request_id`**: the same id as the `X-Request-ID` header, and in every log line about the request (lesson 4.15).
+- **`details`**: only for validation errors: which field, what's wrong.
 
-An **exception handler** is a function FastAPI calls when a given exception escapes a route; it builds the response. Atlas registers three: for `HTTPException` (errors routes raise on purpose), for `RequestValidationError` (bad input) and for `Exception` (bugs). The last one logs the full traceback on the server and tells the client only "Something went wrong on our side": internals like SQL or file paths must never reach clients, because they help attackers.
+### Who needs what
 
-### Middleware
+A failure has two audiences. The **client** needs to know what to do next, and nothing that helps an attacker: no SQL, file paths, library versions or connection strings. The **operator** (whoever runs the server) needs everything: the full traceback, the inputs, the timing. The request id joins the two: the client quotes it, the operator searches the logs for it.
 
-**Middleware** is code that wraps every request: it runs before the route and after it, like layers of an onion. Atlas has two:
+### One place for the mapping
 
-- **Request id**: reuse the caller's `X-Request-ID` header or make a new random id; store it on `request.state`; add it to the response. One id follows a request through logs and, in Part 5, through the worker.
-- **CORS** (below).
-
-### CORS
-
-Browsers enforce the **same-origin policy**: a page from one **origin** (scheme + host + port, like `https://atlas.example`) can't read responses from another origin unless that origin allows it. Otherwise any website you visit could call your bank's API with your cookies and read the results.
-
-**CORS** (Cross-Origin Resource Sharing) is how a server says which other origins may call it. For requests with custom headers like `Authorization`, the browser first sends a **preflight**: an `OPTIONS` request asking "may this origin send a POST with these headers?". The server answers with `Access-Control-Allow-*` headers, or doesn't.
-
-CORS is a browser rule. It doesn't stop curl or scripts, so it isn't authentication. Atlas's web UI is served from the same origin as the API, so it doesn't need CORS at all; the setting exists for a front end hosted elsewhere (Part 7's CloudFront setup).
-
-### Idempotency keys
-
-A client POSTs "add repository", the network drops, and the client never sees the answer. Did it work? Retrying might add it twice. An **idempotency key** fixes this: the client generates a unique `Idempotency-Key` header and sends the same key with each retry. The server stores the response under the key the first time, and replays it for repeats. Stripe's API popularised this; an IETF draft standardises the header.
+Errors happen everywhere: in routes, in dependencies, in Pydantic, in the router. Turning them into responses happens in one place, the app's **exception handlers**: functions FastAPI calls when an exception escapes a route, each building the response for one kind of exception. Routes just raise.
 
 ```{mermaid}
 flowchart LR
-  REQ[request] --> CORS[CORS middleware] --> RID[request id middleware] --> ROUTE[route]
-  ROUTE -->|raises| H[exception handlers<br/>one error shape]
-  ROUTE --> RES[response + X-Request-ID]
-  H --> RES
+  R[route or dependency] -->|"raise ApiError(409, 'email_taken', ...)"| H1[ApiError handler]
+  P[Pydantic] -->|RequestValidationError| H2[validation handler]
+  S[Starlette router] -->|"HTTPException 404 / 405"| H3[HTTP error handler]
+  B[a bug] -->|any other exception| H4[crash handler<br/>logs traceback]
+  H1 & H2 & H3 & H4 --> J["one JSON shape<br/>+ X-Request-ID"]
 ```
-
-### Conventions Atlas follows
-
-Plural resource nouns; JSON everywhere with `snake_case` fields; times in UTC, ISO 8601 (`2026-11-18T03:10:48Z`); 201 + the created resource for POST; 204 for empty successes; `limit` with a maximum on every list; versioning by adding fields, never changing their meaning (a `/v2/` prefix only if a breaking change is ever unavoidable).
 
 ## In the project
 
-### Error handlers: `app.py`
+### Red: what clients may rely on
+
+`tests/test_api_errors.py` describes the contract:
+
+```python
+def assert_standard_error(response: httpx.Response, status: int, code: str) -> None:
+    assert response.status_code == status
+    error = response.json()["error"]
+    assert error["code"] == code
+    assert error["request_id"] == response.headers["X-Request-ID"]
+
+
+def test_unknown_routes_answer_in_the_standard_shape(client: TestClient) -> None:
+    assert_standard_error(client.get("/no-such-route"), 404, "not_found")
+
+
+def test_wrong_methods_answer_in_the_standard_shape(client: TestClient) -> None:
+    assert_standard_error(client.delete("/health"), 405, "method_not_allowed")
+
+
+def test_each_failure_has_its_own_stable_code(client: TestClient) -> None:
+    ada = sign_up(client, "ada@example.com")
+    again = {"email": "ada@example.com", "password": "a-long-password"}
+    wrong = {"username": "ada@example.com", "password": "not-her-password"}
+
+    assert_standard_error(client.post("/auth/register", json=again), 409, "email_taken")
+    assert_standard_error(client.post("/auth/login", data=wrong), 401, "wrong_credentials")
+    assert_standard_error(client.get("/users/me"), 401, "unauthorized")
+    assert_standard_error(client.get("/issues/999999"), 404, "issue_not_found")
+    stolen = {"refresh_token": "made-up"}
+    assert_standard_error(client.post("/auth/refresh", json=stolen), 401, "invalid_refresh_token")
+    repo = {"full_name": "pytorch/ignite"}
+    assert_standard_error(client.post("/repos", json=repo, headers=ada), 403, "admins_only")
+
+
+def test_unexpected_errors_hide_their_details(api_app: FastAPI) -> None:
+    def broken_session() -> Iterator[Session]:
+        raise RuntimeError("connection string postgresql://atlas:s3cret@db/atlas is wrong")
+        yield  # never reached; makes this a generator, like the real dependency
+
+    api_app.dependency_overrides[get_session] = broken_session
+    # raise_server_exceptions=False: receive the 500 response, as a real client would.
+    client = TestClient(api_app, raise_server_exceptions=False)
+
+    response = client.get("/ready")
+
+    assert_standard_error(response, 500, "internal_server_error")
+    assert "s3cret" not in response.text
+```
+
+`assert_standard_error` is a small test helper: the contract, written once. The last test stages a crash whose message contains a password, the kind of detail a careless handler would echo. Before the changes below:
+
+```text
+E       KeyError: 'error'
+E       KeyError: 'error'
+E       KeyError: 'X-Request-ID'
+FAILED tests/test_api_errors.py::test_unknown_routes_answer_in_the_standard_shape
+FAILED tests/test_api_errors.py::test_wrong_methods_answer_in_the_standard_shape
+FAILED tests/test_api_errors.py::test_each_failure_has_its_own_stable_code
+FAILED tests/test_api_errors.py::test_unexpected_errors_hide_their_details
+```
+
+### Green: `ApiError`, raised by routes
+
+`src/atlas/api/errors.py`, the whole file:
+
+```python
+"""Errors the API reports on purpose, each with a stable code clients can rely on (lesson 4.14).
+
+Routes raise ApiError; app.py turns every error, these included, into one JSON shape.
+The code is part of the API's contract: clients branch on it, so it never changes once
+published. The message is for people and may be reworded at any time.
+"""
+
+
+class ApiError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.headers = headers
+```
+
+Routes raise it where they used to raise FastAPI's `HTTPException`:
+
+```python
+    except IntegrityError:
+        # The unique constraint on email decides, so two simultaneous sign-ups can't both win.
+        session.rollback()
+        raise ApiError(
+            status.HTTP_409_CONFLICT, "email_taken", "An account with this email exists"
+        ) from None
+```
+
+and the same for `issue_not_found`, `admins_only`, `database_unavailable` and the rest of the table above. `ApiError` lives in its own module rather than in `app.py`, so routes can import it without the circular import from lesson 4.6.
+
+Why one class with a `code`, rather than an exception class per error (`EmailTaken`, `IssueNotFound`, ...)? Each of those would be a few lines that only carry a status and a code: shallow classes (lesson 4.6) that a reader has to look up. One class with arguments says everything at the place it's raised.
+
+### Green: one handler per kind of exception
+
+In `create_app`:
+
+```python
+    @app.exception_handler(ApiError)
+    async def api_error(request: Request, error: ApiError) -> JSONResponse:
+        """Errors routes raise on purpose: their own code and message."""
+        body = error_body(error.code, error.message, request)
+        return JSONResponse(body, status_code=error.status_code, headers=error.headers)
+
+    # Starlette's class, not FastAPI's subclass: unknown routes (404) and wrong methods (405)
+    # are raised by Starlette's router, and FastAPI's class wouldn't catch them (lesson 4.14).
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, error: StarletteHTTPException) -> JSONResponse:
+        """Errors raised by the framework itself: a code derived from the status."""
+        body = error_body(status_code_name(error.status_code), str(error.detail), request)
+        return JSONResponse(body, status_code=error.status_code, headers=error.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
+        details = [
+            {"location": list(item["loc"]), "message": item["msg"]} for item in error.errors()
+        ]
+        body = error_body("validation_error", "The request is not valid", request, details)
+        return JSONResponse(body, status_code=422)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, error: Exception) -> JSONResponse:
+        # The full traceback goes to the server log; the client gets an id to quote, not internals.
+        logger.exception("unhandled error")
+        body = error_body("internal_server_error", "Something went wrong on our side", request)
+        # This handler runs outside the request_id middleware, so it adds the header itself.
+        request_id = getattr(request.state, "request_id", None)
+        headers = {"X-Request-ID": request_id} if request_id else None
+        return JSONResponse(body, status_code=500, headers=headers)
+```
+
+with two helpers above `create_app`:
 
 ```python
 def error_body(
@@ -89,203 +257,108 @@ def status_code_name(status_code: int) -> str:
     return HTTPStatus(status_code).phrase.lower().replace(" ", "_").replace("-", "_")
 ```
 
-Inside `create_app`:
+The two fixes from "The problem" are each one detail:
 
-```python
-    @app.exception_handler(HTTPException)
-    async def http_error(request: Request, error: HTTPException) -> JSONResponse:
-        body = error_body(status_code_name(error.status_code), str(error.detail), request)
-        return JSONResponse(body, status_code=error.status_code, headers=error.headers)
+- **Which class the handler catches.** FastAPI's `HTTPException` is a *subclass* of Starlette's. A handler for the subclass doesn't see exceptions of the parent class, and the router raises the parent. Registering the handler for Starlette's class catches both. Errors raised by FastAPI's own security helpers (the 401 when a token is missing) get the derived code `unauthorized`, the same code `get_current_user` uses for a bad token, so a client handles both alike.
+- **Where the crash handler runs.** Starlette catches unexpected exceptions in its outermost layer, *outside* every middleware, including the one that sets `X-Request-ID`. So that handler sets the header itself.
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
-        details = [
-            {"location": list(item["loc"]), "message": item["msg"]} for item in error.errors()
-        ]
-        body = error_body("validation_error", "The request is not valid", request, details)
-        return JSONResponse(body, status_code=422)
-
-    @app.exception_handler(Exception)
-    async def unexpected_error(request: Request, error: Exception) -> JSONResponse:
-        # The full traceback goes to the server log; the client gets an id to quote, not internals.
-        logger.exception(
-            "unhandled error, request_id=%s", getattr(request.state, "request_id", None)
-        )
-        body = error_body("internal_server_error", "Something went wrong on our side", request)
-        return JSONResponse(body, status_code=500)
-```
-
-`HTTPStatus` is from Python's standard `http` module: `HTTPStatus(404).phrase` is `"Not Found"`. Handlers are `async def` because they do no blocking work. You've seen their output throughout Part 4, for example:
+`HTTPStatus` is from Python's standard `http` module: `HTTPStatus(404).phrase` is `"Not Found"`. The handlers are `async def` because they do no blocking work.
 
 ```text
+$ uv run pytest -q
+...
+119 passed in 8.83s
+```
+
+And from a running server:
+
+```text
+$ curl -s http://localhost:8000/no-such-route
+{"error":{"code":"not_found","message":"Not Found","request_id":"05c92149d6554598b71ec8a8cc42af9a"}}
+
+$ curl -s -X DELETE http://localhost:8000/health
+{"error":{"code":"method_not_allowed","message":"Method Not Allowed","request_id":"075bb1ecc1d24f8b92adf2c76e105a53"}}
+
+$ curl -s -X POST http://localhost:8000/auth/register -H 'Content-Type: application/json' -d '{"email": "ada@example.com", "password": "correct-horse-battery"}'
+{"error":{"code":"email_taken","message":"An account with this email exists","request_id":"2e1e73d41cdd4676ae90a633d97c556c"}}
+
 $ curl -s http://localhost:8000/issues/999
-{"error":{"code":"not_found","message":"Issue 999 not found","request_id":"8807aeb3e4bc46e8ae2a52511477c258"}}
+{"error":{"code":"issue_not_found","message":"Issue 999 not found","request_id":"35f5b68997b7415096c4a271e46744ff"}}
+
+$ curl -s -X POST http://localhost:8000/auth/login -d 'username=ada@example.com&password=wrong-password-here'
+{"error":{"code":"wrong_credentials","message":"Incorrect email or password","request_id":"286817a86f7449948b81c10cae06b7e9"}}
 ```
 
-### Request ids and CORS
+The web UI shows `error.message` to people, and can now branch on `error.code` where it needs to.
 
-```python
-    @app.middleware("http")
-    async def request_id(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        # Reuse the caller's id if it sent one, so one request can be traced across services.
-        request.state.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.request_id
-        return response
+## Trade-offs: error formats *(deep dive)*
 
-    # Added after request_id, so it wraps it: CORS headers are on every response, errors included.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
-    )
-```
+**RFC 9457, "Problem Details for HTTP APIs"**, is a standard error format (it replaced RFC 7807 in 2023): a JSON object with `type` (a URI naming the kind of problem), `title`, `status`, `detail` and `instance`, served as `application/problem+json`. Its strengths are that generic tools understand it and its `type` URIs can link to documentation.
 
-`call_next(request)` runs everything inside (other middleware, then the route) and returns its response. Middleware added later wraps middleware added earlier.
+| | Atlas's `{"error": {...}}` | RFC 9457 problem details |
+|---|---|---|
+| Error kind | short `code` (`email_taken`) | `type` URI (`https://atlas.example/errors/email-taken`) |
+| Request id | `request_id` field | an extension member (any extra field is allowed) |
+| Validation details | `details` list | an extension member |
+| Tooling | clients written for Atlas | generic libraries and gateways |
 
-```text
-$ curl -s -i http://localhost:8000/health -H "X-Request-ID: trace-me-123"
-HTTP/1.1 200 OK
-...
-x-request-id: trace-me-123
+Atlas keeps its simpler shape because its only clients are its own web UI and course readers, and a short code is easier to branch on. A public API with many unknown clients would do well to adopt RFC 9457: switching later means changing every error response, which is itself a breaking change, so for a public API decide early.
 
-$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: http://localhost:8000" -H "Access-Control-Request-Method: POST"
-HTTP/1.1 200 OK
-...
-access-control-allow-methods: GET, POST, PUT, PATCH, DELETE
-access-control-allow-headers: Accept, Accept-Language, Authorization, Content-Language, Content-Type, Idempotency-Key, X-Request-ID
-access-control-allow-origin: http://localhost:8000
-
-$ curl -s -i -X OPTIONS http://localhost:8000/repos -H "Origin: https://evil.example" -H "Access-Control-Request-Method: POST"
-HTTP/1.1 400 Bad Request
-...
-Disallowed CORS origin
-```
-
-### Idempotency keys: `api/idempotency.py`
-
-The keys live in a table, `idempotency_keys`, unique per `(user_id, key)`:
-
-```python
-def replay(session: Session, user: User, key: str | None, path: str) -> JSONResponse | None:
-    """The stored response for this key, or None if the request is new."""
-    if key is None:
-        return None
-    stored = session.scalar(
-        select(IdempotencyKey).where(IdempotencyKey.user_id == user.id, IdempotencyKey.key == key)
-    )
-    if stored is None:
-        return None
-
-    used_for_another_request = stored.request_path != path
-    if used_for_another_request:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "This Idempotency-Key was already used for a different request",
-        )
-    return JSONResponse(stored.response_body, status_code=stored.response_status)
-
-
-def remember(
-    session: Session, user: User, key: str | None, path: str, status_code: int, body: Any
-) -> None:
-    """Store the response in the same transaction as the change it describes."""
-    if key is None:
-        return
-    session.add(IdempotencyKey(user_id=user.id, key=key, request_path=path,
-                               response_status=status_code, response_body=body))
-```
-
-`POST /repos` uses both, around its work. Storing the response in the *same transaction* as the new repository is the important part: either both are saved or neither, so there's no moment where the repository exists but the key doesn't.
-
-```python
-    previous = idempotency.replay(session, admin, idempotency_key, request.url.path)
-    if previous is not None:
-        return previous
-    ...
-    session.add(repo)
-    session.flush()
-    payload = RepoOut.model_validate(repo).model_dump(mode="json")
-    idempotency.remember(
-        session, admin, idempotency_key, request.url.path, status.HTTP_201_CREATED, payload
-    )
-    session.commit()
-```
-
-`idempotency_key: Annotated[str | None, Header(max_length=100)] = None` in the route's parameters reads the `Idempotency-Key` header (FastAPI converts underscores to hyphens). Retrying with the same key replays; without one, the duplicate is a conflict:
-
-```text
-$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
-{"id":3,"full_name":"sktime/sktime","indexed_at":null}
-
-$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: add-sktime-1" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
-{"id":3,"full_name":"sktime/sktime","indexed_at":null}
-
-$ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
-{"error":{"code":"conflict","message":"sktime/sktime is already tracked","request_id":"81971f390e3c4354bfeb09c88afc9716"}}
-```
+**Exceptions or return values?** Some languages and styles return errors as values (Go's `value, err`, Rust's `Result`) rather than raising them. Python and FastAPI are built around exceptions, and raising lets a dependency stop a request from deep inside without every caller checking. The cost is that a function's errors aren't visible in its signature, which is why the codes are listed in one table, above.
 
 ## Common mistakes
 
-- **Leaking internals in errors**: stack traces, SQL, file paths. Log them; return an id.
-- **`allow_origins=["*"]` with credentials**: browsers refuse the combination, and it's unsafe anyway. List the origins.
-- **Thinking CORS protects the API.** It only restrains browsers. Authentication protects the API.
-- **Storing idempotency keys in a separate transaction** from the change: a crash in between breaks the guarantee.
-- **Idempotency keys shared across users**: one user could replay another's response. Atlas scopes them per user.
-- **Changing an error's `code`** once clients depend on it. Codes are part of your API.
+- **Leaking internals in errors**: stack traces, SQL, file paths, connection strings. Log them; return an id.
+- **Clients parsing messages.** Give them codes, and keep codes stable.
+- **Changing what a code means** once clients depend on it. Add a new code instead.
+- **Handling only the errors your own code raises.** The framework raises some too (unknown routes, wrong methods); test them.
+- **Catching everything inside routes** (`except Exception: return {...}`): bugs become fake successes, and nothing is logged.
+- **500 for a dependency's failure**: use 502 or 503, so clients and load balancers know to retry.
 
 ## Check yourself
 
-**1.** Why does the `Exception` handler return a generic message instead of the error text?
+**1.** Why didn't the handler registered for FastAPI's `HTTPException` catch the router's 404?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-Unexpected errors can contain internals (SQL, paths, library versions) that help attackers and confuse users. The server logs the full traceback with the request id; the client gets the id to quote, which is enough to find the log entry.
+The router raises Starlette's `HTTPException`, the parent class. A handler registered for a subclass only receives instances of that subclass. Registering for the parent class (Starlette's) receives both.
 :::
 
-**2.** A script on `https://evil.example` calls Atlas's API with `fetch`. What does CORS do, and what doesn't it do?
+**2.** What's the difference between an error's `code` and its `message`, from a client's point of view?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-The browser won't let that page read Atlas's responses (and for requests needing a preflight, won't send the real request). It doesn't stop the same request from curl or a server; that's what authentication is for.
+The code is for programs: a fixed identifier the client may branch on, which never changes meaning. The message is for people: it may be reworded, translated or made clearer at any time, so a client must never compare it.
 :::
 
-**3.** Why must the idempotency record be saved in the same transaction as the new repository?
+**3.** In the crash test, the error message contained a password. Where did that message end up?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-If they were separate, a crash after creating the repository but before storing the key would let a retry create it again (or hit a conflict), which is exactly what the key is meant to prevent. One transaction makes them all-or-nothing.
+In the server's log, as part of the full traceback written by `logger.exception`, tagged with the request id. Not in the response: the client got only the generic message and the id. (Lesson 4.15 discusses keeping secrets out of logs too: here the secret came from the exception itself, which is a reason to keep connection strings out of error messages at the source.)
 :::
 
 ## Exercise
 
-Send a request that triggers a validation error with your own `X-Request-ID: my-test-1` header. Confirm the id appears both in the response header and in the error body.
+`POST /issues/{id}/notes` (lesson 4.20) answers `issue_not_found` for a missing issue. Write a test, red first, that `PATCH /notes/999999` answers 404 with code `note_not_found`, using `assert_standard_error`.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-```bash
-curl -s -i "http://localhost:8000/search" -H "X-Request-ID: my-test-1"
+```python
+def test_a_missing_note_has_its_own_code(client: TestClient) -> None:
+    ada = sign_up(client, "ada@example.com")
+
+    response = client.patch("/notes/999999", json={"body": "x"}, headers=ada)
+
+    assert_standard_error(response, 404, "note_not_found")
 ```
-The response has `x-request-id: my-test-1` and the body's `"request_id":"my-test-1"`, with `details` saying `["query","q"]` is required.
+Make it red by temporarily changing the code in `routes/notes.py`'s `ApiError(...)` to something else. Not in the reference code.
 :::
 
 ## Stretch
 
-Add structured request logging to the `request_id` middleware: after `call_next`, log one line with method, path, status code, duration in milliseconds and the request id. Use `time.perf_counter()`.
+Add `responses={409: {"model": ErrorResponse}}` (and the other statuses each route can return) to a few route decorators, then look at `/docs`. What does a client gain? Could a test check that every `ApiError` a route can raise is documented?
 
 ::: {.callout-tip collapse="true" title="Solution"}
-```python
-        started = time.perf_counter()
-        response = await call_next(request)
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.info(
-            "%s %s %s %.1fms request_id=%s",
-            request.method, request.url.path, response.status_code, elapsed_ms,
-            request.state.request_id,
-        )
-```
-Lesson 7.8 replaces this with JSON logs that tools can search. Not in the reference code yet.
+The docs page and the OpenAPI document then show the error shape for those statuses, so client generators can produce typed error objects. A test can't easily discover which errors a route raises (they're in its code paths, not its signature), which is one argument for the "errors as values" style, and why many projects keep a hand-maintained table of codes like the one in this lesson.
 :::
 
 ## What changed in the project
 
-`app.py` gains error handlers, the request id middleware and CORS; new `api/idempotency.py` and `idempotency_keys` table; `POST /repos` honours `Idempotency-Key`. Commit: `feat: Added consistent errors, request ids, CORS and idempotency keys`.
+New `src/atlas/api/errors.py`; routes, dependencies and `idempotency.py` raise `ApiError` with specific codes; `app.py` handles Starlette's `HTTPException` and adds `X-Request-ID` to 500s; new `tests/test_api_errors.py`. Commit: `fix: Gave every error one shape and a stable code, including unknown routes and 500s`.

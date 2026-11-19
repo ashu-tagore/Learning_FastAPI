@@ -1,0 +1,381 @@
+---
+title: "4.15 Observability from day one: structured logs and request tracing"
+description: "Log every request as one JSON line carrying its request id, follow a failure from the id a user quotes to its cause, and decide what logs must never contain."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 15 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* compares logging libraries and formats.
+:::
+
+::: {.callout-note title="Analogy: a ship's log with entry numbers"}
+A ship's log records events in a fixed format: time, position, what happened. When something goes wrong at sea, investigators don't read the whole voyage; they look up the entries for that moment. Imagine instead a log written as free prose, with some events recorded twice and the time missing from half the entries. Everything is "in there", and nobody can find it.
+
+**Structured logs** are the fixed-format version: every line has the same fields, including the **request id**, the entry number that links everything that happened while handling one request.
+:::
+
+## The problem
+
+A learner writes in: "Atlas showed me an error. It said to quote this: `5d22a71c9cdf4c94a55f1fdf792c662c`." That id is what lesson 4.14 gives clients for exactly this moment. Now find out what happened.
+
+Here's Atlas's log from that afternoon, as it was before this lesson: the database had briefly gone away, and two requests failed. Uvicorn's lines, Atlas's lines and Python tracebacks, all mixed:
+
+```text
+INFO:     127.0.0.1:37426 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37434 - "GET /search?q=early%20stopping HTTP/1.1" 200 OK
+unhandled error, request_id=5d22a71c9cdf4c94a55f1fdf792c662c
+Traceback (most recent call last):
+  ...
+sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: connection to server at "127.0.0.1", port 5432 failed: Connection refused
+INFO:     127.0.0.1:37448 - "GET /issues HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  ...
+sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: connection to server at "127.0.0.1", port 5432 failed: Connection refused
+unhandled error, request_id=e836a95c41eb47438f390d4e374dbd57
+  ...
+```
+
+The whole log was **999 lines** for two failed requests. Searching for the id finds one line, `unhandled error, request_id=5d22...`; the traceback that explains it is in the following ~120 lines, printed again by Uvicorn further down without the id. Which request was it: `/issues` or `/issues/1`? The access lines don't carry ids, and the order of lines doesn't settle it. How long did it take? Nothing says. And notice what *is* logged: the full query string, `?q=early%20stopping`, which for some routes could be something private.
+
+Logs are the main way to understand a running system you can't attach a debugger to, and in production that's every system. They have to be designed for searching, not written for reading line by line.
+
+## Theory
+
+### Three kinds of telemetry
+
+**Observability** is how well you can understand what a system is doing from what it emits. Three kinds of data, usually called the three pillars:
+
+- **Logs**: one record per event, with details. "Request 5d22 to `/issues` failed after 3.7 ms with `OperationalError`."
+- **Metrics**: numbers aggregated over time. "1.2% of requests failed in the last 5 minutes; 99% finished within 300 ms."
+- **Traces**: the path of one request through every service it touched, with timings for each step.
+
+Part 4 builds logs, because they're the foundation and every later part produces them. Lesson 7.8 adds metrics, traces and alerts.
+
+### Structured logging
+
+A **structured log** writes each event as data, not prose. Atlas uses **JSON lines**: one JSON object per line.
+
+```json
+{"time": "2026-11-19T08:35:01.391455+00:00", "level": "INFO", "logger": "atlas.api", "message": "request finished", "request_id": "5870a5e7...", "method": "GET", "path": "/issues", "status": 500, "duration_ms": 3.7}
+```
+
+Every log tool can then filter by field: all lines with this `request_id`; all requests with `status` 500 in the last hour; the slowest `path`s. With free text you'd write a regular expression for each question, and get it wrong the first time the wording changes.
+
+### Request ids, everywhere, without passing them around
+
+Lesson 4.14's middleware gives each request an id. To put it on *every* line logged while handling that request, including lines from code deep inside that knows nothing about HTTP, Atlas uses a **`ContextVar`** (from Python's `contextvars` module): a variable that holds a separate value for each running task. The async event loop (lesson 2.6) runs many requests at once, interleaved, and each request runs in its own task, so a value set while handling request A is invisible to request B. The middleware sets it once; the logging system reads it whenever a log record is created.
+
+### What logs must never contain
+
+Logs are copied widely (to log services, to support tickets, to laptops), kept for months, and readable by more people than your database. So:
+
+- **Never**: passwords, tokens, API keys, session cookies, full request or response bodies.
+- **Avoid**: query strings (they can carry search text or, in careless clients, tokens; lesson 4.8), personal data beyond an internal user id (lesson 7.11 covers retention).
+- **Always**: the request id, what happened, how long it took, and for errors the full traceback.
+
+```{mermaid}
+flowchart LR
+  REQ["request (X-Request-ID or new id)"] --> MW["middleware<br/>sets current_request_id, starts timer"]
+  MW --> ROUTE["route and everything it calls<br/>logger.info(...)"]
+  ROUTE --> MW2["middleware<br/>logs 'request finished' with status, duration"]
+  ROUTE -.->|crash| H["crash handler<br/>logger.exception(...)"]
+  MW2 & ROUTE & H --> F["record factory stamps request_id<br/>JsonFormatter writes one line"]
+  F --> OUT["stderr: one JSON line per event"]
+```
+
+## In the project
+
+### Red: what the logs must guarantee
+
+`tests/test_logging.py`, using pytest's **`caplog`** fixture, which captures every log record made during a test:
+
+```python
+def finished(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.getMessage() == "request finished"]
+
+
+def test_every_request_is_logged_once_with_its_id_and_timing(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="atlas")
+
+    client.get("/health", headers={"X-Request-ID": "trace-me-123"})
+
+    [record] = finished(caplog)
+    line = json.loads(JsonFormatter().format(record))
+    assert line["request_id"] == "trace-me-123"
+    assert (line["method"], line["path"], line["status"]) == ("GET", "/health", 200)
+    assert line["duration_ms"] >= 0
+
+
+def test_passwords_never_reach_the_logs(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    secret = "correct-horse-battery"
+
+    client.post("/auth/register", json={"email": "ada@example.com", "password": secret})
+    client.post("/auth/login", data={"username": "ada@example.com", "password": secret})
+
+    formatted = [JsonFormatter().format(record) for record in caplog.records]
+    assert formatted
+    assert all(secret not in line for line in formatted)
+```
+
+`[record] = finished(caplog)` unpacks a list that must have exactly one element: it fails if the request was logged zero times or twice. A third test, `test_a_crash_is_logged_with_the_id_the_client_was_given`, stages a crash the way lesson 4.14 did and checks that the error line carries the same request id as the response, with the exception text. The tests import a module that doesn't exist yet:
+
+```text
+E   ModuleNotFoundError: No module named 'atlas.logs'
+```
+
+### Green: `src/atlas/logs.py`
+
+```python
+"""Logs as JSON lines, each carrying the id of the request it belongs to (lesson 4.15).
+
+One JSON object per line lets log tools filter by field ("all lines for request X",
+"requests slower than 500 ms") instead of searching free text.
+"""
+
+import json
+import logging
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from typing import Any
+
+# Set by the API's middleware for each request. A ContextVar is per request even when many
+# requests run at once on one event loop, so code deep inside a request never has to pass
+# the id along: every log line made while handling it picks the id up automatically.
+current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
+
+# Attributes every log record has; anything else on a record came from extra={...}.
+_STANDARD_ATTRIBUTES = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        line: dict[str, Any] = {
+            "time": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        extras = {k: v for k, v in vars(record).items() if k not in _STANDARD_ATTRIBUTES}
+        line.update(extras)
+        if record.exc_info:
+            line["exception"] = self.formatException(record.exc_info)
+        return json.dumps(line, default=str)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    """Send Atlas's logs to stderr as JSON lines. Safe to call more than once."""
+    logger = logging.getLogger("atlas")
+    logger.setLevel(level)
+    is_configured = any(isinstance(h.formatter, JsonFormatter) for h in logger.handlers)
+    if is_configured:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    # A record factory reaches every logger, including child loggers like "atlas.api"
+    # and any handler (pytest's included), which a filter on one logger wouldn't.
+    previous_factory = logging.getLogRecordFactory()
+
+    def record_with_request_id(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        # Runs when the record is made, while the request's context is still current.
+        record = previous_factory(*args, **kwargs)
+        record.request_id = current_request_id.get()
+        return record
+
+    logging.setLogRecordFactory(record_with_request_id)
+```
+
+How it fits together, using Python's standard `logging` module:
+
+- A **logger** (`logging.getLogger("atlas.api")`) is what code calls: `logger.info("...")`. Loggers form a tree by name, so `atlas.api` passes its records up to `atlas`.
+- A **handler** decides where records go (here, standard error, which Uvicorn and later Docker collect), and its **formatter** decides how each record is written: `JsonFormatter`.
+- `extra={...}` on a log call attaches fields to the record. `JsonFormatter` writes every such field, which is how `method`, `path`, `status` and `duration_ms` appear.
+- The **record factory** is the function `logging` calls to create each record. Wrapping it stamps `request_id` onto every record at the moment it's created, which is while the request's context is still current.
+
+`create_app` calls `configure_logging()`, and the request id middleware from lesson 4.14 grows a timer and a log line:
+
+```python
+    @app.middleware("http")
+    async def request_id(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        # Reuse the caller's id if it sent one, so one request can be traced across services.
+        request.state.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        # Not reset afterwards: each request runs in its own copy of the context, and the
+        # crash handler, which runs after this middleware has finished, still needs the id.
+        current_request_id.set(request.state.request_id)
+        started = time.perf_counter()
+        status_code = 500  # what the client gets if call_next raises
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+        finally:
+            # Path only, never the query string or body: they can hold tokens and passwords.
+            logger.info(
+                "request finished",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": status_code,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
+            )
+```
+
+`try`/`finally` (lesson 1.9) makes sure the line is written even when the route crashes, with status 500. `time.perf_counter()` is a clock meant for measuring intervals. The crash handler's message became just `logger.exception("unhandled error")`: the id is a field now, not text in the message.
+
+```text
+$ uv run pytest tests/test_logging.py -v
+tests/test_logging.py::test_every_request_is_logged_once_with_its_id_and_timing PASSED
+tests/test_logging.py::test_passwords_never_reach_the_logs PASSED
+tests/test_logging.py::test_a_crash_is_logged_with_the_id_the_client_was_given PASSED
+============================== 3 passed in 0.41s ===============================
+```
+
+### Debugging from the logs alone
+
+Run the API with `--no-access-log`: Atlas's own line replaces Uvicorn's access line, and leaves out the query string.
+
+```bash
+uv run uvicorn atlas.api.app:create_app --factory --no-access-log
+```
+
+The same afternoon, replayed: a few requests, then the database stops and `/issues` fails.
+
+```text
+$ curl -s http://localhost:8000/issues
+{"error":{"code":"internal_server_error","message":"Something went wrong on our side","request_id":"5870a5e7324846ddb58c5613b5fff5fc"}}
+```
+
+The log, one line per event:
+
+```text
+{"time": "2026-11-19T08:35:00.632484+00:00", "level": "INFO", "logger": "atlas.api", "message": "request finished", "request_id": "9ec77fe9c5f44fa49fcc94788527f0cb", "method": "GET", "path": "/health", "status": 200, "duration_ms": 0.7}
+{"time": "2026-11-19T08:35:00.962003+00:00", "level": "INFO", "logger": "atlas.api", "message": "request finished", "request_id": "85e7ba62c4c94980a6d3604f9bb70361", "method": "GET", "path": "/search", "status": 200, "duration_ms": 320.4}
+{"time": "2026-11-19T08:35:00.977708+00:00", "level": "INFO", "logger": "atlas.api", "message": "request finished", "request_id": "6479e3ed12734be5aca047ffa049b6b7", "method": "GET", "path": "/issues/999", "status": 404, "duration_ms": 8.1}
+{"time": "2026-11-19T08:35:01.391455+00:00", "level": "INFO", "logger": "atlas.api", "message": "request finished", "request_id": "5870a5e7324846ddb58c5613b5fff5fc", "method": "GET", "path": "/issues", "status": 500, "duration_ms": 3.7}
+{"time": "2026-11-19T08:35:01.391761+00:00", "level": "ERROR", "logger": "atlas.api", "message": "unhandled error", "request_id": "5870a5e7324846ddb58c5613b5fff5fc", "exception": "Traceback (most recent call last):\n ..."}
+```
+
+Now the learner's question takes one command: every line for their id, and the line of the traceback that names the cause:
+
+```text
+$ grep 5870a5e7324846ddb58c5613b5fff5fc api.log | python3 -c "
+import json, sys
+for line in map(json.loads, sys.stdin):
+    cause = [x for x in line.get('exception', '').splitlines() if x.startswith('sqlalchemy.exc.')]
+    print(line['level'], line['message'], line.get('status', ''), cause[-1][:150] if cause else '')"
+INFO request finished 500
+ERROR unhandled error  sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: connection to server at "127.0.0.1", port 5432 failed: Connection refus
+```
+
+Request `/issues`, failed after 3.7 ms, because the database refused connections. Notice too that `/search` took 320 ms: something to look at before anyone complains, and the kind of question this lesson's stretch answers from these lines.
+
+One thing remains untidy: when a request crashes, Uvicorn still prints its own plain-text traceback ("Exception in ASGI application") next to Atlas's JSON line, and its startup messages are plain text too. Lesson 7.8 configures Uvicorn's own loggers to write JSON as well; for now, Atlas's lines are the ones to search.
+
+## Trade-offs: how to log *(deep dive)*
+
+| Option | Good for | Watch out for |
+|---|---|---|
+| `print()` | throwaway scripts | no levels, no fields, can't be turned off or redirected per module |
+| `logging` with text format | humans reading a terminal | every question needs a new text search |
+| `logging` with a JSON formatter (Atlas) | log services, `grep` plus a small script | less pleasant to read raw; a small amount of code to own |
+| A structured-logging library (structlog) | bigger apps: key-value logging everywhere, development and production renderers | one more dependency to learn |
+| OpenTelemetry logs and traces | many services, one trace across all of them | setup and a collector to run (lesson 7.8) |
+
+Atlas's ~50-line module is enough for one service, and it uses only the standard library, so everything it does is visible. If a later part needs more, structlog or OpenTelemetry slot in behind the same idea: fields, not prose; ids on everything.
+
+How *much* to log is the other trade-off. Every line costs storage and money (log services charge by volume), and noise hides signal. A useful default: one line per request at INFO, one line per unexpected failure at ERROR with its traceback, and DEBUG lines only when switched on.
+
+## Common mistakes
+
+- **Logging secrets**: passwords, tokens, keys, or whole bodies "for debugging". Test that they don't appear, as above.
+- **Free-text logs** that need a new regular expression for every question.
+- **No request id on the lines that matter**, or ids only in some of them.
+- **Logging query strings and full URLs** by default.
+- **Logging an error and re-raising it**, at several layers: the same failure appears five times. Log once, where it's handled.
+- **Using `print()` in a server**: it bypasses levels, formatting and handlers.
+
+## Check yourself
+
+**1.** Why does Atlas use a `ContextVar` for the request id instead of a module-level global variable?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Many requests run at once on one event loop, interleaved. A global would hold whichever request set it last, so lines from request A could carry request B's id. A `ContextVar` holds a separate value per task, so each request's lines get its own id.
+:::
+
+**2.** The middleware logs `request.url.path`, not `str(request.url)`. Why?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The full URL includes the query string, which can carry search text, personal data or (from careless clients) tokens. The path is enough to know which route ran; the rest doesn't belong in logs that many people and tools can read.
+:::
+
+**3.** Why is the "request finished" line written in a `finally` block?
+
+::: {.callout-tip collapse="true" title="Answer"}
+So it's written whether the route returns normally or raises. Without `finally`, crashed requests (the ones you most need to find) would have no request line, only the traceback.
+:::
+
+## Exercise
+
+Make slow requests stand out: when a request takes longer than 1,000 ms, log the "request finished" line at WARNING instead of INFO. Write the test first (hint: a route that sleeps, added to the app inside the test with `@api_app.get("/slow")`).
+
+::: {.callout-tip collapse="true" title="Solution"}
+In the middleware's `finally`:
+
+```python
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            is_slow = duration_ms > 1000
+            level = logging.WARNING if is_slow else logging.INFO
+            logger.log(level, "request finished", extra={..., "duration_ms": duration_ms})
+```
+The test adds a route that sleeps 1.1 seconds, calls it, and checks the single "request finished" record has `levelname == "WARNING"`. Not in the reference code.
+:::
+
+## Stretch
+
+Write a short script that reads Atlas's JSON log from standard input and prints, per path, the number of requests and the slowest duration, sorted slowest first. Run it after clicking through the web UI for a minute.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import json
+import sys
+from collections import defaultdict
+
+durations: dict[str, list[float]] = defaultdict(list)
+for raw in sys.stdin:
+    if not raw.startswith("{"):
+        continue  # Uvicorn's own plain-text lines
+    line = json.loads(raw)
+    if line.get("message") == "request finished":
+        durations[line["path"]].append(line["duration_ms"])
+
+for path, values in sorted(durations.items(), key=lambda item: -max(item[1])):
+    print(f"{path:30} {len(values):5} requests  slowest {max(values):8.1f} ms")
+```
+Run it with `uv run uvicorn ... 2>&1 | tee api.log`, then `python3 slowest.py < api.log`. On a short log from the database-down replay:
+
+```text
+/search                            1 requests  slowest     59.4 ms
+/issues                            1 requests  slowest      3.6 ms
+/issues/1                          1 requests  slowest      1.9 ms
+/health                            1 requests  slowest      1.3 ms
+```
+
+Search is usually the slowest route: full-text ranking over thousands of chunks. Lesson 7.8 turns the same numbers into metrics with percentiles.
+:::
+
+## What changed in the project
+
+New `src/atlas/logs.py`; the request id middleware sets `current_request_id`, times each request and logs one line; `create_app` calls `configure_logging()`; new `tests/test_logging.py`. Commit: `feat: Logged every request as one JSON line carrying its request id`.

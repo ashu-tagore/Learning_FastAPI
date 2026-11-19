@@ -4,6 +4,11 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D23. Stable error codes, JSON logs and strict request bodies (2026-11-19)
+**Decision:** routes raise one `ApiError` class carrying a status and a stable code; Starlette's own HTTP errors and crashes use the same JSON shape; every request is logged as one JSON line with its request id (a `ContextVar` stamped on each record); request schemas refuse unknown fields. Recorded in [06-conventions.md](06-conventions.md) under "API rules".
+**Why:** the depth pass found unknown routes and 405s bypassing the error format, 500s without an `X-Request-ID` header, two different failures sharing one code, logs that couldn't be searched by request id, and unknown fields (such as `"role"`) being silently ignored.
+**Rejected:** one exception class per error (shallow classes); RFC 9457 problem details (a better fit for a public API with unknown clients; Atlas's clients are its own); structlog (a dependency for what ~50 lines of standard library do here).
+
 ### D22. Depth pass: Part 4 grows to 20 lessons; Part 7 designed in depth (2026-11-18)
 **Decision:** lessons start from a reproduced failure, are test-first from 4.5, and security lessons carry out the attack before the defence. Part 4 is renumbered: new 4.5 (testing basics); old 4.8 splits into 4.9 and 4.10; old 4.12 splits into 4.14, 4.15 (observability, new) and 4.16; the rest shift (old 4.13 to 4.17, 4.14 to 4.18, 4.15 to 4.19, 4.16 to 4.20). The curriculum totals 100 lessons. Part 7's lesson specs are fixed in [08-depth-pass.md](08-depth-pass.md) and written in M7. Lesson numbers in D16 and D17 refer to the old numbering (4.13 is now 4.17; 4.8 is now 4.9 and 4.10).
 **Why:** the course aims at the depth of the best single-project backend books; Part 4 stated answers before learners met the problem.
