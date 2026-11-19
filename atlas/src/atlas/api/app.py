@@ -30,6 +30,7 @@ from atlas.api.errors import ApiError
 from atlas.api.limits import RateLimiter, ResponseCache
 from atlas.api.routes import (
     auth,
+    digests,
     issues,
     jobs,
     notes,
@@ -195,7 +196,18 @@ def create_app(
             ) from None
         return {"status": "ready"}
 
-    for module in (auth, users, repos, issues, notes, search, jobs, webhooks, notifications):
+    for module in (
+        auth,
+        users,
+        repos,
+        issues,
+        notes,
+        search,
+        jobs,
+        webhooks,
+        notifications,
+        digests,
+    ):
         app.include_router(module.router)
 
     if settings.web_dir is not None:

@@ -13,6 +13,7 @@ atlas scheduler
 atlas sync pytorch/ignite
 atlas jobs
 atlas notifier
+atlas digest --day 2026-11-19
 """
 
 import argparse
@@ -21,7 +22,7 @@ import json
 import logging
 import re
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import redis
@@ -31,7 +32,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from atlas import issue_cache, storage, worker
+from atlas import digest, issue_cache, storage, worker
 from atlas.config import Settings
 from atlas.events import EventStream
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
@@ -111,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("worker", help="run background jobs from the queue")
     commands.add_parser("scheduler", help="queue a sync of every repository, periodically")
     commands.add_parser("notifier", help="turn issue events into users' notifications")
+
+    digest_parser = commands.add_parser("digest", help="build every user's daily digest")
+    digest_parser.add_argument(
+        "--day",
+        type=date.fromisoformat,
+        default=None,
+        help="the digest's date, YYYY-MM-DD (default: today, UTC); it covers the day before",
+    )
 
     sync_parser = commands.add_parser("sync", help="queue a sync of one repository now")
     sync_parser.add_argument("repo", help="owner/name of a tracked repository")
@@ -378,6 +387,18 @@ def run_notifier() -> int:
     return 0
 
 
+def run_digest(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+
+    day = args.day or digest.today()
+    with session, session.begin():
+        created = digest.build_digests(session, day)
+    print(f"{created} digests created for {day}", file=sys.stderr)
+    return 0
+
+
 def run_sync(args: argparse.Namespace) -> int:
     ctx = worker_context()
     if ctx is None:
@@ -468,6 +489,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_worker()
     if args.command == "scheduler":
         return run_scheduler()
+    if args.command == "digest":
+        return run_digest(args)
     if args.command == "notifier":
         return run_notifier()
     if args.command == "sync":
