@@ -4,7 +4,7 @@ description: "Model a many-to-many 'saved issues' relationship, enforce who may 
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 9 · About 75 minutes
+Part 4 · Lesson 11 · About 75 minutes
 :::
 
 ::: {.callout-note title="Analogy: a library card and the staff room"}

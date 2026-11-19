@@ -73,6 +73,7 @@ def session(engine: Engine) -> Iterator[Session]:
 from collections.abc import AsyncIterator  # noqa: E402
 
 import httpx  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
@@ -80,7 +81,7 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 from atlas.api.app import create_app  # noqa: E402
 from atlas.api.deps import get_session  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
-from tests.fake_github import OAUTH_TRANSPORT  # noqa: E402
+from tests.fake_github import FakeGitHubSignIn  # noqa: E402
 
 
 @pytest.fixture
@@ -124,19 +125,35 @@ async def async_session(engine: Engine) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
-async def client(
-    async_session: AsyncSession, api_settings: ApiSettings
-) -> AsyncIterator[httpx.AsyncClient]:
-    """The real app, called in-process (no server, no network), on the test's session."""
-    app = create_app(api_settings, github_transport=OAUTH_TRANSPORT)
+def github() -> FakeGitHubSignIn:
+    """A fresh fake GitHub per test, so codes issued in one test can't leak into another."""
+    return FakeGitHubSignIn()
+
+
+@pytest.fixture
+def api_app(
+    async_session: AsyncSession, api_settings: ApiSettings, github: FakeGitHubSignIn
+) -> FastAPI:
+    """The real app, wired to the test's rolled-back session and the fake GitHub."""
+    app = create_app(api_settings, github_transport=github.transport)
 
     async def test_session() -> AsyncIterator[AsyncSession]:
         yield async_session
 
     # Every route that asks for a database session gets the test's rolled-back one.
     app.dependency_overrides[get_session] = test_session
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as test_client:
+    return app
+
+
+def browser(app: FastAPI) -> httpx.AsyncClient:
+    """A client with its own cookies, like a separate browser (lesson 4.9's attacks need two)."""
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture
+async def client(api_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """The real app, called in-process (no server, no network)."""
+    async with browser(api_app) as test_client:
         yield test_client
 
 

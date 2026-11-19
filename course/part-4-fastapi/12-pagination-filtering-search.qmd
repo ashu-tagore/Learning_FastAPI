@@ -4,7 +4,7 @@ description: "Return large result sets in pages with offset and cursor (keyset) 
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 10 · About 90 minutes
+Part 4 · Lesson 12 · About 90 minutes
 :::
 
 ::: {.callout-note title="Analogy: a bookmark versus a page number"}

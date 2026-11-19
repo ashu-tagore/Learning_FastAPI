@@ -4,7 +4,7 @@ description: "Pull Part 4 together, practise across it, and build a private note
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 16 · About 3 hours
+Part 4 · Lesson 20 · About 3 hours
 :::
 
 ## Recap
@@ -26,10 +26,11 @@ and open `http://localhost:8000/app/`: create an account, search the codebase (o
 | Schemas and domain types | Parse once at the edge; response schemas are whitelists; PATCH uses `exclude_unset` | [4.3](03-pydantic-schemas.qmd) |
 | Dependency injection | Routes declare what they need; one session per request | [4.4](04-sessions-and-dependency-injection.qmd) |
 | Testing from the start | Red, green, refactor; in-process client; overrides stage failures | [4.5](05-testing-the-api.qmd) |
-| Routers | One module per resource; nouns in URLs, verbs in methods | [4.6](06-routers-and-project-structure.qmd) |
-| Password hashing | Argon2 with salt; uniform login errors | [4.7](07-users-and-password-hashing.qmd) |
-| JWT | Signed, readable, short-lived access tokens | [4.8](08-authentication-with-jwt.qmd) |
-| OAuth2, refresh, roles | GitHub sign-in with state and PKCE; rotating refresh tokens | [4.9](09-sign-in-with-github.qmd) |
+| Routers and structure | One module per resource; imports point one way; layers only when deep | [4.6](06-routers-and-project-structure.qmd) |
+| Password hashing | Salted, slow, memory-hard Argon2; same message and same time for every login failure | [4.7](07-users-and-password-hashing.qmd) |
+| JWT | Signed, readable, short-lived; every check matters; keys long and random | [4.8](08-authentication-with-jwt.qmd) |
+| Sign in with GitHub | Authorization code flow; `state` stops login CSRF, PKCE stops stolen codes | [4.9](09-sign-in-with-github.qmd) |
+| Staying signed in | Rotating, hashed refresh tokens with reuse detection; real logout; roles from the database | [4.10](10-staying-signed-in.qmd) |
 | Authorisation | 401 vs 403 vs 404; owner in the query | [4.11](11-relationships-and-authorisation.qmd) |
 | Pagination | Cursor for feeds, offset for ranked results; `selectinload` | [4.12](12-pagination-filtering-search.qmd) |
 | Migrations | Versioned, reviewed schema changes with Alembic | [4.13](13-migrations-with-alembic.qmd) |

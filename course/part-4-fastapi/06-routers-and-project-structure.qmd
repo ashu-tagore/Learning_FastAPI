@@ -1,21 +1,68 @@
 ---
 title: "4.6 Routers and project structure"
-description: "Split the API into routers by resource, choose resource-shaped URLs, and lay out the project so each file has one clear job."
+description: "Split the API into routers by resource, design resource-shaped URLs, avoid circular imports, and decide when an extra layer of code earns its place."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 5 · About 45 minutes
+Part 4 · Lesson 6 · About 90 minutes
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* is worth coming back to before you start a project of your own.
 :::
 
 ::: {.callout-note title="Analogy: departments in a shop"}
 A small shop has one counter. A department store has departments (shoes, kitchen, books), each with its own staff, all under one roof and one entrance. Customers find things faster, and staff know exactly what's theirs.
 
-A **router** is a department of your API: all the routes for one resource, in one file, with a shared address prefix. The app is the building that puts the departments together.
+But a store can also overdo it: if buying socks means queuing at a "footwear enquiries" desk, which sends you to a "hosiery fulfilment" desk, which hands you to the till, the departments have become obstacles.
+
+A **router** is a department of your API: all the routes for one resource, in one file, with a shared address prefix. The app is the building that puts the departments together. This lesson is about having the right number of departments.
 :::
+
+## The problem
+
+With every route written inside `create_app`, `app.py` grows by a screenful with each feature. By the end of this part it would hold about 25 routes, and every change would touch the same file. Splitting it is the obvious fix, and splitting it carelessly creates two new problems.
+
+**Problem 1: circular imports.** Suppose `routes/users.py` needs a helper that lives in `app.py`, say the function that formats error bodies:
+
+```python
+# routes/users.py
+from atlas.api.app import error_body
+```
+
+But `app.py` imports `routes/users.py` to include its router. Python now has a loop. What happens depends on which module is imported first:
+
+```text
+$ uv run python -c "import atlas.api.routes.users"
+
+$ uv run python -c "import atlas.api.app"
+ImportError: cannot import name 'error_body' from partially initialized module 'atlas.api.app' (most likely due to a circular import) (.../src/atlas/api/app.py)
+```
+
+Importing `users.py` first works, by luck. Importing `app.py` first fails, and that's exactly what Uvicorn does at startup. Python ran `app.py` from the top, reached the import of `routes/users.py`, started running it, and `users.py` asked `app.py` for `error_body`, which hadn't been defined yet: the module was "partially initialized". The test suite fails the same way before running a single test, because `conftest.py` imports `create_app`:
+
+```text
+$ uv run pytest -q
+...
+E   ImportError: cannot import name 'error_body' from partially initialized module 'atlas.api.app' (most likely due to a circular import) ...
+```
+
+**Problem 2: layers that do nothing.** Many project templates split every feature into a route, a "service" and a "repository". It looks organised. Here is Atlas's "get an issue or answer 404", written both ways and run against the same database:
+
+```text
+get_issue_or_404  issue 1 -> #20 'Support new metric', issue 999 -> 404
+get_issue_route   issue 1 -> #20 'Support new metric', issue 999 -> 404
+```
+
+Same behaviour. The direct version is 8 lines of code; the layered one is 24, in three classes, plus an exception that exists only to be translated into another exception. ("Trade-offs" below shows both.) Every reader now has to open three places to learn one thing.
+
+So the job is to split along the right lines: few enough pieces to hold in your head, with imports that point one way.
 
 ## Theory
 
-With every route in `app.py`, the file grows to thousands of lines and every change touches it. FastAPI's **`APIRouter`** is a group of routes that you define in its own module and later attach to the app with `app.include_router(...)`. A router can set a `prefix` (`/issues`) and `tags` (for the docs) once for all its routes.
+### Routers
+
+FastAPI's **`APIRouter`** is a group of routes defined in its own module and attached to the app with `app.include_router(...)`. A router sets a `prefix` (`/issues`) and `tags` (for the docs page) once for all its routes. Everything else works the same as `@app.get`: parameters, dependencies, response models.
 
 ### Resource-shaped URLs
 
@@ -30,7 +77,32 @@ With every route in `app.py`, the file grows to thousands of lines and every cha
 | `POST /repos` | add a repository |
 | `GET /users/me` | the signed-in user |
 
-Not `/getIssues` or `/saveIssue?id=42`: the method already says "get" or "save".
+Not `/getIssues` or `/saveIssue?id=42`: the method already says "get" or "save". One router per resource family (`/auth`, `/users`, `/repos`, `/issues`, `/search`) gives one file per family.
+
+### Imports point one way
+
+Circular imports disappear when imports only ever point "down" a fixed order:
+
+```{mermaid}
+flowchart TB
+  APP["app.py<br/>create_app assembles everything<br/>(nothing imports it)"] --> ROUTES["routes/*.py<br/>one router per resource"]
+  ROUTES --> DEPS["deps.py<br/>settings, session, current user"]
+  ROUTES --> SCHEMAS["schemas.py<br/>request and response shapes"]
+  DEPS --> CORE["config.py, models.py, security.py, storage.py<br/>no FastAPI, no HTTP"]
+  ROUTES --> CORE
+```
+
+- `app.py` imports routers; **nothing imports `app.py`**.
+- Route modules import shared pieces (`deps.py`, `schemas.py`) and the core. They rarely import each other, and only for small helpers like `issue_out`, which one resource reuses from another.
+- The core modules don't know HTTP exists, so the command line and the background worker (Part 5) use them too.
+
+The fix for Problem 1, then, is to move `error_body` to a module lower in the order, or keep error formatting entirely inside `app.py`, which is what Atlas does in lesson 4.14.
+
+### Deep modules, not many layers
+
+A useful test for any function, class or file: compare what you must *know to use it* (its **interface**) with what it *does for you*. A **deep** module has a small interface and does a lot: `storage.chunk_search_statement(repo, query, kind=..., limit=..., offset=...)` hides a full-text query with ranking, filtering and paging. A **shallow** module has an interface about as big as its body: `IssueRepository.get(issue_id)` is a renamed `session.get`. Shallow modules add places to look without removing anything to understand.
+
+## In the project
 
 ### Atlas's layout
 
@@ -55,26 +127,11 @@ src/atlas/
       notes.py       notes (4.20)
 ```
 
-The rule behind it: **code that knows about HTTP lives in `api/`; code that doesn't, lives outside.** `security.py` and `storage.py` can be used by the CLI, the API and the background worker (Part 5) alike.
+The rule behind it: **code that knows about HTTP lives in `api/`; code that doesn't, lives outside.** Most of these files are filled in by later lessons; this lesson creates the shape.
 
-Why not a "services" layer and a "repositories" layer between routes and the database, as some templates have? For an app this size, each extra layer is a file to jump through that does little but pass arguments along. Atlas's routes call SQLAlchemy directly and share real logic through `storage.py`. If a rule grows complex, it moves into a deeper module then, not before.
+### A router module
 
-```{mermaid}
-flowchart TB
-  APP[app.py<br/>create_app] --> AUTH[routes/auth.py]
-  APP --> USERS[routes/users.py]
-  APP --> REPOS[routes/repos.py]
-  APP --> ISSUES[routes/issues.py]
-  APP --> SEARCH[routes/search.py]
-  AUTH & USERS & REPOS & ISSUES & SEARCH --> DEPS[deps.py]
-  AUTH --> SEC[security.py]
-  SEARCH --> ST[storage.py]
-  DEPS --> SEC
-```
-
-## In the project
-
-A router module, `src/atlas/api/routes/search.py` (lesson 4.12 fills in the query):
+`src/atlas/api/routes/search.py` (lesson 4.12 fills in the query):
 
 ```python
 """Keyword search over an indexed codebase (the same query as `atlas find`)."""
@@ -98,6 +155,19 @@ for module in (auth, users, repos, issues, notes, search):
     app.include_router(module.router)
 ```
 
+`/health` and `/ready` stay in `app.py`: they're about the process, not a resource, and there are only two.
+
+### Refactoring under tests
+
+Moving code between files changes no behaviour, so it's the **refactor** step of lesson 4.5's loop: no new test, but the existing suite must pass before and after. After the move:
+
+```text
+$ uv run pytest tests/test_api_operations.py tests/test_schemas.py -q
+18 passed in 1.39s
+```
+
+If an import were wrong or a router weren't included, these tests would say so at once. That's why lesson 4.5 came before this one.
+
 Once all of Part 4 is in place, the OpenAPI document lists these paths:
 
 ```text
@@ -107,26 +177,84 @@ $ curl -s http://localhost:8000/openapi.json | python3 -c "import json,sys; prin
 
 (The GitHub sign-in routes are hidden from the docs with `include_in_schema=False`: they're browser redirects, not calls a client makes.)
 
+## Trade-offs: layers versus deep modules *(deep dive)*
+
+Here is the counter-example from "The problem" in full. The layered version:
+
+```python
+class IssueRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, issue_id: int) -> Issue | None:
+        return self.session.get(Issue, issue_id, options=[selectinload(Issue.labels)])
+
+
+class IssueNotFound(Exception):
+    pass
+
+
+class IssueService:
+    def __init__(self, repository: IssueRepository) -> None:
+        self.repository = repository
+
+    def get_issue(self, issue_id: int) -> Issue:
+        issue = self.repository.get(issue_id)
+        if issue is None:
+            raise IssueNotFound(issue_id)
+        return issue
+
+
+def get_issue_route(session: Session, issue_id: int) -> Issue:
+    service = IssueService(IssueRepository(session))
+    try:
+        return service.get_issue(issue_id)
+    except IssueNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Issue {issue_id} not found") from None
+```
+
+And Atlas's:
+
+```python
+def get_issue_or_404(session: Session, issue_id: int) -> Issue:
+    issue = session.get(Issue, issue_id, options=[selectinload(Issue.labels)])
+    if issue is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Issue {issue_id} not found")
+    return issue
+```
+
+The usual arguments for layers, and how they apply to Atlas:
+
+| Argument for layers | Holds when | In Atlas |
+|---|---|---|
+| "We can swap the database" | you really have two storage back ends | One Postgres, by decision D8; SQLAlchemy already hides the driver |
+| "Business logic stays out of HTTP code" | the logic is substantial and reused | Substantial logic (search, issue storage) already lives in `storage.py`, used by CLI and API |
+| "Easier to test" | the layer can be tested alone, meaningfully | Tests run real routes against a real Postgres in milliseconds (lesson 4.5); a mocked repository would test the mocks |
+| "Every feature looks the same" | many people, very different features | Conventions (`deps.py`, schemas, one router per resource) give the same consistency |
+
+So Atlas adds a layer only when it would be **deep**: when it hides real complexity behind a small interface, the way `storage.py` hides full-text search or `security.py` hides token signing. If one day a rule like "an issue may be saved only if its repository is still tracked and the user hasn't hit their limit" appears in three routes, it earns a function of its own then, not before.
+
 ## Common mistakes
 
-- **Circular imports**: `routes/users.py` imports from `app.py`, which imports `routes/users.py`. Shared things go in `deps.py` or `schemas.py`, which import nothing from routes.
+- **Importing `app.py` from anywhere else.** It sits at the top of the order: it imports, it's never imported.
 - **Verbs in URLs**: `/issues/42/save` with POST. Use the resource (`/issues/42/saved`) and let the method be the verb.
-- **Thin pass-through layers** (`IssueService.get_issue` calling `IssueRepository.get_issue` calling `session.get`): three files, one line of logic.
+- **Thin pass-through layers**: three files, one line of logic.
 - **Forgetting `include_router`**: the routes exist in the module but answer 404.
 - **Inconsistent plurals**: `/issue/42` and `/repos`. Pick plural nouns everywhere.
+- **Refactoring without running the tests**: a move that "obviously changes nothing" is when an import goes missing.
 
 ## Check yourself
 
-**1.** What does `prefix="/issues"` on a router do?
+**1.** Why did `import atlas.api.routes.users` succeed but `import atlas.api.app` fail?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-It's prepended to every route in the router, so `@router.get("/{issue_id}")` answers `GET /issues/{issue_id}`. The prefix is written once instead of on every route.
+Python runs a module top to bottom on its first import. Starting from `users.py`, Python ran all of `app.py` (whose import of `users.py` got the half-run module already in progress), so `error_body` existed by the time `users.py` asked for it. Starting from `app.py`, Python reached the router import before defining `error_body`, so `users.py` asked a half-run `app.py` for a name that didn't exist yet. Circular imports succeed or fail depending on order, which is why they must be designed out, not tested around.
 :::
 
-**2.** Why does `security.py` live outside `api/`?
+**2.** What makes a module "deep"? Give one deep and one shallow example from this lesson.
 
 ::: {.callout-tip collapse="true" title="Answer"}
-It knows nothing about HTTP: hashing a password or signing a token is the same for the CLI (`atlas make-admin`), the API and tests. Keeping it free of FastAPI imports lets every part of Atlas use it.
+A deep module does a lot behind a small interface. Deep: `storage.chunk_search_statement`, which hides ranked full-text search, filtering and paging behind a few arguments. Shallow: `IssueRepository.get`, whose interface (an issue id in, an issue or `None` out) is the same as the one line it wraps.
 :::
 
 **3.** Design the URL and method for "list the notes I wrote on issue 42".
@@ -137,7 +265,7 @@ It knows nothing about HTTP: hashing a password or signing a token is the same f
 
 ## Exercise
 
-Move the `/stats` route from lesson 4.4's exercise into `routes/stats.py` with its own router (`prefix="/stats"`, `tags=["operations"]`) and include it in `create_app`.
+Move the `/stats` route from lesson 4.4's exercise into `routes/stats.py` with its own router (`prefix="/stats"`, `tags=["operations"]`) and include it in `create_app`. First write a test that `GET /stats` answers 200 with both keys, and run it before the route exists to see it fail with 404.
 
 ::: {.callout-tip collapse="true" title="Solution"}
 ```python
@@ -156,15 +284,15 @@ def stats(session: SessionDep) -> dict[str, int]:
     chunks = session.scalar(select(func.count()).select_from(Chunk)) or 0
     return {"repos": repos, "chunks": chunks}
 ```
-Then add `stats` to the import and the `for module in (...)` loop.
+Add `stats` to the import and the `for module in (...)` loop. The test: `response = client.get("/stats")`, then `assert response.status_code == 200` and `assert set(response.json()) == {"repos", "chunks"}`. With an empty test database both counts are 0. Not in the reference code.
 :::
 
 ## Stretch
 
-Sketch REST URLs for Part 6's features: asking a question about a repository, listing past answers, and rating an answer as helpful. Which method does each use?
+Sketch REST URLs for Part 6's features: asking a question about a repository, listing past answers, and rating an answer as helpful. Which method does each use, and which router would own each?
 
 ::: {.callout-tip collapse="true" title="Solution"}
-One reasonable design: `POST /repos/{repo_id}/questions` (ask; creates a question and its answer), `GET /questions` (my past questions), `GET /questions/{id}` (one with its answer), `PUT /questions/{id}/rating` with `{"helpful": true}` (set my rating; idempotent). Part 6 builds its own version and explains its choices.
+One reasonable design: `POST /repos/{repo_id}/questions` (ask; creates a question and its answer), `GET /questions` (my past questions), `GET /questions/{id}` (one with its answer), `PUT /questions/{id}/rating` with `{"helpful": true}` (set my rating; idempotent). A `questions` router would own all four, even the first: the resource being created is a question, and the repository is only part of its address. Part 6 builds its own version and explains its choices.
 :::
 
 ## What changed in the project

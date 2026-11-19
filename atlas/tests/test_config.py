@@ -1,7 +1,7 @@
 """Settings (lesson 4.2): fail fast, and never print a secret while failing."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from atlas.config import ApiSettings
 
@@ -36,7 +36,16 @@ def test_a_startup_error_never_contains_secrets(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_secrets_print_as_stars() -> None:
-    settings = ApiSettings(database_url="postgresql+psycopg://x/y", secret_key="s3cret-value")  # type: ignore[arg-type]
+    key = "s3cret-value-that-is-long-enough-for-hs256"
+    settings = ApiSettings(database_url="postgresql+psycopg://x/y", secret_key=SecretStr(key))
 
-    assert "s3cret-value" not in repr(settings)
-    assert settings.secret_key.get_secret_value() == "s3cret-value"
+    assert key not in repr(settings)
+    assert settings.secret_key.get_secret_value() == key
+
+
+def test_a_short_secret_key_stops_startup() -> None:
+    # A short key can be guessed, and then anyone can sign tokens for any user (lesson 4.8).
+    with pytest.raises(ValidationError) as failure:
+        ApiSettings(database_url="postgresql+psycopg://x/y", secret_key=SecretStr("changeme"))
+
+    assert failure.value.errors()[0]["loc"] == ("secret_key",)

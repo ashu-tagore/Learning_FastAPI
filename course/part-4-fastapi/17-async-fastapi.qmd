@@ -4,7 +4,7 @@ description: "Convert Atlas's API to async database access, keep CPU-heavy work 
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 13 · About 90 minutes
+Part 4 · Lesson 17 · About 90 minutes
 :::
 
 ::: {.callout-note title="Analogy: one waiter, many tables"}

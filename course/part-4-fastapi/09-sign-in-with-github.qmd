@@ -1,40 +1,51 @@
 ---
-title: "4.9 Sign in with GitHub, refresh tokens and roles"
-description: "Add GitHub sign-in with the OAuth2 authorization code flow (state and PKCE), keep users signed in with rotating refresh tokens, and give accounts roles."
+title: "4.9 Sign in with GitHub: OAuth2 and PKCE"
+description: "Add GitHub sign-in with the OAuth2 authorization code flow, then carry out login CSRF and a stolen-code attack against it to see exactly what state and PKCE each prevent."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 8 · About 120 minutes
+Part 4 · Lesson 9 · About 2.5 hours
 :::
 
-::: {.callout-warning title="Being restructured"}
-This lesson is being split by the [depth pass](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/08-depth-pass.md). Until then it also covers lesson 4.10 (refresh tokens, logout and roles).
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Attack it". The trade-offs section *(deep dive)* covers OpenID Connect and other identity providers.
 :::
 
 ::: {.callout-note title="Analogy: a hotel key card from the front desk"}
 A conference venue doesn't check your passport itself. It sends you to the hotel's front desk, which already knows you; the desk gives you a slip; the venue phones the desk with that slip and asks "who is this?". The venue never sees your passport, and the hotel only tells it your name.
 
-**OAuth2** is that arrangement on the web. Atlas (the venue) sends you to GitHub (the desk). You sign in *there*, approve Atlas, and GitHub sends you back with a one-time code. Atlas trades the code for a token and asks GitHub "who is this?". Atlas never sees your GitHub password.
+**OAuth2** is that arrangement on the web. Atlas (the venue) sends you to GitHub (the desk). You sign in *there*, approve Atlas, and GitHub sends you back with a one-time code. Atlas trades the code for a token and asks GitHub "who is this?". Atlas never sees your GitHub password, and stores no password for you at all.
 :::
+
+## The problem
+
+Atlas's users are people who want to contribute to open-source projects on GitHub. They all have a GitHub account already, and asking them for yet another password is friction, plus one more password database to protect (lesson 4.7 showed what a leaked one costs). Signing in with GitHub solves both.
+
+But "signing in with someone else's account system" means trusting messages that arrive through the user's browser, which an attacker can also send. Two attacks matter here, and this lesson carries out both against Atlas:
+
+1. **Login CSRF**: the attacker tricks *you* into signing in to Atlas *as them*. It sounds harmless until you realise that everything you then do (save issues, write notes about the projects you're working on, fill in your skills profile) lands in an account the attacker can read.
+2. **Code interception**: the one-time code passes through the browser's address bar, where it can leak (a browser extension, a shared screen, logs). An attacker who replays it signs in as *you*.
+
+Each has a specific defence. You'll remove each defence in turn and watch the attack succeed.
 
 ## Theory
 
 ### OAuth2, the authorization code flow
 
-**OAuth2** (RFC 6749) is a framework that lets a user grant one application limited access to their account on another, without sharing a password. The roles: the **user**, the **client** (Atlas), and the **authorization server** (GitHub). The flow for web apps is the **authorization code flow**:
+**OAuth2** (RFC 6749) is a framework that lets a user grant one application limited access to their account on another, without sharing a password. The roles: the **user**, the **client** (Atlas), and the **authorization server** (GitHub). Atlas registers once with GitHub as an **OAuth app** and gets a public **client id** and a private **client secret**. The flow for web apps is the **authorization code flow**:
 
 1. Atlas redirects the browser to GitHub's authorize page with its `client_id`, a `redirect_uri` and a random `state`.
 2. The user signs in to GitHub and approves.
 3. GitHub redirects the browser back to the `redirect_uri` with a short-lived `code` and the same `state`.
-4. Atlas's server sends the `code` plus its **client secret** to GitHub directly (not through the browser) and gets an access token.
-5. Atlas calls GitHub's `GET /user` with that token to learn the user's id and login.
+4. Atlas's *server* sends the `code` plus the client secret to GitHub directly (not through the browser) and gets an access token.
+5. Atlas calls GitHub's `GET /user` with that token to learn the user's numeric id and login.
 
-**OIDC** (OpenID Connect) is a layer on top of OAuth2 that standardises step 5: the server returns a signed **ID token** (a JWT, lesson 4.8) saying who the user is. Google and Microsoft sign-in use it. GitHub's sign-in for apps is plain OAuth2, so Atlas asks the `/user` endpoint instead. The ideas carry over.
+### The two defences
 
-### Two protections
+- **`state`**: a random value Atlas stores in a cookie in *your* browser before sending you to GitHub. When a callback arrives, its `state` must match your cookie. A callback you didn't start (a link from an attacker) has no matching cookie, so it's refused. This stops login CSRF.
+- **PKCE** (Proof Key for Code Exchange, RFC 7636, said "pixy"): Atlas makes a random **code verifier**, keeps it in the same cookie, and sends GitHub only its SHA-256 hash, the **code challenge**. GitHub remembers which challenge each code was issued for. At step 4, Atlas must present the verifier that hashes to it. A stolen code, replayed from anyone else's browser, comes with the wrong verifier, so GitHub refuses it.
 
-- **`state`**: a random value Atlas stores in a cookie and sends to GitHub. On the way back, it must match. Without it, an attacker could send you a link to Atlas's callback with *their* code, and you'd be signed in to their account (a login CSRF attack).
-- **PKCE** (Proof Key for Code Exchange, RFC 7636, said "pixy"): Atlas makes a random **code verifier**, sends GitHub only its SHA-256 hash (the **code challenge**), and later proves it knows the verifier when exchanging the code. An intercepted code is useless without the verifier. GitHub's documentation strongly recommends both.
+GitHub's documentation strongly recommends using both.
 
 **Scopes** say what access the app wants (`repo`, `read:org`, ...). Atlas asks for **no scopes**: GitHub then grants read-only access to public information, which is all sign-in needs. This keeps the product rule from [the vision](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/01-vision.md): Atlas never writes to GitHub.
 
@@ -50,29 +61,111 @@ sequenceDiagram
   B->>A: callback (+ cookie)
   A->>A: state matches cookie?
   A->>G: POST access_token (code, secret, verifier)
+  G->>G: verifier hashes to the code's challenge?
   G-->>A: GitHub token
   A->>G: GET /user
   G-->>A: id 4242, login
   A-->>B: Atlas tokens
 ```
 
-### Refresh tokens
-
-Access tokens last 15 minutes (lesson 4.8). A **refresh token** is a long-lived (30 days) random string the client trades for a new access token. Unlike a JWT it means nothing on its own: it is looked up in a table, so it **can be revoked** (logout).
-
-Atlas uses **rotation**: each refresh token works once and is replaced by a new one. If a used token ever comes back, either the user or a thief is replaying an old copy. Atlas can't tell which, so it revokes every token that user has: **reuse detection**. Refresh tokens are long and random, so a fast SHA-256 hash is safe for storing them (unlike passwords).
-
-### Roles
-
-**Authorisation** answers "what may you do?" (authentication answered "who are you?"). The simplest model is a **role** per user: Atlas has `user` and `admin`. Admins may add repositories; lesson 4.11 enforces it.
-
 ## In the project
 
 ### Configuration
 
-Create a GitHub **OAuth app** (GitHub → Settings → Developer settings → OAuth Apps → New OAuth App) with callback URL `http://localhost:8000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `.env`. Without them, `/auth/github/login` answers 404 "GitHub sign-in is not configured", and everything else works.
+Create a GitHub OAuth app (GitHub → Settings → Developer settings → OAuth Apps → New OAuth App) with callback URL `http://localhost:8000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `.env`. Without them, `/auth/github/login` answers 404 "GitHub sign-in is not configured", and everything else works.
 
-### The flow helpers: `github_oauth.py`
+### A fake GitHub that behaves like the real one
+
+Tests can't sign in to the real GitHub. Lesson 2.5 replaced GitHub's API with `httpx.MockTransport`; sign-in needs a fake that's strict in the same ways GitHub is, or the attack tests would pass against a fake that accepts anything. `tests/fake_github.py`:
+
+```python
+class FakeGitHubSignIn:
+    """GitHub's sign-in, faked closely enough to test the attacks in lesson 4.9.
+
+    Like GitHub, it issues a code when the user approves, remembers the PKCE challenge
+    that code was issued for, accepts each code once, and only for the matching verifier.
+    """
+
+    def __init__(self) -> None:
+        self.issued: dict[str, tuple[str | None, dict[str, object]]] = {}
+        self.access_tokens: dict[str, dict[str, object]] = {}
+        self.transport = httpx.MockTransport(self.handle)
+
+    def approve(
+        self, authorize_url: str, github_id: int = 4242, login: str = "octo-learner"
+    ) -> str:
+        """What happens at GitHub when the user clicks "Authorize": a code for this request."""
+        query = parse_qs(urlparse(authorize_url).query)
+        code = f"code-{len(self.issued) + 1}"
+        # Without PKCE there is no challenge, and GitHub accepts the code with any verifier.
+        challenge = query["code_challenge"][0] if "code_challenge" in query else None
+        self.issued[code] = (challenge, {"id": github_id, "login": login})
+        return code
+```
+
+Its `exchange` method (not shown) pops the code (so it works once), hashes the verifier it receives, and answers `bad_verification_code` unless it matches the stored challenge. `create_app` takes a `github_transport` argument (lesson 4.1's factory again), and the test fixtures pass `github.transport`.
+
+Attacks need *two* browsers: the attacker's and the victim's, each with its own cookies. In `conftest.py`, the `client` fixture is split so a test can open extra ones:
+
+```python
+def browser(app: FastAPI) -> TestClient:
+    """A client with its own cookies, like a separate browser."""
+    return TestClient(app)
+```
+
+(`api_app` is a new fixture that builds the app with the test's session and the fake GitHub; `client` is now just `browser(api_app)`.)
+
+### Red: the attacks as tests
+
+`tests/test_api_github.py` holds the ordinary flow tests (the redirect has a state and an S256 challenge and no scope; a first sign-in creates an account and a second reuses it; a made-up code answers 502) and these two:
+
+```python
+def start_sign_in(client: TestClient) -> tuple[str, str]:
+    """Click "Sign in with GitHub": return GitHub's authorize URL and the state Atlas sent."""
+    response = client.get("/auth/github/login", follow_redirects=False)
+    authorize_url = response.headers["location"]
+    state = parse_qs(urlparse(authorize_url).query)["state"][0]
+    return authorize_url, state
+
+
+def test_login_csrf_a_link_to_the_attackers_sign_in_is_refused(
+    api_app: FastAPI, session: Session, github: FakeGitHubSignIn
+) -> None:
+    with browser(api_app) as attacker, browser(api_app) as victim:
+        # The attacker starts a sign-in with their own GitHub account, approves it,
+        # and stops before the callback: they now hold a valid code and state.
+        authorize_url, state = start_sign_in(attacker)
+        code = github.approve(authorize_url, github_id=6666, login="attacker")
+
+        # They send the victim a link to the callback. The victim's browser has no cookie
+        # from this sign-in, because it never started one.
+        response = victim.get("/auth/github/callback", params={"code": code, "state": state})
+
+    assert response.status_code == 400
+    assert session.scalar(select(User).where(User.github_id == 6666)) is None
+
+
+def test_a_stolen_code_is_useless_without_its_verifier(
+    api_app: FastAPI, session: Session, github: FakeGitHubSignIn
+) -> None:
+    with browser(api_app) as victim, browser(api_app) as attacker:
+        authorize_url, _ = start_sign_in(victim)
+        stolen_code = github.approve(authorize_url, github_id=4242, login="victim")
+
+        # The attacker intercepts the code and replays it in a sign-in they started
+        # themselves, so their state check passes; but their verifier is their own.
+        _, attacker_state = start_sign_in(attacker)
+        response = attacker.get(
+            "/auth/github/callback", params={"code": stolen_code, "state": attacker_state}
+        )
+
+    assert response.status_code == 502
+    assert session.scalar(select(User).where(User.github_id == 4242)) is None
+```
+
+The second test is subtle: the attacker passes the `state` check honestly, using their own sign-in, so only PKCE stands between them and the victim's account. 502 Bad Gateway is the right status: Atlas is fine, but the server it relies on (GitHub) refused.
+
+### Green: the flow helpers in `github_oauth.py`
 
 ```python
 def new_pkce_pair() -> tuple[str, str]:
@@ -100,9 +193,9 @@ def authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge:
     return f"{AUTHORIZE_URL}?{query}"
 ```
 
-`exchange_code(...)` does steps 4 and 5 with `httpx` (lesson 2.5). GitHub reports problems like an expired code in the JSON body (`"error": "bad_verification_code"`) rather than only the status, so it checks the body. Its `transport` parameter lets tests replace GitHub with a fake (lesson 4.19).
+`exchange_code(...)` does steps 4 and 5 with `httpx` (lesson 2.5), sending `code_verifier` with the code. GitHub reports problems like an expired code in the JSON body (`"error": "bad_verification_code"`) rather than only the status, so it checks the body. Its `transport` parameter is how tests swap in the fake (lesson 4.19 has more on fakes).
 
-### The two routes: `routes/auth.py`
+### Green: the two routes in `routes/auth.py`
 
 ```python
 @router.get("/github/login", include_in_schema=False)
@@ -128,11 +221,14 @@ def github_login(request: Request, settings: SettingsDep) -> RedirectResponse:
     return response
 ```
 
-`samesite="lax"` lets the cookie travel on GitHub's top-level redirect back to Atlas, but not on requests other sites make in the background. `max_age` is 600 seconds because GitHub's codes expire after 10 minutes anyway.
+`samesite="lax"` lets the cookie travel on GitHub's top-level redirect back to Atlas, but not on requests other sites make in the background. `max_age` is 600 seconds because GitHub's codes expire after 10 minutes anyway. `secure` sends the cookie only over HTTPS when Atlas is served over HTTPS (Part 7).
 
 The callback checks `state`, exchanges the code, then finds or creates the account by GitHub's numeric id:
 
 ```python
+    cookie = request.cookies.get(OAUTH_COOKIE, "")
+    expected_state, _, verifier = cookie.partition(".")
+
     # secrets.compare_digest takes the same time whatever the input, leaking nothing via timing.
     state_matches = bool(expected_state) and secrets.compare_digest(state, expected_state)
     if not state_matches:
@@ -147,105 +243,108 @@ The callback checks `state`, exchanges the code, then finds or creates the accou
         user.github_login = identity.login
 ```
 
-Finally it issues Atlas tokens. When serving the web interface, it redirects to `/app/#access_token=...&refresh_token=...`. The part after `#` (the **fragment**) is never sent to any server, so tokens don't land in server logs; `web/app.js` reads it and clears it from the address bar.
-
-### Refresh, rotation and logout
-
-```python
-@router.post("/refresh", response_model=TokenPair)
-def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) -> TokenPair:
-    """Trade a refresh token for a new pair. Each refresh token works exactly once."""
-    stored = session.scalar(
-        select(RefreshToken).where(
-            RefreshToken.token_hash == hash_refresh_token(body.refresh_token)
-        )
-    )
-    rejected = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token")
-    if stored is None:
-        raise rejected
-
-    now = datetime.now(UTC)
-    was_already_used = stored.revoked_at is not None
-    if was_already_used:
-        # A used token coming back means it was probably stolen. Sign the user out everywhere.
-        session.execute(
-            update(RefreshToken)
-            .where(RefreshToken.user_id == stored.user_id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=now)
-        )
-        session.commit()
-        raise rejected
-
-    has_expired = stored.expires_at <= now
-    if has_expired:
-        raise rejected
-
-    stored.revoked_at = now
-    user = session.get(User, stored.user_id)
-    if user is None:
-        raise rejected
-    return issue_tokens(session, user, settings)
-```
-
-The same refresh token, used twice:
+Finally it issues Atlas tokens (lesson 4.10) and deletes the cookie. When serving the web interface, it redirects to `/app/#access_token=...&refresh_token=...`. The part after `#` (the **fragment**) is never sent to any server, so tokens don't land in server logs; `web/app.js` reads it and clears it from the address bar.
 
 ```text
-$ curl -s -X POST http://localhost:8000/auth/refresh -H "Content-Type: application/json" -d "{\"refresh_token\": \"$REFRESH\"}"
-{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIzIiwidHlwZSI6ImFjY2VzcyIsImlhdCI6MTc5NDk3MTQ1OCwiZXhwIjoxNzk0OTcyMzU4fQ.lkmalTBx9H0fRCKyeq57wFoCre2KfbzXPNgbyNyYecI","refresh_token":"0y640gA8JRRgHKnd7cCZ5WQmOgCSfLSqNQSiTQ5w-w0","token_type":"bearer","expires_in":900}
-
-$ curl -s -X POST http://localhost:8000/auth/refresh -H "Content-Type: application/json" -d "{\"refresh_token\": \"$REFRESH\"}"
-{"error":{"code":"unauthorized","message":"Invalid refresh token","request_id":"c191d67b6b614db48d83aba2683634dd"}}
+$ uv run pytest tests/test_api_github.py -v
+tests/test_api_github.py::test_github_login_redirects_with_state_and_pkce PASSED
+tests/test_api_github.py::test_github_callback_creates_then_reuses_the_account PASSED
+tests/test_api_github.py::test_github_callback_rejects_a_state_it_did_not_issue PASSED
+tests/test_api_github.py::test_github_callback_reports_a_bad_code PASSED
+tests/test_api_github.py::test_login_csrf_a_link_to_the_attackers_sign_in_is_refused PASSED
+tests/test_api_github.py::test_a_stolen_code_is_useless_without_its_verifier PASSED
+============================== 6 passed in 0.31s ===============================
 ```
 
-The second call also revoked the new refresh token from the first call. `POST /auth/logout` revokes one refresh token; the access token still works until it expires, at most 15 minutes. The web page calls `/auth/refresh` automatically when a request gets 401.
+## Attack it: remove one defence at a time
 
-### Making an administrator
-
-There's deliberately no API route to become admin. An operator with database access runs a CLI command:
+The two attack tests, run against copies of Atlas with a defence removed. "State removed" means the callback accepts any `state`; "PKCE removed" means Atlas sends no challenge and no verifier, which GitHub allows.
 
 ```text
-$ atlas make-admin --email ada@example.com
-ada@example.com is now an administrator
+== state check removed
+E       assert 502 == 400
+FAILED tests/test_api_github.py::test_login_csrf_a_link_to_the_attackers_sign_in_is_refused
+1 failed, 1 passed, 4 deselected in 0.27s
 
-$ atlas make-admin --email nobody@example.com
-atlas: no user with email nobody@example.com
+== PKCE removed
+E       assert 200 == 502
+FAILED tests/test_api_github.py::test_a_stolen_code_is_useless_without_its_verifier
+1 failed, 1 passed, 4 deselected in 0.31s
+
+== both removed
+E       assert 200 == 400
+E       assert 200 == 502
+FAILED tests/test_api_github.py::test_login_csrf_a_link_to_the_attackers_sign_in_is_refused
+FAILED tests/test_api_github.py::test_a_stolen_code_is_useless_without_its_verifier
+2 failed, 4 deselected in 0.26s
 ```
+
+Read them closely, because they're more interesting than "each defence stops one attack":
+
+- **Without `state`**, the CSRF test failed, but with 502, not 200: the attack *still didn't work*. The victim's browser had no cookie, so Atlas sent GitHub an empty verifier, and GitHub refused the code. PKCE, built for a different attack, happened to block this one too.
+- **Without PKCE**, the stolen code worked: 200, and the attacker was signed in as the victim. `state` can't help here, because the attacker used their own, valid sign-in.
+- **Without both**, both attacks succeed.
+
+This is **defence in depth**: independent protections, so that one mistake doesn't open the door. It's also why the CSRF test asserts exactly 400 rather than "anything but 200": a test that only checked "the attack failed" would have hidden that the `state` check was gone.
+
+## Trade-offs: identity providers and OpenID Connect *(deep dive)*
+
+**OIDC** (OpenID Connect) is a layer on top of OAuth2 that standardises step 5: instead of calling a "who am I" endpoint, the client receives a signed **ID token** (a JWT, lesson 4.8) saying who the user is. Google and Microsoft sign-in use it. GitHub's sign-in for apps is plain OAuth2, which is why Atlas asks the `/user` endpoint.
+
+| Option | Good for | Cost |
+|---|---|---|
+| Only email and password (lesson 4.7) | no dependency on anyone else | you guard a password database; users juggle another password |
+| One provider (GitHub) | an audience that all has it | users without it can't sign in, so Atlas keeps passwords too |
+| Several providers via OIDC | general audiences | linking accounts that are the same person; more flows to test |
+| A hosted identity service (Auth0, Cognito, Keycloak) | teams that would rather not build sign-in | cost, vendor lock-in, and you still need to understand this lesson to configure it safely |
+
+Atlas offers both passwords and GitHub, keyed by different columns (`email` and `github_id`), and doesn't merge accounts automatically. Merging "the same email" across providers sounds friendly, but if a provider ever let someone claim an address they don't own, an automatic merge would hand them the account.
 
 ## Common mistakes
 
 - **Skipping `state`** (or not comparing it): login CSRF.
+- **Skipping PKCE** because there's a client secret: a code intercepted in the browser can still be replayed through your own server.
 - **Putting the client secret in the browser** (in JavaScript). The code exchange must happen on the server.
 - **Asking for broad scopes** "just in case". Ask for the least you need; Atlas asks for none.
-- **Identifying GitHub users by login.** Logins can be renamed and reused; the numeric `id` is permanent.
-- **Storing refresh tokens in plain text**: a database leak would hand out 30-day sessions.
-- **Refresh tokens that never rotate**: a stolen one works for its whole life, unnoticed.
+- **Identifying GitHub users by login.** Logins can be renamed and later reused by someone else; the numeric `id` is permanent.
+- **Faking an external service too loosely** in tests: a fake that accepts any code would let the attack tests pass against broken code.
 
 ## Check yourself
 
-**1.** What would an attacker gain by intercepting the `code` in the callback URL, with PKCE in place?
+**1.** In the stolen-code test, the attacker's `state` matched their cookie. Why did the sign-in still fail?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-Nothing useful: exchanging the code requires the code verifier, which never left Atlas's cookie (and Atlas's client secret). GitHub checks that the verifier hashes to the challenge it received.
+The code was issued for the victim's code challenge. The attacker's cookie held the attacker's own verifier, which hashes to a different challenge, so GitHub refused to exchange the code. Only the victim's browser held the right verifier.
 :::
 
-**2.** Why does Atlas revoke *all* of a user's refresh tokens when a used one comes back?
+**2.** With the `state` check removed, why did the CSRF attack still fail, and why is that not a reason to drop `state`?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-A used token returning means two parties hold copies: the real user and probably a thief. Atlas can't tell which request is which, so it ends every session; the real user just signs in again, and the thief is locked out.
+The victim's browser had no cookie from that sign-in, so Atlas sent GitHub an empty verifier, and PKCE refused the code. That's luck from a defence aimed at another attack. `state` is the defence designed for this one; keeping both means a mistake in either still leaves the other.
 :::
 
-**3.** What's the difference between authentication and authorisation?
+**3.** Why does Atlas identify GitHub users by `github_id`, not `github_login`?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-Authentication establishes who you are (password, GitHub sign-in, token). Authorisation decides what you may do (roles, ownership). A request can be authenticated and still forbidden: 401 means "who are you?", 403 means "I know who you are, and no".
+Logins can be renamed, and an old login can then be registered by someone else, who would be matched to the first person's Atlas account. The numeric id never changes and is never reused.
 :::
 
 ## Exercise
 
-Without a GitHub app, call `GET /auth/github/login` and read the redirect: `curl -s -i http://localhost:8000/auth/github/login | head -5`. Then set fake `GITHUB_CLIENT_ID=test` and `GITHUB_CLIENT_SECRET=test`, restart, and repeat. What's in the `location` header, and which cookie is set?
+Write a test that a callback with a correct state but *no code* (`?state=...` only) is rejected with 422, and that `github.issued` still holds the approved code afterwards (nothing was spent).
 
 ::: {.callout-tip collapse="true" title="Solution"}
-Without settings: 404 `GitHub sign-in is not configured`. With them: `302 Found`, `location: https://github.com/login/oauth/authorize?client_id=test&redirect_uri=...&state=...&code_challenge=...&code_challenge_method=S256&allow_signup=true` (no `scope`), and `set-cookie: atlas_oauth=<state>.<verifier>; HttpOnly; Max-Age=600; Path=/; SameSite=lax`. The test `test_github_login_redirects_with_state_and_pkce` checks these.
+```python
+def test_a_callback_without_a_code_is_invalid(client: TestClient, github: FakeGitHubSignIn) -> None:
+    authorize_url, state = start_sign_in(client)
+    code = github.approve(authorize_url)
+
+    response = client.get("/auth/github/callback", params={"state": state})
+
+    assert response.status_code == 422
+    assert code in github.issued
+```
+`code` is a required query parameter of the callback route, so FastAPI rejects the request before the route runs, and the fake never sees an exchange. Not in the reference code.
 :::
 
 ## Stretch
@@ -265,4 +364,4 @@ Prints `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`, the RFC's value, so Atlas 
 
 ## What changed in the project
 
-New `src/atlas/github_oauth.py`; `RefreshToken` table; `routes/auth.py` gains `/auth/github/login`, `/auth/github/callback`, `/auth/refresh` and `/auth/logout`; `atlas make-admin`. Commit: `feat: Added GitHub sign-in, refresh tokens and roles`.
+New `src/atlas/github_oauth.py`; `routes/auth.py` gains `/auth/github/login` and `/auth/github/callback`; `tests/fake_github.py` gains `FakeGitHubSignIn`; new `tests/test_api_github.py`; `conftest.py` gains `api_app`, `github` and `browser`. Commits: `feat: Added sign in with GitHub`, `test: Faked GitHub sign-in closely enough to test login CSRF and stolen codes`.

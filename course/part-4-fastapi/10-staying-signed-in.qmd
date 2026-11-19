@@ -1,0 +1,356 @@
+---
+title: "4.10 Staying signed in: refresh tokens, logout and roles"
+description: "Keep users signed in safely with rotating, revocable refresh tokens, catch a stolen one through reuse detection, sign out for real, and give accounts roles."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 10 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Attack it". The trade-offs section *(deep dive)* covers where clients should keep refresh tokens.
+:::
+
+::: {.callout-note title="Analogy: a cloakroom ticket that changes every visit"}
+At a cloakroom you get a numbered ticket. Imagine one that hands you a *new* ticket each time you show yours, and tears up the old one. If a thief copies your ticket and uses it first, you'll arrive with a ticket that's already torn up. The attendant can't tell which of you is the thief, but now knows *someone* copied it, so they lock the coat away until you prove who you are again.
+
+That's a **rotating refresh token** with **reuse detection**. The copy can be used at most once, and its use is noticed.
+:::
+
+## The problem
+
+Lesson 4.8's access tokens last 15 minutes, because a JWT can't be revoked: a stolen one works until it expires. That leaves two bad choices:
+
+- **Make users log in every 15 minutes.** Nobody would use the product.
+- **Make access tokens last for weeks.** Then a token leaked once (from a log, a shared laptop, a malicious browser extension) works for weeks, and "log out" can't stop it, because the server never looks anything up.
+
+And there's a second gap: so far "log out" can only mean "the browser forgets the token". The server has no say.
+
+The way out is a second kind of token that *is* stored on the server, and so can be revoked. This lesson builds it, then attacks it the way real refresh tokens get attacked: by stealing one.
+
+## Theory
+
+### Refresh tokens
+
+A **refresh token** is a long-lived (30 days in Atlas), random string that the client trades for a new access token when the old one expires. Unlike a JWT it means nothing on its own: it's looked up in a table, so it **can be revoked**. The access token stays short-lived and fast to check; the refresh token is checked only every 15 minutes or so, so the database lookup costs little.
+
+- **Stored as a hash.** Refresh tokens are long and random (32 random bytes), so a fast SHA-256 hash is safe for storing them, unlike passwords (lesson 4.7), whose problem was being guessable. A leaked table of hashes can't be used to sign in.
+- **Logout** marks the refresh token as revoked. The access token still works until it expires, at most 15 minutes: the price of not looking it up.
+
+### Rotation and reuse detection
+
+**Rotation**: each refresh token works exactly once. Using it returns a new pair (access and refresh) and revokes the old refresh token.
+
+**Reuse detection**: if a refresh token that was already used comes back, two parties hold copies of it: the real user and someone else. The server can't tell which request is which, so it revokes **every** refresh token that user has. The real user signs in again; the thief is locked out.
+
+```{mermaid}
+sequenceDiagram
+  participant C as Client
+  participant A as Atlas
+  participant DB as refresh_tokens
+  C->>A: POST /auth/refresh (token R1)
+  A->>DB: R1 found, not yet used?
+  A->>DB: mark R1 used, store hash of R2
+  A-->>C: access token + R2
+  Note over C,A: later, R1 comes back (a copy)
+  C->>A: POST /auth/refresh (token R1)
+  A->>DB: R1 was already used: revoke all of this user's tokens
+  A-->>C: 401
+```
+
+### Roles
+
+**Authorisation** answers "what may you do?", after authentication answered "who are you?". The simplest model is a **role** per user: Atlas has `user` and `admin`. Admins may add repositories (lesson 4.11 enforces it). Two questions to settle up front: how someone becomes an admin, and what stops a user from making themselves one.
+
+## In the project
+
+### The table
+
+```python
+class RefreshToken(Base):
+    """A long-lived token that can be exchanged for a new access token (lesson 4.10)."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Indexed: signing a user out everywhere updates all their tokens by user_id (lesson 4.13).
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # Only a hash is stored: a leaked table can't be used to sign in.
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+```
+
+### Red: rotation, reuse and logout as tests
+
+```python
+def login_tokens(client: TestClient) -> dict[str, str]:
+    client.post("/auth/register", json={"email": "ada@example.com", "password": "a-long-password"})
+    response = client.post(
+        "/auth/login", data={"username": "ada@example.com", "password": "a-long-password"}
+    )
+    return response.json()
+
+
+def test_refresh_rotates_tokens(client: TestClient) -> None:
+    first = login_tokens(client)
+
+    response = client.post("/auth/refresh", json={"refresh_token": first["refresh_token"]})
+
+    assert response.status_code == 200
+    second = response.json()
+    assert second["refresh_token"] != first["refresh_token"]
+
+
+def test_reusing_a_refresh_token_signs_out_everywhere(client: TestClient) -> None:
+    first = login_tokens(client)
+    second = client.post("/auth/refresh", json={"refresh_token": first["refresh_token"]}).json()
+
+    # The first token comes back: maybe stolen. Every token for this user is revoked.
+    reuse = client.post("/auth/refresh", json={"refresh_token": first["refresh_token"]})
+    later = client.post("/auth/refresh", json={"refresh_token": second["refresh_token"]})
+
+    assert reuse.status_code == 401
+    assert later.status_code == 401
+
+
+def test_logout_revokes_the_refresh_token(client: TestClient) -> None:
+    tokens = login_tokens(client)
+
+    logout = client.post("/auth/logout", json={"refresh_token": tokens["refresh_token"]})
+    assert logout.status_code == 204
+    after = client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert after.status_code == 401
+```
+
+The middle test is the important one. A plausible first version of the refresh route rejects a used token and stops there. Against that version:
+
+```text
+$ uv run pytest tests/test_api_auth.py -k reusing -q
+E       assert 200 == 401
+E        +  where 200 = <Response [200 OK]>.status_code
+1 failed, 12 deselected in 0.41s
+```
+
+The reused token was refused, but the *second* token, the one handed out after the first use, still worked. If the first use was a thief's, that's the thief's token.
+
+### Green: issuing and refreshing
+
+`security.py` gains two small functions:
+
+```python
+def new_refresh_token() -> str:
+    """A random, unguessable token. Unlike a JWT it means nothing until looked up in a table."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_refresh_token(token: str) -> str:
+    # Refresh tokens are long and random, so a fast hash is enough here (unlike passwords).
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+```
+
+`routes/auth.py`, used by every way of signing in (password, GitHub, refresh):
+
+```python
+def issue_tokens(session: Session, user: User, settings: ApiSettings) -> TokenPair:
+    """A short-lived access token, and a long-lived refresh token stored as a hash."""
+    lifetime = timedelta(minutes=settings.access_token_minutes)
+    access_token = create_access_token(user.id, settings.secret_key.get_secret_value(), lifetime)
+
+    refresh_token = new_refresh_token()
+    session.add(
+        RefreshToken(
+            user_id=user.id,
+            token_hash=hash_refresh_token(refresh_token),
+            expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_days),
+        )
+    )
+    session.commit()
+    return TokenPair(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=int(lifetime.total_seconds()),
+    )
+
+
+@router.post("/refresh", response_model=TokenPair)
+def refresh(body: RefreshRequest, session: SessionDep, settings: SettingsDep) -> TokenPair:
+    """Trade a refresh token for a new pair. Each refresh token works exactly once."""
+    stored = session.scalar(
+        select(RefreshToken).where(
+            RefreshToken.token_hash == hash_refresh_token(body.refresh_token)
+        )
+    )
+    rejected = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token")
+    if stored is None:
+        raise rejected
+
+    now = datetime.now(UTC)
+    was_already_used = stored.revoked_at is not None
+    if was_already_used:
+        # A used token coming back means it was probably stolen. Sign the user out everywhere.
+        session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == stored.user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        session.commit()
+        raise rejected
+
+    has_expired = stored.expires_at <= now
+    if has_expired:
+        raise rejected
+
+    stored.revoked_at = now
+    user = session.get(User, stored.user_id)
+    if user is None:
+        raise rejected
+    return issue_tokens(session, user, settings)
+```
+
+Every failure gives the same message: the client learns nothing about *why* its token was refused. Marking the old token used (`stored.revoked_at = now`) and storing the new one happen in the same transaction, committed inside `issue_tokens`, so a crash can't leave both usable.
+
+Logout revokes one token and answers **204 No Content**:
+
+```python
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(body: RefreshRequest, session: SessionDep) -> Response:
+    """Revoke a refresh token. The current access token stays valid until it expires."""
+    session.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.token_hash == hash_refresh_token(body.refresh_token),
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=datetime.now(UTC))
+    )
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+
+```text
+$ uv run pytest tests/test_api_auth.py -k reusing -q
+1 passed, 12 deselected in 0.35s
+```
+
+The web page calls `/auth/refresh` automatically when a request gets 401, and `/auth/logout` from its "Log out" button.
+
+### Making an administrator
+
+There's deliberately **no API route** to become admin, and `PATCH /users/me` only accepts `skills_profile` (lesson 4.3's schema is a whitelist; lesson 4.11 attacks it anyway). An operator with access to the server runs a command-line command instead:
+
+```text
+$ atlas make-admin --email ada@example.com
+ada@example.com is now an administrator
+
+$ atlas make-admin --email nobody@example.com
+atlas: no user with email nobody@example.com
+```
+
+The role is read from the database on every request (via `get_current_user`), not stored in the access token, so removing someone's admin role takes effect immediately rather than after their token expires.
+
+## Attack it: a stolen refresh token
+
+The scenario: Grace's app holds a refresh token, and an attacker has copied it (from a log, a backup, a compromised browser extension). The attacker uses it first; then Grace's app refreshes as usual; then the attacker tries the new token they were given. A script runs it against a real server, first with rotation but **without** reuse detection:
+
+```text
+attacker refreshes with the stolen token -> 200 new pair issued
+Grace's app refreshes with the same one -> 401 Invalid refresh token
+attacker tries their new token         -> 200 new pair issued
+```
+
+The attacker now holds a working session that renews itself indefinitely. Grace just sees "please sign in again", signs in, and nobody ever notices. Now the same script against Atlas as built:
+
+```text
+attacker refreshes with the stolen token -> 200 new pair issued
+Grace's app refreshes with the same one -> 401 Invalid refresh token
+attacker tries their new token         -> 401 Invalid refresh token
+```
+
+The moment Grace's app presented the already-used token, Atlas revoked every refresh token of hers, including the one it had just given the attacker. The attacker keeps the access token from that first refresh for at most 15 minutes, and then they're out.
+
+Reuse detection can't prevent the theft, and it can't tell the attacker from Grace. What it does is turn a silent, permanent compromise into one that is short, and noticed: in Part 7 the same event can raise an alert (lesson 7.8).
+
+## Trade-offs: where should the client keep the refresh token? *(deep dive)*
+
+| Place | Readable by page scripts | Sent automatically | Main risk |
+|---|---|---|---|
+| `sessionStorage` (Atlas's web UI) | yes | no | a malicious script on the page (cross-site scripting) reads it |
+| `localStorage` | yes | no | same, and it survives closing the browser |
+| `HttpOnly` cookie | no | yes, to the API | other sites can trigger requests that carry it (CSRF), so it needs `SameSite` and CSRF protection |
+| Mobile app secure storage | no (other apps) | no | lost or rooted devices |
+
+Atlas's ready-made UI uses `sessionStorage` and loads no third-party scripts, which keeps it simple for this course. Many production web apps put the refresh token in an `HttpOnly`, `SameSite` cookie scoped to the refresh route only, so page scripts never see it; lesson 7.10 revisits this with the full threat model. Rotation and reuse detection help in every row of the table: whatever the theft route, a copied token can be used at most once without being noticed.
+
+## Common mistakes
+
+- **Storing refresh tokens in plain text**: a database leak would hand out 30-day sessions.
+- **Refresh tokens that never rotate**: a stolen one works for its whole life, unnoticed.
+- **Rotation without reuse detection**: as shown, the thief keeps going and the user is the one locked out.
+- **Putting the role in the access token** and trusting it: a demoted admin stays admin until the token expires.
+- **A "make me admin" route** "just for setup": it will be found.
+- **Logout that only clears the browser**: the refresh token stays valid on the server for its full lifetime.
+
+## Check yourself
+
+**1.** Why is SHA-256 fine for refresh tokens when lesson 4.7 showed it's terrible for passwords?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Passwords are chosen by people, so they're guessable, and a fast hash makes guessing cheap. A refresh token is 32 random bytes: there's no list of likely values to try, and checking every possibility is out of reach at any speed. Hashing it only protects against a leaked table being used directly.
+:::
+
+**2.** In the attack, who is locked out when reuse is detected, and why is that acceptable?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Both: every refresh token of Grace's is revoked, the attacker's and her app's. Grace is mildly inconvenienced (she signs in again); the attacker loses access for good. Atlas can't tell which request was the thief's, so ending every session is the only safe choice.
+:::
+
+**3.** Why is there no API route to make someone an admin?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Any route that grants admin rights is a target: one authorisation bug in it and anyone can promote themselves. A command run on the server requires access that attackers on the internet don't have. The rare, privileged action goes through the narrowest door.
+:::
+
+## Exercise
+
+Write a test, red first, that an expired refresh token is refused: log in, set the stored token's `expires_at` to yesterday with an `update(...)` through the test `session`, then call `/auth/refresh`. Make it fail first by commenting out the `has_expired` check.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_an_expired_refresh_token_is_refused(client: TestClient, session: Session) -> None:
+    tokens = login_tokens(client)
+    session.execute(
+        update(RefreshToken).values(expires_at=datetime.now(UTC) - timedelta(days=1))
+    )
+    session.commit()
+
+    response = client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+
+    assert response.status_code == 401
+```
+The route reads the token through the same test session, so it sees the change. Without the check, the refresh succeeds with 200. Not in the reference code.
+:::
+
+## Stretch
+
+Add `POST /auth/logout-everywhere`, protected by `CurrentUser`, that revokes all of the signed-in user's refresh tokens (for "I lost my laptop"). Write the test first. Why doesn't it take a refresh token in the body, unlike `/auth/logout`?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+@router.post("/logout-everywhere", status_code=status.HTTP_204_NO_CONTENT)
+def logout_everywhere(user: CurrentUser, session: SessionDep) -> Response:
+    session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(UTC))
+    )
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+It acts on *all* the user's tokens, so it needs to know who the user is, which the access token proves; a single refresh token isn't needed. The test: log in twice (two refresh tokens), call it with the access token, then check both refresh tokens get 401. Not in the reference code.
+:::
+
+## What changed in the project
+
+`RefreshToken` table; `security.py` gains `new_refresh_token` and `hash_refresh_token`; `routes/auth.py` gains `issue_tokens`, `/auth/refresh` and `/auth/logout`; `atlas make-admin`. Commit: `feat: Added refresh tokens with rotation and reuse detection, logout and roles`.

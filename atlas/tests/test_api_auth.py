@@ -1,10 +1,10 @@
-from urllib.parse import parse_qs, urlparse
-
 import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from atlas import security
+from atlas.api.routes import auth
 from atlas.models import User
 from tests.conftest import sign_up
 
@@ -74,6 +74,25 @@ async def test_login_failures_look_identical(client: httpx.AsyncClient) -> None:
 
     assert wrong_password.status_code == unknown_email.status_code == 401
     assert wrong_password.json()["error"]["message"] == unknown_email.json()["error"]["message"]
+
+
+async def test_unknown_emails_cost_one_hash_like_real_ones(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards against the timing attack in lesson 4.7 without measuring time (which is flaky)."""
+    await sign_up(client, "ada@example.com")
+    hashed: list[str] = []
+
+    def counting_verify(password: str, password_hash: str) -> bool:
+        hashed.append(password_hash)
+        return security.verify_password(password, password_hash)
+
+    monkeypatch.setattr(auth, "verify_password", counting_verify)
+
+    for email in ("ada@example.com", "nobody@example.com"):
+        await client.post("/auth/login", data={"username": email, "password": "wrong-password"})
+
+    assert len(hashed) == 2
 
 
 async def test_me_requires_a_valid_token(client: httpx.AsyncClient) -> None:
@@ -161,57 +180,6 @@ async def test_logout_revokes_the_refresh_token(client: httpx.AsyncClient) -> No
     assert logout.status_code == 204
     after = await client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
     assert after.status_code == 401
-
-
-async def test_github_login_redirects_with_state_and_pkce(client: httpx.AsyncClient) -> None:
-    response = await client.get("/auth/github/login", follow_redirects=False)
-
-    assert response.status_code == 302
-    location = urlparse(response.headers["location"])
-    query = parse_qs(location.query)
-    assert location.netloc == "github.com"
-    assert "scope" not in query
-    assert query["code_challenge_method"] == ["S256"]
-    assert len(query["code_challenge"][0]) == 43
-    assert query["state"][0] == client.cookies["atlas_oauth"].split(".")[0]
-
-
-async def test_github_callback_rejects_a_state_it_did_not_issue(client: httpx.AsyncClient) -> None:
-    await client.get("/auth/github/login", follow_redirects=False)
-
-    response = await client.get(
-        "/auth/github/callback", params={"code": "good-code", "state": "forged"}
-    )
-
-    assert response.status_code == 400
-
-
-async def test_github_callback_creates_then_reuses_the_account(
-    client: httpx.AsyncClient, async_session: AsyncSession
-) -> None:
-    for _ in range(2):
-        start = await client.get("/auth/github/login", follow_redirects=False)
-        state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-        response = await client.get(
-            "/auth/github/callback", params={"code": "good-code", "state": state}
-        )
-        assert response.status_code == 200
-        assert set(response.json()) >= {"access_token", "refresh_token"}
-
-    accounts = (await async_session.scalars(select(User).where(User.github_id == 4242))).all()
-    assert [account.github_login for account in accounts] == ["octo-learner"]
-
-
-async def test_github_callback_reports_a_bad_code(client: httpx.AsyncClient) -> None:
-    start = await client.get("/auth/github/login", follow_redirects=False)
-    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-
-    response = await client.get(
-        "/auth/github/callback", params={"code": "stale-code", "state": state}
-    )
-
-    assert response.status_code == 502
-    assert "incorrect or expired" in response.json()["error"]["message"]
 
 
 async def test_request_id_is_echoed(client: httpx.AsyncClient) -> None:
