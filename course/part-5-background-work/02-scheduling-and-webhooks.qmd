@@ -154,7 +154,7 @@ def create_job(session: Session, kind: str, repo_id: int) -> tuple[int, bool]:
         .values(kind=kind, repo_id=repo_id)
         .on_conflict_do_nothing(
             index_elements=["kind", "repo_id"],
-            index_where=Job.status.in_(["queued", "running"]),
+            index_where=PENDING,  # text("status IN ('queued', 'running')"), see lesson 5.5
         )
         .returning(Job.id)
     )
@@ -163,9 +163,7 @@ def create_job(session: Session, kind: str, repo_id: int) -> tuple[int, bool]:
         return new_id, True
 
     existing_id = session.scalar(
-        select(Job.id).where(
-            Job.kind == kind, Job.repo_id == repo_id, Job.status.in_(["queued", "running"])
-        )
+        select(Job.id).where(Job.kind == kind, Job.repo_id == repo_id, PENDING)
     )
     if existing_id is None:
         # The pending job finished between the two statements: try once more.
@@ -173,7 +171,7 @@ def create_job(session: Session, kind: str, repo_id: int) -> tuple[int, bool]:
     return existing_id, False
 ```
 
-`insert` here comes from `sqlalchemy.dialects.postgresql`, because `ON CONFLICT DO NOTHING` is Postgres's own addition to SQL: "if this insert would break a unique rule, skip it instead of failing". `index_elements` and `index_where` name the partial index the conflict is about. If the insert conflicts, Postgres inserts nothing and `RETURNING` returns no row, so the function looks up the job that's already pending. The insert is atomic, so twenty simultaneous calls produce one row and no errors.
+`insert` here comes from `sqlalchemy.dialects.postgresql`, because `ON CONFLICT DO NOTHING` is Postgres's own addition to SQL: "if this insert would break a unique rule, skip it instead of failing". `index_elements` and `index_where` name the partial index the conflict is about. `PENDING` is the index's condition written as literal SQL with `text(...)`, word for word as in the index; lesson 5.5 shows the failure that taught Atlas to write it that way. If the insert conflicts, Postgres inserts nothing and `RETURNING` returns no row, so the function looks up the job that's already pending. The insert is atomic, so twenty simultaneous calls produce one row and no errors.
 
 ### The scheduler
 

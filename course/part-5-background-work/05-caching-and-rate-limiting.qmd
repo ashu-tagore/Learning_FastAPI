@@ -1,0 +1,422 @@
+---
+title: "5.5 Caching and rate limiting with Redis"
+description: "Find out why search got slow before reaching for a cache, then add a cache whose keys can't go stale, a sliding-window rate limit shared by every API process, and fix a bug that only appears on a statement's eleventh run."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 5 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* compares rate-limit algorithms and cache strategies.
+:::
+
+::: {.callout-note title="Analogy: a library's reference desk"}
+A librarian who gets the same question fifty times a day ("where are the atlases?") writes the answer on a card at the desk. Next time, they read the card instead of walking the shelves. When the atlases move, the old card has to go, or it sends people to the wrong shelf. That's a **cache**, and the hard part is the card going stale.
+
+The same library lets each visitor borrow ten books a month, counted at one desk that every branch phones. If each branch kept its own count, a visitor could borrow ten at every branch. That's a **rate limit**, and why it lives in one shared place.
+:::
+
+## The problem
+
+Atlas now indexes more than Ignite. A larger codebase, Django (2,955 files, 14,558 chunks at commit `03b95b8`), was indexed into the development database with `atlas index`, and searches were timed through the API, 30 requests each:
+
+```text
+'model'      status 200 median   27.7 ms  p90   31.2 ms
+'query'      status 200 median  163.7 ms  p90  236.8 ms
+'test case'  status 200 median   10.7 ms  p90   12.4 ms
+'field'      status 200 median  504.6 ms  p90  651.6 ms
+'request'    status 200 median   12.3 ms  p90   15.0 ms
+```
+
+Half a second for `field`. (p90, the 90th percentile, is the time that 90% of requests beat.) The tempting fix is a cache: remember each answer, and the second `field` search is instant. But a cache hides slowness without explaining it, and the first search, and every search for a new word, stays slow. So, first, why?
+
+`EXPLAIN ANALYZE` (lesson 3.6) runs a query and shows what Postgres did:
+
+```text
+ Limit (actual time=1908.627..1910.740 rows=11 loops=1)
+   ...
+               ->  Nested Loop (actual time=2.643..1904.428 rows=4681 loops=1)
+                     Join Filter: (d.id = c.document_id)
+                     Rows Removed by Join Filter: 13833584
+                     ->  Bitmap Heap Scan on chunks c (actual time=2.048..9.571 rows=4683 loops=1)
+                     ->  Materialize (actual time=0.000..0.172 rows=2955 loops=4683)
+ Execution Time: 1910.904 ms
+```
+
+Postgres found the 4,683 matching chunks in under 10 ms using the full-text index. Then it matched each one against every Django document, one by one: 4,683 × 2,955 comparisons, 13.8 million rows thrown away. A hash join would have done the same work in a millisecond. Why such a bad plan? Postgres chooses plans from **statistics** about each table (how many rows, how values are distributed), and these tables had none:
+
+```text
+ documents |       2955 |              |
+ chunks    |      14558 |              |
+```
+
+`last_analyze` and `last_autoanalyze` were both empty. The rows had just been loaded, and Postgres's background **autovacuum** hadn't yet got round to **analysing** them (collecting those statistics). It does so once enough rows change (by default 50 plus 10% of the table), checking every minute, so a search right after a big load can land in the gap. One command:
+
+```text
+ANALYZE documents, chunks
+```
+
+And the same measurement:
+
+```text
+'model'      status 200 median   29.1 ms  p90   32.0 ms
+'query'      status 200 median   25.9 ms  p90   27.0 ms
+'test case'  status 200 median   10.2 ms  p90   12.0 ms
+'field'      status 200 median   22.8 ms  p90   28.7 ms
+'request'    status 200 median   22.6 ms  p90   27.4 ms
+```
+
+`field` went from 505 ms to 23 ms, with no cache. Had a cache been added first, it would have hidden the problem for repeated searches and left every new one slow. **Measure, find the cause, then decide whether a cache is still worth it.**
+
+It still is, for a different reason. Every search, even a 23 ms one, uses a database connection and Postgres CPU, and Atlas's database is shared by the API, the workers and soon the AI features of Part 6. The same few searches (popular words, the web UI's defaults) come up again and again. A cache in Redis answers those without touching Postgres.
+
+And there's a second problem: nothing stops one client from sending a thousand searches a second, from a script or a bug, and taking the database's attention from everyone else.
+
+## Theory
+
+### Caching
+
+A **cache** stores the result of an expensive operation so the next identical request can reuse it. A **hit** finds the result in the cache; a **miss** doesn't, so the work is done and the result stored. Three questions decide whether a cache is correct:
+
+1. **What's the key?** Everything that affects the answer must be in it. Atlas's search answer depends on the repository, the query, the kind filter, the page size and the offset.
+2. **When does an entry go stale?** When the data behind it changes: here, when the repository is re-indexed.
+3. **How does a stale entry stop being used?** This is "cache invalidation", famously hard.
+
+Atlas avoids invalidation with **versioned keys**: the key includes the version of the data, here the repository's `indexed_at` time, which changes every time it's re-indexed. After a re-index, every request builds a key that has never been used, so the old entries are simply never read again, and a **TTL** (time to live: Redis deletes the key after a set time, here 10 minutes) clears them away. Nothing ever has to be deleted on purpose, so nothing can be forgotten. The price is one small database lookup per request, to read the version.
+
+### Rate limiting
+
+A **rate limit** caps how many requests a client may make in a time **window**, for example 60 searches per minute per client. Over the limit, the API answers **429 Too Many Requests** with a **`Retry-After`** header saying how many seconds to wait. Well-behaved clients wait; badly behaved ones keep getting cheap 429s instead of expensive searches.
+
+The count must be shared. Atlas will run several API processes behind a load balancer (Part 7). A counter in each process's memory would let a client make 60 requests to *each* process. Redis is shared by all of them, and its commands are atomic.
+
+Three common algorithms:
+
+- **Fixed window counter.** One counter per client per calendar minute: `INCR`, and `EXPIRE` after a minute. Simple and tiny. But at a boundary, a client can use the whole allowance at 10:00:59.9 and the whole next one at 10:01:00.1: twice the limit in 0.2 seconds.
+- **Sliding window log.** Keep the time of each of the client's requests in the last minute. Allowed if fewer than the limit. Exact, at the cost of memory proportional to the limit (60 timestamps for 60 a minute: nothing).
+- **Token bucket.** A bucket refills at a steady rate up to a maximum; each request takes a token. Smooth, with an adjustable burst, but its atomic update needs a script running inside Redis (Lua, a separate language).
+
+Atlas uses the **sliding window log**, in a Redis **sorted set** (lesson 5.1) per client: members are requests, scores are their times. Real Redis, with a clock moved by hand, 60 requests just before a minute boundary and 60 just after:
+
+```text
+fixed window        allowed 120 of 120 requests made within 0.2 seconds
+sliding window log  allowed 60 of 120 requests made within 0.2 seconds
+```
+
+### Failing open
+
+If Redis is down, what should the limiter do? **Failing closed** (reject everything) turns a Redis outage into a search outage. **Failing open** (allow everything) keeps search working without limits for a while. For a search limit, availability wins: Atlas fails open and logs a warning. A limit that protected money (Part 6's LLM spend limit) would fail closed.
+
+```{mermaid}
+flowchart TD
+    R[GET /search] --> L{rate limit<br/>sorted set in Redis}
+    L -->|over 60 a minute| X[429 with Retry-After]
+    L -->|allowed, or Redis down| V[read repo version<br/>indexed_at from Postgres]
+    V --> K{cache key<br/>repo, version, params}
+    K -->|hit| H[answer from Redis]
+    K -->|miss| P[search Postgres]
+    P --> S[store in Redis, TTL 10 min]
+    S --> A[answer]
+```
+
+## In the project
+
+### Redis from async code
+
+The queue (lesson 5.1) uses redis-py's ordinary, blocking client, which suits the synchronous worker. Rate limits and the cache are checked on every API request, inside `async` routes, so they use the same library's **asyncio** client, `redis.asyncio.Redis`, whose commands are awaited and don't block the event loop (lesson 4.17's rule). It's created in the app's lifespan next to the database engine, and closed at shutdown.
+
+### Red: the limiter's rules
+
+`tests/test_limits.py`, against real Redis, with the `FakeClock` from lesson 5.1:
+
+```python
+async def test_allows_the_limit_then_says_when_to_retry(
+    limiter: RateLimiter, clock: FakeClock
+) -> None:
+    allowed = [await limiter.check("k", limit=3, window_seconds=60) for _ in range(3)]
+    clock.advance(10)
+
+    retry_after = await limiter.check("k", limit=3, window_seconds=60)
+
+    assert allowed == [None, None, None]
+    assert retry_after == 50  # the oldest request leaves the window 60 s after it was made
+
+
+async def test_window_slides_one_request_at_a_time(limiter: RateLimiter, clock: FakeClock) -> None:
+    await limiter.check("k", limit=3, window_seconds=60)  # at t=0
+    clock.advance(59)
+    await limiter.check("k", limit=3, window_seconds=60)  # t=59
+    await limiter.check("k", limit=3, window_seconds=60)  # t=59
+    assert await limiter.check("k", limit=3, window_seconds=60) is not None
+
+    clock.advance(2)  # t=61: only the request from t=0 has left the window
+
+    assert await limiter.check("k", limit=3, window_seconds=60) is None
+    assert await limiter.check("k", limit=3, window_seconds=60) is not None
+```
+
+Two more: rejected requests don't count against the client (or a client retrying too early would never get back under the limit), and an unreachable Redis allows every request.
+
+### Green: `api/limits.py`
+
+```python
+async def check(self, key: str, limit: int, window_seconds: float) -> float | None:
+    """Count one request; None if it's allowed, else seconds until one would be."""
+    now = self.clock()
+    redis_key = f"{self.prefix}:{key}"
+    # Unique per request: two requests in the same microsecond are still two entries.
+    member = f"{now}:{uuid.uuid4().hex}"
+    try:
+        # transaction=True wraps the commands in MULTI/EXEC: Redis runs them as one
+        # step, so no other request's commands can land in between.
+        async with self.client.pipeline(transaction=True) as pipe:
+            pipe.zremrangebyscore(redis_key, 0, now - window_seconds)
+            pipe.zadd(redis_key, {member: now})
+            pipe.zcard(redis_key)
+            pipe.zrange(redis_key, 0, 0, withscores=True)
+            # Idle clients' logs disappear by themselves.
+            pipe.expire(redis_key, int(window_seconds) + 1)
+            _, _, count, oldest, _ = await pipe.execute()
+        if count <= limit:
+            return None
+        # Rejected requests don't count, or a client retrying too early would never
+        # get back under the limit.
+        await self.client.zrem(redis_key, member)
+    except redis.RedisError:
+        logger.warning("rate limiter unavailable; allowing the request", exc_info=True)
+        return None
+
+    oldest_time = float(oldest[0][1])
+    return oldest_time + window_seconds - now
+```
+
+A **pipeline** sends several commands in one round trip; with `transaction=True` they run as a single atomic step. In order: drop entries older than the window, add this request, count, and fetch the oldest entry (the next one to leave the window, which gives `Retry-After`). If two requests race at the limit, both may be counted and both removed, so both are rejected: under contention it errs on the strict side, by one.
+
+Routes ask for a limit through a dependency, made by a small factory function so each route can name its own limit:
+
+```python
+def limit_per_client(
+    name: str, limit: int, window_seconds: float = 60
+) -> Callable[..., Awaitable[None]]:
+    """A dependency allowing `limit` requests per window from each client address."""
+
+    async def dependency(request: Request, limiter: LimiterDep) -> None:
+        # The address the connection came from. Behind a load balancer this is the load
+        # balancer's own address; Part 7 configures the real client's (X-Forwarded-For).
+        client = request.client.host if request.client else "unknown"
+        retry_after = await limiter.check(f"{name}:ip:{client}", limit, window_seconds)
+        if retry_after is not None:
+            raise too_many_requests(retry_after)
+
+    return dependency
+```
+
+`limit_per_user` is the same, keyed by the signed-in user's id. Search, which needs no account, is limited per client address (60 a minute); `POST /repos/{id}/sync` per user (5 a minute: each sync costs a fetch and GitHub quota). They're attached with the route decorator's `dependencies=[...]`, for dependencies that guard a route without passing it a value:
+
+```python
+@router.get(
+    "",
+    response_model=SearchPage,
+    dependencies=[Depends(limit_per_client("search", SEARCH_REQUESTS_PER_MINUTE))],
+)
+```
+
+### The cache
+
+`ResponseCache` in the same module keeps JSON under versioned keys:
+
+```python
+def key(self, name: str, version: str, params: dict[str, Any]) -> str:
+    """A key for this request against this version of the data.
+
+    When the data changes, its version changes, and so does every key: old entries
+    are never read again and expire on their own. Nothing has to be deleted.
+    """
+    canonical = json.dumps(params, sort_keys=True)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:32]
+    return f"{self.prefix}:{name}:{version}:{digest}"
+```
+
+`sort_keys=True` makes the same parameters produce the same text whatever order they came in; hashing keeps the key short whatever the query is. `get` and `set` fail open like the limiter. The search route:
+
+```python
+# The index's version: it changes whenever the repository is re-indexed, and with it
+# every cache key, so a cached answer can never outlive the index it came from.
+indexed_at = await session.scalar(select(Repo.indexed_at).where(Repo.full_name == repo))
+if indexed_at is None:
+    response.headers["X-Cache"] = "skip"  # never indexed: nothing worth caching
+    return await run_search(session, q, repo, kind, limit, offset)
+
+params = {"q": q, "kind": kind, "limit": limit, "offset": offset}
+key = cache.key("search", f"{repo}@{indexed_at.isoformat()}", params)
+cached = await cache.get(key)
+if cached is not None:
+    response.headers["X-Cache"] = "hit"
+    return SearchPage.model_validate(cached)
+
+page = await run_search(session, q, repo, kind, limit, offset)
+await cache.set(key, page.model_dump(mode="json"))
+response.headers["X-Cache"] = "miss"
+return page
+```
+
+The repository name goes in the version string, so two repositories can never share an entry. The `X-Cache` header tells clients (and tests) what happened. The test that matters is staleness:
+
+```python
+async def test_search_is_cached_until_the_repository_is_reindexed(
+    client: httpx.AsyncClient,
+    async_session: AsyncSession,
+    sample_repo: Path,
+    limiter: RateLimiter,
+) -> None:
+    await index_sample(async_session, sample_repo)
+    first = await client.get("/search", params={"q": "accuracy"})
+    second = await client.get("/search", params={"q": "accuracy"})
+
+    (sample_repo / "ignite" / "metrics.py").unlink()
+    await index_sample(async_session, sample_repo)
+    after_reindex = await client.get("/search", params={"q": "accuracy"})
+
+    assert [first.headers["X-Cache"], second.headers["X-Cache"]] == ["miss", "hit"]
+    assert second.json() == first.json()
+    assert after_reindex.headers["X-Cache"] == "miss"
+    assert after_reindex.json()["items"] == []
+```
+
+The file defining `accuracy` was deleted and the repository re-indexed: the next search misses and correctly finds nothing.
+
+API tests get their own limiter and cache under a random key prefix, on real Redis when `TEST_REDIS_URL` is set. Without it, they point at a port nothing listens on and fail open, so every API test still runs on a machine without Redis.
+
+Measured on the running API against Django, ten identical searches each, after the cache was emptied:
+
+```text
+'model'  miss  39.2 ms   hits: median  5.8 ms over 9
+'field'  miss  31.6 ms   hits: median  5.4 ms over 9
+```
+
+A hit still costs about 5 ms over HTTP: the request, the version lookup in Postgres, a Redis `GET`. The saving per request is modest, as "The problem" predicted; the real gain is the search Postgres didn't run. And 70 searches in a row from one address:
+
+```text
+{200: 60, 429: 10}
+429 Retry-After: 60 {"error":{"code":"rate_limited","message":"Too many requests; try again in 60 seconds","request_id":"348c2b7c92d6466eb4df4f94a3b9675b"}}
+```
+
+### A bug that waits for the eleventh run
+
+The per-user limit's test made six sync requests as one admin. It failed, but not with a 429:
+
+```text
+psycopg.errors.InvalidColumnReference: there is no unique or exclusion constraint matching the ON CONFLICT specification
+[SQL: INSERT INTO jobs (kind, repo_id, status, attempts) VALUES (...) ON CONFLICT (kind, repo_id) WHERE status IN (%(status_1_1)s::VARCHAR, %(status_1_2)s::VARCHAR) DO NOTHING RETURNING jobs.id]
+```
+
+That's `create_job` from lesson 5.2, which had passed every test so far. A reproduction calling it repeatedly on one connection failed on exactly the **11th** call, every time. Two features add up to that number:
+
+- psycopg, the Postgres driver, **prepares** a statement on the server once it has run the same SQL 5 times on a connection (`prepare_threshold` is 5, checked on psycopg 3.3.9), so later runs skip re-parsing.
+- Postgres plans a prepared statement with the actual values for its first 5 runs, then may switch to a **generic plan** that works for any values (the `PREPARE` documentation describes this).
+
+`ON CONFLICT (kind, repo_id) WHERE status IN (...)` must be matched to the partial unique index by comparing the two conditions. In a generic plan, the condition's values are placeholders (`$1`, `$2`), and Postgres can't prove that "status in ($1, $2)" means the same as the index's "status in ('queued', 'running')". So on the 11th run the INSERT fails. In production that would have been the eleventh webhook on one pooled connection: an hour or a week after deploying, depending on traffic.
+
+The regression test:
+
+```python
+def test_create_job_keeps_working_once_the_driver_prepares_it(worker: WorkerContext) -> None:
+    # Regression (lesson 5.5): psycopg prepares a statement on the server after 5 runs on
+    # one connection, and Postgres switches a prepared statement to a generic plan after 5
+    # more. With the partial index's condition sent as parameters, the generic plan could
+    # not be matched to the index: the 11th call failed.
+    repo_id = add_repo(worker)
+    with worker.session_factory() as session, session.begin():
+        results = [create_job(session, "sync_repo", repo_id) for _ in range(20)]
+
+    assert len({job_id for job_id, _ in results}) == 1
+```
+
+And the fix: write the condition as literal SQL, so there are no parameters to become placeholders:
+
+```python
+# The same condition as the partial unique index ix_jobs_one_pending, word for word.
+PENDING = text("status IN ('queued', 'running')")
+...
+        .on_conflict_do_nothing(
+            index_elements=["kind", "repo_id"],
+            # Literal SQL, not parameters: Postgres matches this condition to the partial
+            # index's, and from the 11th run on one connection (once psycopg has prepared
+            # the statement and Postgres switches to a generic plan) it can't match a
+            # placeholder, and the INSERT fails (lesson 5.5).
+            index_where=PENDING,
+        )
+```
+
+A test that ran each thing once or twice could never have found this. Bugs that depend on *how many times* something has happened need tests that repeat it.
+
+## Trade-offs *(deep dive)*
+
+**Versioned keys vs deleting entries.** Deleting cache entries when data changes ("invalidate on write") needs every writer to know every key that might be affected, and one forgotten path serves stale data until the TTL. Versioned keys need one cheap version read per request and can't go stale. When the version read is as expensive as the work, they don't pay.
+
+**TTL length.** With versioned keys, the TTL only controls memory, not correctness. Without them, the TTL is the longest time a stale answer can be served.
+
+**Cache stampede.** When a popular entry expires, many requests miss at once and all run the same query. Remedies include a lock so one request rebuilds the entry while the rest wait, or refreshing early. Atlas's searches are cheap enough that a few duplicate misses don't matter.
+
+**Per-client address limits.** Many people behind one office network share an address and a limit; one attacker with many addresses gets many limits. Per-user limits are fairer but need accounts. Atlas uses addresses for its public search and users for authenticated actions.
+
+**Token bucket instead.** When short bursts should be allowed ("10 at once, then 1 a second"), a token bucket expresses it directly. It needs a Lua script in Redis for atomicity. The sliding log is enough for Atlas's limits and readable in Python.
+
+## Common mistakes
+
+- **Caching before measuring.** The slow search was missing statistics, not a missing cache.
+- **Forgetting part of the key.** Cache `q` without `offset`, and page 2 returns page 1.
+- **Invalidating by hand.** Every writer must remember; use a version in the key where you can.
+- **Per-process limits or caches.** Each API process has its own memory; share them in Redis.
+- **Counting rejected requests.** A client that retries early stays locked out.
+- **`Retry-After` rounded down.** A client that obeys it arrives too early and gets another 429.
+- **Failing closed by reflex.** Decide per limit whether availability or protection matters more.
+- **Parameters in a partial-index conflict target.** They break once the statement is prepared.
+
+## Check yourself
+
+**1.** After a re-index, why does Atlas never serve an old cached search, even though nothing deletes the old entries?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The cache key contains the repository's `indexed_at` time, which the re-index changed. Every request after it builds a key with the new version, which has never been stored. The old entries remain under keys nothing builds any more, until their 10-minute TTL removes them.
+:::
+
+**2.** A client makes 60 searches between 10:00:00 and 10:00:30. When can it make its next one, and what `Retry-After` does it get at 10:00:40?
+
+::: {.callout-tip collapse="true" title="Answer"}
+At 10:01:00, when the first of the 60 leaves the 60-second window. At 10:00:40 the oldest request is 40 seconds old, so `Retry-After: 20`. (With a fixed window it could also send 60 more at 10:01:00 exactly, all at once; the sliding log then only allows one more for each earlier request that leaves the window.)
+:::
+
+**3.** Why did `create_job` work in every earlier test and fail in this lesson's?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The failure needs more than ten runs of the same INSERT on one database connection: psycopg prepares it after 5 runs, and Postgres switches to a generic plan after 5 more, in which the conflict condition's values are placeholders that can't be matched to the partial index. Earlier tests created a few jobs each; the per-user limit test made six syncs of two jobs each, plus the two from adding the repository.
+:::
+
+## Exercise
+
+`GET /repos/{id}/snapshot` signs a download link and asks object storage whether the snapshot exists. Limit it to 10 requests per minute per user, and test that the 11th answers 429.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+@router.get(
+    "/{repo_id}/snapshot",
+    response_model=SnapshotOut,
+    dependencies=[Depends(limit_per_user("snapshot", 10))],
+)
+```
+The test signs up a user, makes 11 requests, and expects `[404] * 10 + [429]` (no snapshot exists in the test, so the allowed ones answer 404; the limit runs before the route and counts them anyway). It needs the `limiter` fixture from `test_limits.py`, for real Redis, and the `snapshot_store` override from lesson 5.4. Checked against the reference code. Not in the reference code.
+:::
+
+## Stretch
+
+Prove that the cache can't mix up repositories: index the sample codebase as `pytorch/ignite` and as `someone/fork`, delete `metrics.py` and re-index only the fork, then search `accuracy` in both. What would go wrong if the cache key had only `indexed_at` as its version, without the repository name?
+
+::: {.callout-tip collapse="true" title="Solution"}
+With the reference code, Ignite returns one hit and the fork none, both as misses. Without the name in the version, two repositories whose `indexed_at` happened to be equal would share every key, and one would be answered with the other's results. `index_folder` takes the time from Python's `datetime.now`, to the microsecond, so a clash is unlikely; but two workers on different machines can index at the same microsecond, and nothing would stop it. Putting the name in the key makes it impossible rather than unlikely. Checked against the reference code (`miss 1 miss 0`).
+:::
+
+## What changed in the project
+
+New `atlas/api/limits.py` (`RateLimiter`, `ResponseCache`, `limit_per_client`, `limit_per_user`); search limited to 60 a minute per address and cached under versioned keys with an `X-Cache` header; `POST /repos/{id}/sync` limited to 5 a minute per user; the async Redis client in the app's lifespan; `create_job`'s conflict condition as literal SQL, with a regression test; `tests/test_limits.py`. Commit: `feat: Added Redis rate limits and a versioned search cache, and fixed ON CONFLICT failing on prepared statements`.
