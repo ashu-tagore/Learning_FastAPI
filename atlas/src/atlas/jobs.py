@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -33,6 +33,8 @@ MAX_ATTEMPTS = 5
 # A running job whose worker vanished (killed, crashed, lost its network) is taken over
 # once this lease ends. Longer than any real sync; shorter than a user's patience.
 LEASE = timedelta(minutes=10)
+# The same condition as the partial unique index ix_jobs_one_pending, word for word.
+PENDING = text("status IN ('queued', 'running')")
 
 
 @dataclass
@@ -67,7 +69,11 @@ def create_job(session: Session, kind: str, repo_id: int) -> tuple[int, bool]:
         .values(kind=kind, repo_id=repo_id)
         .on_conflict_do_nothing(
             index_elements=["kind", "repo_id"],
-            index_where=Job.status.in_(["queued", "running"]),
+            # Literal SQL, not parameters: Postgres matches this condition to the partial
+            # index's, and from the 11th run on one connection (once psycopg has prepared
+            # the statement and Postgres switches to a generic plan) it can't match a
+            # placeholder, and the INSERT fails (lesson 5.5).
+            index_where=PENDING,
         )
         .returning(Job.id)
     )
@@ -76,9 +82,7 @@ def create_job(session: Session, kind: str, repo_id: int) -> tuple[int, bool]:
         return new_id, True
 
     existing_id = session.scalar(
-        select(Job.id).where(
-            Job.kind == kind, Job.repo_id == repo_id, Job.status.in_(["queued", "running"])
-        )
+        select(Job.id).where(Job.kind == kind, Job.repo_id == repo_id, PENDING)
     )
     if existing_id is None:
         # The pending job finished between the two statements: try once more.

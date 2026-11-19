@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Request, status
+from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from atlas.api import idempotency
 from atlas.api.deps import AdminUser, CurrentUser, QueueDep, SessionDep, SnapshotsDep
 from atlas.api.errors import ApiError
+from atlas.api.limits import limit_per_user
 from atlas.api.routes.jobs import BOTH_SYNCS, queue_jobs
 from atlas.api.schemas import JobOut, QueuedJobs, RepoCreate, RepoOut, SnapshotOut
 from atlas.models import Repo
@@ -70,7 +71,14 @@ async def add_repo(
     return JSONResponse(payload, status_code=status.HTTP_201_CREATED)
 
 
-@router.post("/{repo_id}/sync", status_code=status.HTTP_202_ACCEPTED, response_model=QueuedJobs)
+@router.post(
+    "/{repo_id}/sync",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=QueuedJobs,
+    # Each sync costs a clone or fetch and GitHub quota; even an admin's script shouldn't
+    # be able to queue them in a loop (lesson 5.5).
+    dependencies=[Depends(limit_per_user("sync", 5))],
+)
 async def sync_repo(
     repo_id: int, admin: AdminUser, session: SessionDep, queue: QueueDep
 ) -> QueuedJobs:

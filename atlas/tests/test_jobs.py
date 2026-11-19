@@ -202,3 +202,15 @@ def test_running_job_is_taken_over_only_after_its_lease_ends(
         )
 
     assert run_job(worker, job_id) == outcome
+
+
+def test_create_job_keeps_working_once_the_driver_prepares_it(worker: WorkerContext) -> None:
+    # Regression (lesson 5.5): psycopg prepares a statement on the server after 5 runs on
+    # one connection, and Postgres switches a prepared statement to a generic plan after 5
+    # more. With the partial index's condition sent as parameters, the generic plan could
+    # not be matched to the index: the 11th call failed.
+    repo_id = add_repo(worker)
+    with worker.session_factory() as session, session.begin():
+        results = [create_job(session, "sync_repo", repo_id) for _ in range(20)]
+
+    assert len({job_id for job_id, _ in results}) == 1

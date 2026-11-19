@@ -3,18 +3,32 @@
 from dataclasses import asdict
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, Response, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from atlas.api.deps import SessionDep
+from atlas.api.limits import ResponseCache, get_cache, limit_per_client
 from atlas.api.schemas import RepoFullName, SearchHit, SearchPage
+from atlas.models import Repo
 from atlas.storage import chunk_search_statement, hit_from_row
 
 router = APIRouter(prefix="/search", tags=["search"])
 
 
-@router.get("", response_model=SearchPage)
+# Generous for a person, tight for a script hammering the database (lesson 5.5).
+SEARCH_REQUESTS_PER_MINUTE = 60
+
+
+@router.get(
+    "",
+    response_model=SearchPage,
+    dependencies=[Depends(limit_per_client("search", SEARCH_REQUESTS_PER_MINUTE))],
+)
 async def search(
     session: SessionDep,
+    cache: Annotated[ResponseCache, Depends(get_cache)],
+    response: Response,
     q: Annotated[str, Query(min_length=1, max_length=200, description="Words to look for")],
     repo: Annotated[RepoFullName, Query()] = "pytorch/ignite",
     kind: Literal["code", "doc"] | None = None,
@@ -22,6 +36,29 @@ async def search(
     offset: Annotated[int, Query(ge=0, le=1000)] = 0,
 ) -> SearchPage:
     """Offset pagination: fine here, because nobody reads past the first few pages of results."""
+    # The index's version: it changes whenever the repository is re-indexed, and with it
+    # every cache key, so a cached answer can never outlive the index it came from.
+    indexed_at = await session.scalar(select(Repo.indexed_at).where(Repo.full_name == repo))
+    if indexed_at is None:
+        response.headers["X-Cache"] = "skip"  # never indexed: nothing worth caching
+        return await run_search(session, q, repo, kind, limit, offset)
+
+    params = {"q": q, "kind": kind, "limit": limit, "offset": offset}
+    key = cache.key("search", f"{repo}@{indexed_at.isoformat()}", params)
+    cached = await cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "hit"
+        return SearchPage.model_validate(cached)
+
+    page = await run_search(session, q, repo, kind, limit, offset)
+    await cache.set(key, page.model_dump(mode="json"))
+    response.headers["X-Cache"] = "miss"
+    return page
+
+
+async def run_search(
+    session: AsyncSession, q: str, repo: str, kind: str | None, limit: int, offset: int
+) -> SearchPage:
     statement = chunk_search_statement(repo, q, kind=kind, limit=limit + 1, offset=offset)
     hits = [hit_from_row(row) for row in await session.execute(statement)]
 
