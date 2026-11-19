@@ -4,7 +4,7 @@ description: "Compare the main ways programs talk over a network, know when each
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 14 · About 75 minutes
+Part 4 · Lesson 18 · About 75 minutes
 :::
 
 ::: {.callout-note title="Analogy: letters, a questionnaire, an internal phone line, a phone call"}

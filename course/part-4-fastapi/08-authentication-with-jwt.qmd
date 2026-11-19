@@ -4,7 +4,7 @@ description: "Log users in with signed, short-lived JSON Web Tokens, protect rou
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 7 · About 90 minutes
+Part 4 · Lesson 8 · About 90 minutes
 :::
 
 ::: {.callout-note title="Analogy: a festival wristband"}

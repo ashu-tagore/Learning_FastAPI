@@ -4,7 +4,7 @@ description: "Test the whole API in-process with httpx and a rolled-back databas
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 15 · About 90 minutes
+Part 4 · Lesson 19 · About 90 minutes
 :::
 
 ::: {.callout-note title="Analogy: a flight simulator"}

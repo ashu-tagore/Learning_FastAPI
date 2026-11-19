@@ -4,7 +4,7 @@ description: "Pull Part 4 together, practise across it, and build a private note
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 16 · About 3 hours
+Part 4 · Lesson 20 · About 3 hours
 :::
 
 ## Recap

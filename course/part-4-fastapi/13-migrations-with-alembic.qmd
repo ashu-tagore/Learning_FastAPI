@@ -4,7 +4,7 @@ description: "Change a live database schema safely with versioned Alembic migrat
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 11 · About 75 minutes
+Part 4 · Lesson 13 · About 75 minutes
 :::
 
 ::: {.callout-note title="Analogy: renovation plans, numbered"}

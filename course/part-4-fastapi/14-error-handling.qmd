@@ -4,7 +4,7 @@ description: "Give every error one predictable shape, trace requests with ids in
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 12 · About 90 minutes
+Part 4 · Lesson 14 · About 90 minutes
 :::
 
 ::: {.callout-warning title="Being restructured"}
