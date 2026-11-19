@@ -1,10 +1,10 @@
 ---
 title: "4.20 Review and practice"
-description: "Pull Part 4 together, practise across it, and build a private notes resource on your own from a spec and acceptance tests."
+description: "Pull Part 4 together, practise across it, review planted security bugs like a code reviewer, and build a private notes resource on your own from a spec and acceptance tests."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 20 · About 3 hours
+Part 4 · Lesson 20 · About 4 hours
 :::
 
 ## Recap
@@ -37,9 +37,9 @@ and open `http://localhost:8000/app/`: create an account, search the codebase (o
 | Error handling | One shape, a stable code per failure, framework errors included, internals only in logs | [4.14](14-error-handling.qmd) |
 | Observability | One JSON log line per request, every line carrying its request id; no secrets in logs | [4.15](15-observability.qmd) |
 | Browsers and retries | CORS for chosen origins; idempotency keys make POST safe to retry | [4.16](16-browsers-and-retries.qmd) |
-| Async | Await all I/O; CPU work to the thread pool; load relationships | [4.17](17-async-fastapi.qmd) |
-| API styles | REST by default; GraphQL, gRPC, WebSocket, SSE for specific needs | [4.18](18-api-styles.qmd) |
-| Testing | In-process client, rolled-back transaction, fakes at the boundary | [4.19](19-testing-strategy.qmd) |
+| Async | Waits don't hold threads (measured: 200 waits, 5.7 s sync vs 1.7 s async); load relationships up front | [4.17](17-async-fastapi.qmd) |
+| API styles | REST by default; a WebSocket for server push, not speed; GraphQL and gRPC for specific needs | [4.18](18-api-styles.qmd) |
+| Testing strategy | Most tests in-process against real Postgres; fakes at the boundary; coverage maps blind spots; a contract snapshot | [4.19](19-testing-strategy.qmd) |
 
 ## Mixed practice
 
@@ -47,9 +47,72 @@ No step-by-step hints; each relates to several lessons.
 
 1. **Docs only.** Add a "documentation only" checkbox to the web UI's search. Which file changes, and which API parameter already exists?
 2. **Admin sees users.** Add `GET /users` (admins only) with cursor pagination by `id`. Return `UserOut` items. Write the 401, 403 and happy-path tests.
-3. **Expire idempotency keys.** Keys are kept forever. Add a `created_at` filter so keys older than 24 hours are ignored by `replay`, and write a test that uses `update(...)` to age a key.
+3. **Document the errors.** Declare each route's error responses (`responses={409: {"model": ErrorResponse}, ...}`), then refresh the contract snapshot (lesson 4.19) and read its diff. Which routes return more statuses than you expected?
 4. **Who's slow?** Using lesson 4.15's stretch logging, find the slowest route when you click through the web UI. Explain why.
-5. **Break it on purpose.** Remove `selectinload(Issue.repo)` from `get_issue_or_404`, restart the server and call `GET /issues/1`. You get a 500, and the server log shows `MissingGreenlet`. Now run the tests: they all still pass. Why? (Hint: in the tests, the same session that stored the issues still holds the `Repo` object in memory.) Write a test that would catch it.
+5. **Break it on purpose.** Remove each `selectinload(...)` in `routes/issues.py` and `routes/users.py`, one at a time, and run the suite. Which tests catch each removal? If one isn't caught, write the test that would (lesson 4.17 shows how).
+
+## Security review: three planted bugs
+
+Reviewing code for security is a skill on its own: the bugs look like ordinary code. Below are three changes someone might propose to Atlas, each written to look reasonable. For each one: what's the vulnerability, what can an attacker (or an accident) do with it, and which of Atlas's tests would catch it? Answer before opening the solutions.
+
+**Change 1**, in `routes/notes.py` (lesson 4.20's notes), "simplifying" a check:
+
+```python
+async def get_own_note(session: SessionDep, note_id: int, user: User) -> IssueNote:
+    note = await session.get(IssueNote, note_id)
+    if note is None:
+        raise ApiError(status.HTTP_404_NOT_FOUND, "note_not_found", f"Note {note_id} not found")
+    return note
+```
+
+::: {.callout-tip collapse="true" title="Solution 1"}
+The ownership check (`or note.user_id != user.id`) is gone. Any signed-in user can now read, edit or delete anyone's note by trying ids: an IDOR (lesson 4.11). With the change applied, the suite says:
+
+```text
+FAILED tests/test_api_resources.py::test_other_peoples_notes_are_invisible
+1 failed, 125 passed in 9.78s
+```
+
+The function's name, `get_own_note`, still promises ownership: names are claims, and only tests check them.
+:::
+
+**Change 2**, in `routes/auth.py`, to help debug failed logins:
+
+```python
+    user = await session.scalar(select(User).where(User.email == normalise_email(form.username)))
+    logger.info("login attempt", extra={"credentials": vars(form)})
+```
+
+::: {.callout-tip collapse="true" title="Solution 2"}
+`vars(form)` is every field of the login form, *including the password*, and `JsonFormatter` writes every `extra` field. Every login attempt, successful or not, would put a password into the logs (lesson 4.15). With the change applied:
+
+```text
+FAILED tests/test_logging.py::test_passwords_never_reach_the_logs
+1 failed, 125 passed in 9.47s
+```
+
+Log what you need (the email, the outcome), never a whole request object.
+:::
+
+**Change 3**, in `security.py`, after a user in another time zone reported being logged out:
+
+```python
+        # Servers' clocks can drift apart, so don't reject tokens for being a little old.
+        payload: dict[str, Any] = jwt.decode(
+            token, secret_key, algorithms=[JWT_ALGORITHM], options={"verify_exp": False}
+        )
+```
+
+::: {.callout-tip collapse="true" title="Solution 3"}
+`verify_exp: False` doesn't allow "a little" old: it switches expiry off entirely, so a stolen access token now works forever and the 15-minute lifetime (lesson 4.8) means nothing. Time zones don't affect `exp` either, since it's a UTC timestamp. Small clock differences are what PyJWT's `leeway` argument is for (lesson 4.8's stretch). With the change applied:
+
+```text
+FAILED tests/test_api_tokens.py::test_forged_tokens_are_rejected[expired]
+1 failed, 125 passed in 9.18s
+```
+:::
+
+Notice that each bug was caught by exactly one test, and that each of those tests was written by carrying out the attack (lessons 4.11, 4.15, 4.8). Without them, all three changes would have passed the other 125 tests.
 
 ## Build it alone: private notes on issues
 
@@ -187,8 +250,10 @@ Without notes, you should be able to:
 - Write, review and roll back an Alembic migration.
 - Say when to use `def`, `async def` and `run_in_threadpool`.
 - Pick an API style for a new feature and justify it.
-- Write API tests that cover unhappy paths against a real database.
+- Write API tests that cover unhappy paths against a real database, and break the code once to see each one fail.
+- Spot an authorisation bug, a secret in a log line and a disabled security check in a code review.
+- Read a coverage report for blind spots, and explain why a high number proves little.
 
 ## What changed in the project
 
-Checkpoint 4: the Atlas API v1 (accounts, GitHub sign-in, issues, saved issues, notes, keyword search, live search) with the ready-made web UI at `/app`, migrations, and 81 tests. Tag: `checkpoint-04`.
+Checkpoint 4: the Atlas API v1 (accounts, GitHub sign-in, issues, saved issues, notes, keyword search, live search) with the ready-made web UI at `/app`, migrations, stable error codes, JSON request logs, and 126 tests with 94% coverage. Tag: `checkpoint-04`.
