@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     git_base_url: str = "https://github.com"
     # How often the scheduler queues a sync of every repository (lesson 5.2).
     sync_interval_minutes: int = 15
+    # Object storage for snapshots (lesson 5.4). Unset endpoint means real AWS S3. Keys are
+    # not settings: boto3 reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY itself, and on
+    # AWS it uses the task's IAM role instead, so no key is ever configured there (Part 7).
+    s3_endpoint_url: str | None = None
+    s3_region: str = "us-east-1"
+    snapshot_bucket: str = "atlas-snapshots"
+    # Older snapshots of a repository are deleted once this many newer ones exist.
+    snapshots_kept: int = 3
 
 
 class ApiSettings(Settings):

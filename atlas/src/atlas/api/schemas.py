@@ -105,6 +105,14 @@ class RepoOut(BaseModel):
     issues_synced_until: datetime | None
 
 
+class SnapshotOut(BaseModel):
+    """Where to download the repository's files at the indexed commit (lesson 5.4)."""
+
+    commit: str
+    url: str  # works without a token, for anyone who has it, until expires_at
+    expires_at: datetime
+
+
 # ---------- Background jobs ----------
 
 
@@ -112,7 +120,7 @@ class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    kind: Literal["sync_repo", "sync_issues"]
+    kind: Literal["sync_repo", "sync_issues", "snapshot_repo"]
     repo_id: int
     status: Literal["queued", "running", "succeeded", "dead"]
     attempts: int

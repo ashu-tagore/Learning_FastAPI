@@ -5,12 +5,13 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from atlas.api import idempotency
-from atlas.api.deps import AdminUser, QueueDep, SessionDep
+from atlas.api.deps import AdminUser, CurrentUser, QueueDep, SessionDep, SnapshotsDep
 from atlas.api.errors import ApiError
 from atlas.api.routes.jobs import BOTH_SYNCS, queue_jobs
-from atlas.api.schemas import JobOut, QueuedJobs, RepoCreate, RepoOut
+from atlas.api.schemas import JobOut, QueuedJobs, RepoCreate, RepoOut, SnapshotOut
 from atlas.models import Repo
 
 router = APIRouter(prefix="/repos", tags=["repos"])
@@ -77,3 +78,27 @@ async def sync_repo(
     await get_repo_or_404(session, repo_id)
     jobs = await queue_jobs(session, queue, repo_id, BOTH_SYNCS)
     return QueuedJobs(jobs=[JobOut.model_validate(job) for job in jobs])
+
+
+@router.get("/{repo_id}/snapshot", response_model=SnapshotOut)
+async def read_snapshot(
+    repo_id: int, user: CurrentUser, session: SessionDep, snapshots: SnapshotsDep
+) -> SnapshotOut:
+    """A short-lived link to the repository's files at the indexed commit.
+
+    The client downloads from object storage directly: megabytes never pass through the
+    API, and the link's signature, not Atlas, decides who may read the object.
+    """
+    repo = await get_repo_or_404(session, repo_id)
+    commit = repo.indexed_commit
+    not_found = ApiError(
+        status.HTTP_404_NOT_FOUND, "snapshot_not_found", "No snapshot of this repository yet"
+    )
+    if commit is None:
+        raise not_found
+    # boto3 is synchronous and this asks the storage server: keep it off the event loop.
+    stored = await run_in_threadpool(snapshots.exists, repo.full_name, commit)
+    if not stored:
+        raise not_found
+    url, expires_at = snapshots.download_url(repo.full_name, commit)
+    return SnapshotOut(commit=commit, url=url, expires_at=expires_at)

@@ -39,6 +39,7 @@ from atlas.logs import configure_logging
 from atlas.models import Job, Repo, User
 from atlas.queue import RedisQueue
 from atlas.search import DEFAULT_EXTENSIONS, search
+from atlas.snapshots import SnapshotStore, make_s3_client
 from atlas.stats import collect_stats
 
 DEFAULT_REPO = "pytorch/ignite"
@@ -340,7 +341,8 @@ def worker_context() -> WorkerContext | None:
         return None
     factory = sessionmaker(create_engine(settings.database_url))
     queue = RedisQueue(redis.Redis.from_url(settings.redis_url))
-    return WorkerContext(factory, queue, settings)
+    snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
+    return WorkerContext(factory, queue, settings, snapshots)
 
 
 def run_worker() -> int:

@@ -25,6 +25,7 @@ from atlas import github, gitrepo, storage
 from atlas.config import Settings
 from atlas.models import Job, Repo
 from atlas.queue import JobQueue
+from atlas.snapshots import SnapshotStore
 
 logger = logging.getLogger("atlas.jobs")
 
@@ -41,6 +42,7 @@ class WorkerContext:
     session_factory: sessionmaker[Session]
     queue: JobQueue
     settings: Settings
+    snapshots: SnapshotStore
     github_transport: httpx.AsyncBaseTransport | None = None
 
 
@@ -174,6 +176,9 @@ def _run_handler(ctx: WorkerContext, session: Session, job: Job) -> None:
     if job.kind == "sync_repo":
         sync_repo(session, repo, ctx.settings)
         return
+    if job.kind == "snapshot_repo":
+        snapshot_repo(repo, ctx.settings, ctx.snapshots)
+        return
     sync_issues(session, repo, ctx.settings, ctx.github_transport)
 
 
@@ -198,6 +203,25 @@ def sync_repo(session: Session, repo: Repo, settings: Settings) -> storage.Index
         summary = storage.index_folder(session, repo.full_name, path)
     repo.indexed_commit = head
     return summary
+
+
+def snapshot_repo(repo: Repo, settings: Settings, snapshots: SnapshotStore) -> bool:
+    """Store a snapshot of the indexed commit, unless it's stored already; prune old ones.
+
+    A separate job from sync_repo on purpose: if object storage is down, indexing carries
+    on, and only snapshots wait for their retries.
+    """
+    commit = repo.indexed_commit
+    if commit is None:
+        return False  # never indexed: nothing to snapshot yet
+    path = Path(settings.repos_dir) / repo.full_name
+    url = f"{settings.git_base_url}/{repo.full_name}.git"
+    # This worker may not have the clone (another one did the sync); fetch brings the
+    # indexed commit, unless upstream history was rewritten since.
+    gitrepo.clone_or_update(url, path)
+    uploaded = snapshots.upload(repo.full_name, commit, path)
+    snapshots.prune(repo.full_name, keep=settings.snapshots_kept)
+    return uploaded
 
 
 def sync_issues(

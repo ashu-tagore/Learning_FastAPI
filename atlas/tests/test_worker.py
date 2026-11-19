@@ -23,17 +23,19 @@ def run_until_idle(worker: WorkerContext) -> int:
     return work(worker, threading.Event(), wait_seconds=0, stop_when_idle=True)
 
 
-def test_scheduler_queues_both_syncs_and_worker_runs_them(
+def test_scheduler_queues_every_job_kind_and_worker_runs_them(
     worker: WorkerContext, upstream: Path
 ) -> None:
     add_repo(worker)
 
-    assert schedule_once(worker) == (2, 0)
-    assert run_until_idle(worker) == 2
+    assert schedule_once(worker) == (3, 0)
+    # The snapshot job may run before the code sync and find nothing indexed yet; the
+    # next scheduler run catches up. Each job converges on its own.
+    assert run_until_idle(worker) == 3
 
     with worker.session_factory() as session:
         statuses = sorted(session.scalars(select(Job.status)))
-        assert statuses == ["succeeded", "succeeded"]
+        assert statuses == ["succeeded", "succeeded", "succeeded"]
         assert session.scalar(select(Document.id).limit(1)) is not None
 
 
@@ -43,22 +45,22 @@ def test_scheduler_does_not_pile_up_jobs_nobody_has_run(worker: WorkerContext) -
     first = schedule_once(worker)
     second = schedule_once(worker)
 
-    assert (first, second) == ((2, 0), (0, 0))
+    assert (first, second) == ((3, 0), (0, 0))
     with worker.session_factory() as session:
-        assert len(session.scalars(select(Job.id)).all()) == 2
+        assert len(session.scalars(select(Job.id)).all()) == 3
 
 
 def test_scheduler_resends_a_job_whose_message_was_lost(worker: WorkerContext) -> None:
     add_repo(worker)
     schedule_once(worker)
-    # Lose both messages, as if Redis had restarted without saving them.
+    # Lose all three messages, as if Redis had restarted without saving them.
     while worker.queue.receive(wait_seconds=0) is not None:
         pass
     an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
     with worker.session_factory() as session, session.begin():
         session.execute(update(Job).values(created_at=an_hour_ago))
 
-    assert schedule_once(worker) == (0, 2)
+    assert schedule_once(worker) == (0, 3)
 
 
 def test_stop_event_ends_the_loop_before_the_next_job(worker: WorkerContext) -> None:

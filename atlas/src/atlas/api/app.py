@@ -31,6 +31,7 @@ from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
 from atlas.logs import configure_logging, current_request_id
 from atlas.queue import RedisQueue
+from atlas.snapshots import SnapshotStore, make_s3_client
 
 logger = logging.getLogger("atlas.api")
 
@@ -72,6 +73,8 @@ def create_app(
         # Connects lazily, on the first send: the API starts even while Redis is down.
         redis_client = redis.Redis.from_url(settings.redis_url)
         app.state.queue = RedisQueue(redis_client)
+        # Creating the client makes no network call; nor does signing a download link.
+        app.state.snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
         await engine.dispose()

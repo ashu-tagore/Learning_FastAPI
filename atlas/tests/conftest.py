@@ -246,10 +246,12 @@ def queue(redis_client: redis.Redis, clock: FakeClock) -> Iterator[RedisQueue]:
 
 import subprocess  # noqa: E402
 
+import boto3  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from atlas.config import Settings  # noqa: E402
 from atlas.jobs import WorkerContext  # noqa: E402
+from atlas.snapshots import S3_CONFIG, SnapshotStore  # noqa: E402
 from tests.fake_github import FakeIssueTracker  # noqa: E402
 
 
@@ -282,8 +284,35 @@ def issue_tracker() -> FakeIssueTracker:
 
 
 @pytest.fixture
+def snapshot_store() -> Iterator[SnapshotStore]:
+    """A real S3 API (SeaweedFS from compose.yml) with a bucket of its own, emptied after."""
+    url = os.environ.get("TEST_S3_URL")
+    if url is None:
+        pytest.skip("set TEST_S3_URL to run object storage tests (see lesson 5.4)")
+    client = boto3.client(
+        "s3",
+        endpoint_url=url,
+        region_name="us-east-1",
+        # The throwaway local credentials from compose.yml.
+        aws_access_key_id="atlas",
+        aws_secret_access_key="atlas-dev-secret-key",
+        config=S3_CONFIG,
+    )
+    bucket = f"test-{uuid.uuid4().hex}"
+    client.create_bucket(Bucket=bucket)
+    yield SnapshotStore(client, bucket)
+    for item in client.list_objects_v2(Bucket=bucket).get("Contents", []):
+        client.delete_object(Bucket=bucket, Key=item["Key"])
+    client.delete_bucket(Bucket=bucket)
+
+
+@pytest.fixture
 def worker(
-    engine: Engine, queue: RedisQueue, tmp_path: Path, issue_tracker: FakeIssueTracker
+    engine: Engine,
+    queue: RedisQueue,
+    snapshot_store: SnapshotStore,
+    tmp_path: Path,
+    issue_tracker: FakeIssueTracker,
 ) -> Iterator[WorkerContext]:
     """A worker's world: real Postgres (rolled back), real Redis, local Git, fake GitHub.
 
@@ -298,5 +327,5 @@ def worker(
     with engine.connect() as connection:
         transaction = connection.begin()
         factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
-        yield WorkerContext(factory, queue, settings, issue_tracker.transport())
+        yield WorkerContext(factory, queue, settings, snapshot_store, issue_tracker.transport())
         transaction.rollback()
