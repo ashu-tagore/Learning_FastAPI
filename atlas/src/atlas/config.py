@@ -4,7 +4,7 @@ Nothing else in Atlas reads os.environ. Each setting is typed and validated here
 so a missing or malformed value fails at startup with a clear message.
 """
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,7 +24,9 @@ class ApiSettings(Settings):
     """Settings the web API needs on top. Secrets have no defaults: a missing one stops startup."""
 
     database_url: str
-    secret_key: SecretStr
+    # At least 32 characters (256 bits for HS256 keys, RFC 7518): a short key can be
+    # guessed, and whoever knows it can sign tokens for any user (lesson 4.8).
+    secret_key: SecretStr = Field(min_length=32)
     access_token_minutes: int = 15
     refresh_token_days: int = 30
     # Browser origins allowed to call the API (lesson 4.16).
