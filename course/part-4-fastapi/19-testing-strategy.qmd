@@ -1,5 +1,5 @@
 ---
-title: "4.15 Testing APIs against a real Postgres"
+title: "4.19 Testing APIs against a real Postgres"
 description: "Test the whole API in-process with httpx and a rolled-back database transaction per test, fake GitHub at the network boundary, and cover the unhappy paths."
 ---
 
@@ -47,7 +47,7 @@ flowchart LR
 
 ### Async tests
 
-The routes are async (lesson 4.13), so the tests are too. The **anyio** pytest plugin (installed with FastAPI) runs `async def` tests; each test module opts in with `pytestmark = pytest.mark.anyio`, and `conftest.py` picks the event loop:
+The routes are async (lesson 4.17), so the tests are too. The **anyio** pytest plugin (installed with FastAPI) runs `async def` tests; each test module opts in with `pytestmark = pytest.mark.anyio`, and `conftest.py` picks the event loop:
 
 ```python
 @pytest.fixture
@@ -247,7 +247,7 @@ $ uv run pytest -q
 
 81 tests, including Parts 1 to 3, in about five seconds against a real database. The one warning comes from Starlette: its `TestClient` will move from `httpx` to a successor package, `httpx2`. It doesn't affect results; the course will follow when the change settles.
 
-CI also runs the migrations from scratch, down and up again, and `alembic check` (lesson 4.11).
+CI also runs the migrations from scratch, down and up again, and `alembic check` (lesson 4.13).
 
 ## Common mistakes
 

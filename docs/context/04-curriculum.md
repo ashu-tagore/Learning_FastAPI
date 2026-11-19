@@ -1,6 +1,6 @@
 # 04. Curriculum
 
-96 lessons in 10 parts. Each part ends at a **checkpoint**: a git tag where the reference implementation works and its tests pass. "Builds" says what the lesson adds to the project.
+100 lessons in 10 parts. Each part ends at a **checkpoint**: a git tag where the reference implementation works and its tests pass. "Builds" says what the lesson adds to the project.
 
 Lesson ids are `P.N` (part, number). Lesson files live at `course/part-P-<slug>/NN-<slug>.qmd`.
 
@@ -66,28 +66,32 @@ Parts 1 to 8 end with a **Review and practice** lesson: mixed exercises without 
 
 **Checkpoint 3:** repos, documents, chunks and issues live in Postgres; keyword search runs in SQL.
 
-## Part 4: Building APIs with FastAPI (16)
+## Part 4: Building APIs with FastAPI (20)
 
-This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources.
+This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`), retargeted from "posts" to Atlas's resources. Its depth pass ([08-depth-pass.md](08-depth-pass.md)) makes lessons failure-first and test-first from 4.5, and adds "Attack it" sections to the security lessons.
 
 | Id | Lesson | Builds |
 |---|---|---|
 | 4.1 | FastAPI fundamentals: ASGI, routes, parameters, docs, `def` vs `async def` | API skeleton |
 | 4.2 | Configuration and secrets with pydantic-settings | `Settings` |
-| 4.3 | Pydantic schemas: requests, responses, PATCH vs PUT | Schemas |
-| 4.4 | Database sessions and dependency injection | `get_db` |
-| 4.5 | Routers and project structure | Routers |
-| 4.6 | Users and password hashing | Users |
-| 4.7 | Authentication with JWT | Login, `get_current_user` |
-| 4.8 | Sign in with GitHub (OAuth2 and OIDC), refresh tokens, roles | GitHub login, admin role |
-| 4.9 | Relationships and authorisation | Saved issues, admin-only routes |
-| 4.10 | Querying: pagination (offset and cursor), filtering, search | `/search` (keyword), `/issues` |
-| 4.11 | Migrations with Alembic | Migrations |
-| 4.12 | Errors, middleware, CORS, API design conventions, idempotency keys | Error format, request ids |
-| 4.13 | Async FastAPI with async SQLAlchemy | API converted to async |
-| 4.14 | API styles: REST, GraphQL, gRPC, WebSockets, and when to use each | WebSocket demo |
-| 4.15 | Testing APIs against a real Postgres | Test suite |
-| 4.16 | Review and practice | Unguided: a "notes on issues" resource |
+| 4.3 | Schemas and domain types: parse, don't validate | Schemas, domain types |
+| 4.4 | Database sessions and dependency injection | `get_session`, `/ready` |
+| 4.5 | Testing the API from the start | Test client, rolled-back sessions, `/ready` returns 503 |
+| 4.6 | Routers and project structure | Routers |
+| 4.7 | Users and password hashing | Users |
+| 4.8 | Authentication with JWT | Login, `get_current_user` |
+| 4.9 | Sign in with GitHub: OAuth2 and PKCE | GitHub login |
+| 4.10 | Staying signed in: refresh tokens, logout and roles | Refresh tokens, admin role |
+| 4.11 | Relationships and authorisation | Saved issues, admin-only routes |
+| 4.12 | Querying: pagination (offset and cursor), filtering, search | `/search` (keyword), `/issues` |
+| 4.13 | Migrations with Alembic | Migrations |
+| 4.14 | Error handling by design | Error format |
+| 4.15 | Observability from day one: structured logs and request tracing | JSON logs, request ids |
+| 4.16 | Browsers and retries: CORS, idempotency keys and API conventions | CORS, idempotency keys |
+| 4.17 | Async FastAPI with async SQLAlchemy | API converted to async |
+| 4.18 | API styles: REST, GraphQL, gRPC, WebSockets, and when to use each | WebSocket demo |
+| 4.19 | Testing strategy | Test suite |
+| 4.20 | Review and practice | Unguided: a "notes on issues" resource |
 
 **Checkpoint 4:** Atlas API v1 with the ready-made web UI: sign in, browse issues, keyword-search the codebase.
 

@@ -1,0 +1,333 @@
+---
+title: "4.5 Testing the API from the start"
+description: "Test the API in-process with FastAPI's test client and a rolled-back database session, swap dependencies to simulate failures, and work test-first: watch a test fail, then make it pass."
+---
+
+::: {.lesson-meta}
+Part 4 · Lesson 5 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". From this lesson on, every feature in the course starts with a failing test, so this one matters.
+:::
+
+::: {.callout-note title="Analogy: a crash-test lab"}
+Car makers don't learn whether a seatbelt works by waiting for real accidents. They build a lab where any crash can be staged on demand: a head-on collision at 50 km/h, every time, identically, with sensors everywhere. After each test the lab is reset for the next one.
+
+An **automated test suite** is a crash-test lab for your API. It stages situations on demand, including ones that are hard to arrange by hand ("the database just went down"), checks the result, and resets everything afterwards so each test starts from the same clean state.
+:::
+
+## The problem
+
+Lesson 4.4 ended with a known flaw: when the database is down, `/ready` answers 500 ("the server is broken") instead of 503 ("I'm fine, but I can't serve yet"). To see that, we stopped Postgres by hand, ran curl, read the output, and started Postgres again.
+
+That works once. It doesn't work as a way of building software:
+
+- **It's slow and manual.** Nobody will repeat it after every change, so a later change can quietly break it again (a **regression**).
+- **Some situations are hard to stage.** Stopping the database also breaks every other program using it. Others are worse: "GitHub returns an error", "two requests arrive at once".
+- **It leaves a mess.** Data created while trying things by hand stays in your database and changes the next experiment.
+
+Part 1 introduced pytest (lesson 1.11), and lesson 3.11 tested database code with a session whose changes are rolled back. This lesson adds the last piece, sending HTTP requests to the app from a test, and then fixes `/ready` the way every feature will be built from now on: **test first**.
+
+## Theory
+
+### Test-first, in three steps
+
+**Test-first development** (often called **TDD**, test-driven development) is a loop:
+
+1. **Red**: write a test for behaviour that doesn't exist yet. Run it and *watch it fail*, for the reason you expect.
+2. **Green**: write the simplest code that makes it pass.
+3. **Refactor**: tidy up the code, with the test guarding you.
+
+Watching the test fail first matters more than it seems. A test that has never failed might not be testing anything: lesson 4.2's first security test passed while the leak was still there. And writing the test first forces you to decide what "working" means before you're attached to an implementation.
+
+### Calling the app without a server
+
+You *could* start Uvicorn and send real requests over the network. It's slow and fiddly (ports, startup, shutdown). Instead, FastAPI's **`TestClient`** calls the ASGI app directly (lesson 4.1's `scope`, `receive`, `send`), in the same process: no server, no sockets. Requests still pass through everything real: routing, validation, dependencies, error handling. It has the same interface as `httpx` (lesson 2.5): `client.get(...)`, `client.post(..., json=...)`, and responses with `.status_code` and `.json()`.
+
+### Swapping dependencies
+
+Lesson 4.4's payoff: because routes *declare* what they need, a test can replace any dependency:
+
+```python
+app.dependency_overrides[get_session] = some_other_function
+```
+
+Every route that asks for `SessionDep` now gets whatever `some_other_function` yields. Two uses:
+
+- **Isolation**: give routes the test's rolled-back session, so nothing a test does survives it.
+- **Staging failures**: give routes a session connected to a database that doesn't exist, to simulate an outage without touching the real one.
+
+### Rolled-back sessions, again
+
+Lesson 3.11's `session` fixture opens one transaction per test and rolls it back at the end. Code under test may call `commit()`; with `join_transaction_mode="create_savepoint"` those commits become **savepoints** (checkpoints inside the outer transaction), so the code behaves normally and the final rollback still erases everything.
+
+```{mermaid}
+flowchart LR
+  T[test function] -->|"client.get('/ready')"| C[TestClient]
+  C -->|ASGI call, in-process| APP[Atlas app<br/>routing, validation, routes]
+  APP -->|"SessionDep (overridden)"| S[test session<br/>one transaction]
+  S --> PG[(Postgres atlas_test)]
+  S -.->|after the test| RB[rollback: nothing kept]
+```
+
+## In the project
+
+### Fixtures: settings and a client
+
+Fixtures (lesson 1.11) prepare what tests need. Two new ones in `tests/conftest.py`, next to lesson 3.11's `engine` and `session`:
+
+```python
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+
+from atlas.api.app import create_app
+from atlas.api.deps import get_session
+from atlas.config import ApiSettings
+
+
+@pytest.fixture
+def api_settings() -> ApiSettings:
+    return ApiSettings(
+        database_url=os.environ.get("TEST_DATABASE_URL", "postgresql+psycopg://unused/unused"),
+        secret_key=SecretStr("test-secret-key-that-is-long-enough-for-hs256"),
+    )
+
+
+@pytest.fixture
+def client(session: Session, api_settings: ApiSettings) -> Iterator[TestClient]:
+    """The real app, talking to the test's rolled-back session."""
+    app = create_app(api_settings)
+
+    def test_session() -> Iterator[Session]:
+        yield session
+
+    # Every route that asks for a database session gets the test's rolled-back one.
+    app.dependency_overrides[get_session] = test_session
+    with TestClient(app) as test_client:
+        yield test_client
+```
+
+- `api_settings` passes values directly, which wins over the environment (lesson 4.2), so tests never depend on your shell. `TEST_DATABASE_URL` points at a database used only by tests (lesson 3.11).
+- `client` builds a fresh app per test with `create_app`, the factory from lesson 4.1. This is why Atlas has a factory: each test gets its own app with its own overrides.
+- `with TestClient(app)` runs the app's lifespan (lesson 4.4) on entry and shutdown on exit, as a real server would.
+- Because `client` asks for `session`, any test using `client` is skipped when `TEST_DATABASE_URL` isn't set, like lesson 3.11's database tests.
+
+### First tests: pin down what already works
+
+Before changing anything, describe what works today. `tests/test_api_operations.py`:
+
+```python
+def test_health_says_ok(client: TestClient) -> None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_ready_checks_the_database(client: TestClient) -> None:
+    response = client.get("/ready")
+
+    assert response.json() == {"status": "ready"}
+```
+
+Each test has three parts, separated by blank lines: **arrange** (here, the fixture did it), **act** (one request), **assert** (check the outcome). Test names say the rule being checked, so a failure explains itself.
+
+### Red: the outage test
+
+Now the behaviour we want, written before the code:
+
+```python
+from collections.abc import Iterator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
+
+
+def test_ready_answers_503_when_the_database_is_unreachable(api_settings: ApiSettings) -> None:
+    app = create_app(api_settings)
+    # Port 1 refuses connections: as if Postgres were down.
+    unreachable = create_engine("postgresql+psycopg://atlas:unused@localhost:1/atlas", poolclass=NullPool)
+
+    def broken_session() -> Iterator[Session]:
+        with Session(unreachable) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = broken_session
+    client = TestClient(app)
+
+    ready = client.get("/ready")
+    health = client.get("/health")
+
+    assert ready.status_code == 503
+    assert health.status_code == 200
+```
+
+The test stages an outage without stopping anything: it hands the routes a session bound to port 1, where nothing listens. (`NullPool` means "don't keep connections around", so nothing lingers after the test.) It also checks that `/health` stays at 200 during the outage, the liveness-versus-readiness rule from lesson 4.4. It doesn't use the `client` fixture, because it needs its own override; and the `TestClient` isn't entered with `with`, so the lifespan doesn't run and no real engine is created.
+
+Run it, and watch it fail:
+
+```text
+$ uv run pytest tests/test_api_operations.py --tb=line
+...
+sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: connection to server at "127.0.0.1", port 1 failed: Connection refused
+=========================== short test summary info ============================
+FAILED tests/test_api_operations.py::test_ready_answers_503_when_the_database_is_unreachable
+========================= 1 failed, 2 passed in 0.17s ==========================
+```
+
+It fails for the reason we expected: the database error escapes the route. (`TestClient` re-raises errors from inside the app instead of quietly turning them into a 500, which makes failures easier to read. `--tb=line` asks pytest for short tracebacks.)
+
+### Green: the fix
+
+In `create_app`:
+
+```python
+from fastapi import status
+from sqlalchemy.exc import OperationalError
+
+
+@app.get("/ready", tags=["operations"])
+def ready(session: SessionDep) -> dict[str, str]:
+    """Readiness: the process can reach its database, so it can do real work."""
+    try:
+        session.execute(text("SELECT 1"))
+    except OperationalError:
+        # 503, not 500: nothing is broken in this process, it just can't serve yet.
+        # Load balancers stop sending traffic on 503 and retry later (lesson 7.9).
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "The database is unreachable"
+        ) from None
+    return {"status": "ready"}
+```
+
+`OperationalError` is SQLAlchemy's exception for "the database couldn't be reached or the operation couldn't run", as opposed to errors in your SQL. Catching only that one keeps real bugs visible as 500s. `from None` drops the database error from the chain, since the client doesn't need it. Clients get FastAPI's default error body, `{"detail": "The database is unreachable"}`, until lesson 4.14 gives errors Atlas's own shape. Now:
+
+```text
+$ uv run pytest tests/test_api_operations.py tests/test_schemas.py -v
+tests/test_api_operations.py::test_health_says_ok PASSED
+tests/test_api_operations.py::test_ready_checks_the_database PASSED
+tests/test_api_operations.py::test_ready_answers_503_when_the_database_is_unreachable PASSED
+tests/test_schemas.py::test_email_is_stored_in_one_form PASSED
+...
+tests/test_schemas.py::test_password_length_is_bounded[value1] PASSED
+============================== 18 passed in 0.20s ==============================
+```
+
+The outage is now one test among many, run in a fraction of a second, every time anything changes, in CI too (lesson 3.11 set up Postgres there). The 503 can't silently regress.
+
+### Proof that tests don't leak into each other
+
+Two tests that each insert the same repository, whose `full_name` is unique:
+
+```python
+def test_first_adds_a_repository(session: Session) -> None:
+    session.add(Repo(full_name="pytorch/ignite"))
+    session.commit()
+
+    assert session.scalar(select(func.count()).select_from(Repo)) == 1
+
+
+def test_second_adds_the_same_repository(session: Session) -> None:
+    # full_name is unique: this would fail if the first test's row had survived.
+    session.add(Repo(full_name="pytorch/ignite"))
+    session.commit()
+
+    assert session.scalar(select(func.count()).select_from(Repo)) == 1
+```
+```text
+tests/test_isolation.py::test_first_adds_a_repository PASSED
+tests/test_isolation.py::test_second_adds_the_same_repository PASSED
+```
+
+Both pass, in either order: the first test's `commit()` was only a savepoint, rolled back at its end. These two are a demonstration, not part of the reference suite.
+
+### The rule from here on
+
+Every feature from lesson 4.6 onward is built this way: a failing test that states the rule, then the code, then the passing run. Security lessons go one step further: the test *carries out the attack*, and must fail before the defence exists.
+
+## Trade-offs: how to test an API *(deep dive)*
+
+| Approach | Speed | Realism | Atlas uses it |
+|---|---|---|---|
+| Unit tests of plain functions (`TypeAdapter(Email)`, `hash_password`) | fastest | only one piece | yes, where logic stands alone |
+| In-process HTTP tests (`TestClient`) with a real Postgres | fast | routing, validation, SQL all real | yes, most tests |
+| Tests against a running server over the network | slow | adds the real server and network | no; Part 7 checks a deployed instance instead |
+| Replacing the database with mocks or SQLite | fast | SQL isn't really tested; Postgres features missing | no |
+
+The in-process tier gives the most confidence per second for an API like Atlas. Lesson 4.19 returns to this with a full suite: where each kind of test earns its place, and what to fake.
+
+## Common mistakes
+
+- **Skipping the red step.** A test you've never seen fail may pass for the wrong reason.
+- **Testing only the happy path.** Most bugs, and nearly all security bugs, live in the 4xx and 5xx paths.
+- **Tests that depend on each other's data or order.** Each test builds what it needs; the rollback cleans up.
+- **Catching every exception to make a test pass** (`except Exception:` in `/ready`). Catch the specific error you mean, so real bugs still surface as 500s.
+- **Overrides that outlive the test**: setting `dependency_overrides` on a shared, global app. Build a fresh app per test with the factory.
+- **Running tests against your development database.** Use a separate `atlas_test` database; the test setup drops and recreates its tables.
+
+## Check yourself
+
+**1.** Why must you watch a new test fail before writing the code?
+
+::: {.callout-tip collapse="true" title="Answer"}
+To prove the test can detect the problem. A test that passes before the fix exists is checking something else (or nothing), like lesson 4.2's first security test, which passed while the leak was still there.
+:::
+
+**2.** How does the outage test simulate a database failure without stopping Postgres?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It overrides `get_session` with a function that yields a session bound to `localhost:1`, where nothing listens. The route's `SELECT 1` fails with `OperationalError` exactly as it would in a real outage, while the real database keeps running for everything else.
+:::
+
+**3.** A route under test calls `session.commit()`. Why doesn't the data survive into the next test?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The test's session runs inside one outer transaction with `join_transaction_mode="create_savepoint"`, so the route's commit only releases a savepoint inside it. When the test ends, the fixture rolls back the outer transaction, erasing everything.
+:::
+
+## Exercise
+
+Write a test, red first, that `GET /openapi.json` lists both `/health` and `/ready`, and that `/ready`'s documented responses include 503. It will fail on the 503 part. Make it pass by adding `responses={503: {"description": "The database is unreachable"}}` to the `@app.get("/ready", ...)` decorator.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_the_docs_describe_the_operations_routes(client: TestClient) -> None:
+    paths = client.get("/openapi.json").json()["paths"]
+
+    assert {"/health", "/ready"} <= set(paths)
+    assert "503" in paths["/ready"]["get"]["responses"]
+```
+Before the change, `/ready` documents only `200` (and nothing about 503), so the last assert fails. With `responses={503: ...}` on the decorator, FastAPI adds it to the OpenAPI document. Response codes in OpenAPI are strings, hence `"503"`. The reference code documents the 503 with Atlas's error schema (lesson 4.14).
+:::
+
+## Stretch
+
+Write a test that would have caught lesson 4.4's connection leak: send 20 requests to `/ready`, then assert that no connections are still checked out of the pool. Hint: inside `with TestClient(app)`, `app.state.session_factory.kw["bind"]` is the engine, and `engine.pool.checkedout()` counts borrowed connections. Then break `get_session` (`return` instead of `yield`) and watch the test catch it.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_requests_return_their_connections(api_settings: ApiSettings) -> None:
+    app = create_app(api_settings)
+
+    with TestClient(app) as client:
+        for _ in range(20):
+            assert client.get("/ready").status_code == 200
+        engine = app.state.session_factory.kw["bind"]
+
+        assert engine.pool.checkedout() == 0
+```
+It passes with the `yield` version. With the leak it fails:
+
+```text
+E           assert 4 == 0
+E            +  where 4 = checkedout()
+```
+
+Why 4 and not 20? Python's garbage collector closes some abandoned sessions and returns their connections, at moments you don't control. That unpredictability is exactly why leaks pass manual testing and then fail under load. Not in the reference code.
+:::
+
+## What changed in the project
+
+`tests/conftest.py` gains `api_settings` and `client`; new `tests/test_api_operations.py`; `/ready` answers 503 when the database is unreachable. Commit: `feat: Made /ready answer 503 when the database is unreachable`.

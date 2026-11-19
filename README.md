@@ -10,7 +10,7 @@ A course that takes you from never having written code to building, deploying an
 
 **Atlas Agents** watches the project for new good-first issues and prepares an **Issue Brief** for each: a summary, the relevant code, the project's conventions, the commands to run, and a reproduction script verified to fail. You then write the fix yourself. Atlas never posts to GitHub and never writes your code.
 
-Along the way you learn the whole backend stack: Python, Git, operating systems and Linux, HTTP, SQL and Postgres in depth, FastAPI (sync and async), authentication and OAuth, background jobs, event streams, caching, retrieval (RAG), agents and sandboxing, Docker, CI/CD, Terraform, AWS, observability, security, incident response, distributed systems and system design. 96 lessons in 10 parts.
+Along the way you learn the whole backend stack: Python, Git, operating systems and Linux, HTTP, SQL and Postgres in depth, FastAPI (sync and async), authentication and OAuth, background jobs, event streams, caching, retrieval (RAG), agents and sandboxing, Docker, CI/CD, Terraform, AWS, observability, security, incident response, distributed systems and system design. 100 lessons in 10 parts.
 
 ## Course map
 

@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload
 
 from atlas.api.deps import CurrentUser, SessionDep
-from atlas.api.schemas import IssueOut, IssuePage
+from atlas.api.schemas import IssueOut, IssuePage, RepoFullName
 from atlas.models import Issue, Label, Repo, saved_issues
 
 router = APIRouter(prefix="/issues", tags=["issues"])
@@ -48,7 +48,7 @@ def decode_cursor(cursor: str) -> int:
 @router.get("", response_model=IssuePage)
 async def list_issues(
     session: SessionDep,
-    repo: str = "pytorch/ignite",
+    repo: Annotated[RepoFullName, Query()] = "pytorch/ignite",
     label: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     cursor: str | None = None,

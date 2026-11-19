@@ -5,16 +5,38 @@ separate is what keeps fields like password_hash out of every response.
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+
+# ---------- Domain types (lesson 4.3) ----------
+# Each type is parsed once, at the edge. Code that receives an Email or a RepoFullName
+# never re-checks it: an invalid value can't get that far.
+
+
+def normalise_email(address: str) -> str:
+    # Atlas treats addresses as case-insensitive and stores one form, so
+    # "Ada@Example.com" and "ada@example.com" can't become two accounts.
+    return address.lower()
+
+
+Email = Annotated[EmailStr, AfterValidator(normalise_email)]
+
+# The upper bound matters too: hashing is slow on purpose (lesson 4.7), so a megabyte
+# "password" would make each login attempt expensive for the server.
+Password = Annotated[str, Field(min_length=10, max_length=128)]
+
+# "owner/name", as GitHub writes it; at most the 200 characters the repos column holds.
+RepoFullName = Annotated[
+    str, Field(pattern=r"^[\w.-]+/[\w.-]+$", max_length=200, examples=["pytorch/ignite"])
+]
 
 # ---------- Users and authentication ----------
 
 
 class UserCreate(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=10, max_length=128)
+    email: Email
+    password: Password
 
 
 class UserOut(BaseModel):
@@ -30,9 +52,14 @@ class UserOut(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """PATCH body: every field optional, so a client can change just one."""
+    """PATCH body: a client sends only the fields it wants to change.
 
-    skills_profile: str | None = Field(default=None, max_length=2000)
+    Each field has a default so it may be left out, but its type doesn't allow null:
+    "absent" means "leave it alone", while null would mean "store nothing", which the
+    column forbids. Routes read model_dump(exclude_unset=True), so defaults never apply.
+    """
+
+    skills_profile: str = Field(default="", max_length=2000)
 
 
 class TokenPair(BaseModel):
@@ -50,7 +77,7 @@ class RefreshRequest(BaseModel):
 
 
 class RepoCreate(BaseModel):
-    full_name: str = Field(pattern=r"^[\w.-]+/[\w.-]+$", examples=["pytorch/ignite"])
+    full_name: RepoFullName
 
 
 class RepoOut(BaseModel):
@@ -100,7 +127,7 @@ class SearchPage(BaseModel):
     next_offset: int | None
 
 
-# ---------- Notes (review lesson 4.16) ----------
+# ---------- Notes (review lesson 4.20) ----------
 
 
 class NoteCreate(BaseModel):

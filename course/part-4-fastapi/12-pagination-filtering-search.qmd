@@ -1,5 +1,5 @@
 ---
-title: "4.10 Querying: pagination, filtering and search"
+title: "4.12 Querying: pagination, filtering and search"
 description: "Return large result sets in pages with offset and cursor (keyset) pagination, filter with query parameters, expose keyword search over HTTP, and avoid N+1 queries."
 ---
 
@@ -213,7 +213,7 @@ Filters combine with `AND`, and the cursor condition is just one more `WHERE`, s
 Turn on SQL logging (`create_engine(..., echo=True)`) and call `GET /issues`. Count the `SELECT` statements. Then remove `selectinload(Issue.labels)` and count again.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-With `selectinload`, three `SELECT`s per request (issues, labels, repos). Without it on labels, one extra `SELECT` per issue as `issue_out` reads `issue.labels`: with the three sample issues, five in total, and with 20 issues, 22. That growth with the page size is the N+1 problem. (After lesson 4.13's switch to async, the lazy loads fail outright instead, which is one reason async code makes you load relationships explicitly.)
+With `selectinload`, three `SELECT`s per request (issues, labels, repos). Without it on labels, one extra `SELECT` per issue as `issue_out` reads `issue.labels`: with the three sample issues, five in total, and with 20 issues, 22. That growth with the page size is the N+1 problem. (After lesson 4.17's switch to async, the lazy loads fail outright instead, which is one reason async code makes you load relationships explicitly.)
 :::
 
 ## What changed in the project

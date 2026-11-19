@@ -11,7 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Settings every part of Atlas may need, including the command line."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a startup error would otherwise print every value it read,
+    # secrets included, into logs (lesson 4.2 shows the leak).
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     database_url: str | None = None
     # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
@@ -25,9 +27,9 @@ class ApiSettings(Settings):
     secret_key: SecretStr
     access_token_minutes: int = 15
     refresh_token_days: int = 30
-    # Browser origins allowed to call the API (lesson 4.12).
+    # Browser origins allowed to call the API (lesson 4.16).
     cors_origins: list[str] = ["http://localhost:8000"]
-    # GitHub sign-in (lesson 4.8). Leave unset to disable it.
+    # GitHub sign-in (lesson 4.9). Leave unset to disable it.
     github_client_id: str | None = None
     github_client_secret: SecretStr | None = None
     # Where the ready-made web interface lives on disk; unset to serve the API only.

@@ -30,7 +30,7 @@ ALTER TABLE issues ALTER COLUMN repo_id SET NOT NULL;
 ALTER TABLE issues DROP COLUMN repo;
 ```
 
-- `ALTER TABLE` changes an existing table: here adding a column, filling it from the `repos` table, making it required, then dropping the old text column. Lesson 4.11 automates these changes with migrations.
+- `ALTER TABLE` changes an existing table: here adding a column, filling it from the `repos` table, making it required, then dropping the old text column. Lesson 4.13 automates these changes with migrations.
 - `REFERENCES repos (id)` makes `repo_id` a **foreign key**: every value must exist as an `id` in `repos`. The database now refuses orphans:
 
 ```sql

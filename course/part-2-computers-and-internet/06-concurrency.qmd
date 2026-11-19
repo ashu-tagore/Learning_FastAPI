@@ -127,7 +127,7 @@ concurrent: 0.72 s
 
 ### The one rule of async
 
-**Never block inside `async def`.** A blocking call (`time.sleep`, the synchronous `httpx.Client`, a slow calculation) freezes the event loop, and every other task waits with it. Inside async code, use async libraries and `await`. This rule comes back with force in lesson 4.13, where blocking inside a FastAPI route can stall every user of your API.
+**Never block inside `async def`.** A blocking call (`time.sleep`, the synchronous `httpx.Client`, a slow calculation) freezes the event loop, and every other task waits with it. Inside async code, use async libraries and `await`. This rule comes back with force in lesson 4.17, where blocking inside a FastAPI route can stall every user of your API.
 
 ## In the project: concurrent labels
 

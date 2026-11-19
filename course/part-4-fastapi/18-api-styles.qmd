@@ -1,5 +1,5 @@
 ---
-title: "4.14 API styles: REST, GraphQL, gRPC and WebSockets"
+title: "4.18 API styles: REST, GraphQL, gRPC and WebSockets"
 description: "Compare the main ways programs talk over a network, know when each fits, and add a search-as-you-type WebSocket to Atlas."
 ---
 
@@ -18,7 +18,7 @@ Part 4 · Lesson 14 · About 75 minutes
 
 ### REST
 
-What Atlas has used all along: resources at URLs, HTTP methods as verbs, status codes for outcomes, JSON bodies (lessons 4.5 and 4.12). Strengths: simple, works with every tool (curl, browsers, caches, proxies), easy to secure and observe. Weaknesses: a screen may need several requests (user, then saved issues, then labels), or get more fields than it needs.
+What Atlas has used all along: resources at URLs, HTTP methods as verbs, status codes for outcomes, JSON bodies (lessons 4.6 and 4.14). Strengths: simple, works with every tool (curl, browsers, caches, proxies), easy to secure and observe. Weaknesses: a screen may need several requests (user, then saved issues, then labels), or get more fields than it needs.
 
 ### GraphQL
 
@@ -75,7 +75,7 @@ sequenceDiagram
 ```python
 @router.websocket("/live")
 async def search_as_you_type(websocket: WebSocket, repo: str = "pytorch/ignite") -> None:
-    """One open connection; each message is a query, each reply the top five hits (lesson 4.14).
+    """One open connection; each message is a query, each reply the top five hits (lesson 4.18).
 
     Compared with calling GET /search on every keystroke, the connection (and its TCP and
     TLS handshakes) is set up once, and the server could push updates without being asked.
@@ -175,7 +175,7 @@ SSE: data flows only from server to client, SSE is a normal HTTP response (works
 Send a blank message (`"   "`) over the socket. What comes back? Then send `"engine"` twice and confirm the replies are identical.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-A blank query is stripped to `""` and answered immediately with `{"query": "", "items": []}`, without touching the database. Two `"engine"` messages give identical replies: the index hasn't changed between them. The reference test `test_search_as_you_type` (lesson 4.15) checks the blank case and a real query.
+A blank query is stripped to `""` and answered immediately with `{"query": "", "items": []}`, without touching the database. Two `"engine"` messages give identical replies: the index hasn't changed between them. The reference test `test_search_as_you_type` (lesson 4.19) checks the blank case and a real query.
 :::
 
 ## Stretch

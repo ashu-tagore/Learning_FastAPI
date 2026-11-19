@@ -4,6 +4,11 @@ Newest first. Each entry: the decision, why, and what was rejected. Superseded e
 
 ---
 
+### D22. Depth pass: Part 4 grows to 20 lessons; Part 7 designed in depth (2026-11-18)
+**Decision:** lessons start from a reproduced failure, are test-first from 4.5, and security lessons carry out the attack before the defence. Part 4 is renumbered: new 4.5 (testing basics); old 4.8 splits into 4.9 and 4.10; old 4.12 splits into 4.14, 4.15 (observability, new) and 4.16; the rest shift (old 4.13 to 4.17, 4.14 to 4.18, 4.15 to 4.19, 4.16 to 4.20). The curriculum totals 100 lessons. Part 7's lesson specs are fixed in [08-depth-pass.md](08-depth-pass.md) and written in M7. Lesson numbers in D16 and D17 refer to the old numbering (4.13 is now 4.17; 4.8 is now 4.9 and 4.10).
+**Why:** the course aims at the depth of the best single-project backend books; Part 4 stated answers before learners met the problem.
+**Rejected:** deepening in place without splitting (lessons of three hours); adding deep-dive lessons beside unchanged ones (two styles in one part).
+
 ### D21. Migrations live inside the package and start from Part 3's schema (2026-11-18)
 **Decision:** Alembic's scripts live in `src/atlas/migrations/`. Revision 0001 is the Part 3 schema, 0002 the Part 4 tables, 0003 indexes; `atlas init-db` runs `upgrade head`. Existing Part 3 databases adopt migrations with `alembic stamp 0001`. Revision ids are renamed to sequential numbers. CI runs upgrade, downgrade, upgrade and `alembic check` on an empty database.
 **Why:** the CLI and the Docker image can find the migrations wherever Atlas is installed; learners keep the data they indexed in Part 3; sequential ids read in order.

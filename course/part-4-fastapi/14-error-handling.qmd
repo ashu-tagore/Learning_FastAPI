@@ -1,10 +1,14 @@
 ---
-title: "4.12 Errors, middleware, CORS and API conventions"
+title: "4.14 Errors, middleware, CORS and API conventions"
 description: "Give every error one predictable shape, trace requests with ids in middleware, allow browser origins with CORS, and make POST safe to retry with idempotency keys."
 ---
 
 ::: {.lesson-meta}
 Part 4 · Lesson 12 · About 90 minutes
+:::
+
+::: {.callout-warning title="Being restructured"}
+This lesson is being split by the [depth pass](https://github.com/ashu-tagore/Learning_FastAPI/blob/main/docs/context/08-depth-pass.md). Until then it also covers lessons 4.15 (request ids, logging) and 4.16 (CORS, idempotency keys).
 :::
 
 ::: {.callout-note title="Analogy: a parcel service's habits"}

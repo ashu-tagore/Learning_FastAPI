@@ -252,7 +252,7 @@ def run_commits(args: argparse.Namespace) -> int:
 
 
 def run_init_db() -> int:
-    """Bring the database schema up to date by running every pending migration (lesson 4.11)."""
+    """Bring the database schema up to date by running every pending migration (lesson 4.13)."""
     url = database_url()
     if url is None:
         return 1 if open_database() is None else 0

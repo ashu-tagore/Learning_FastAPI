@@ -1,5 +1,5 @@
 ---
-title: "4.9 Relationships and authorisation"
+title: "4.11 Relationships and authorisation"
 description: "Model a many-to-many 'saved issues' relationship, enforce who may do what with role and ownership checks, and answer 401, 403 and 404 correctly."
 ---
 
@@ -21,7 +21,7 @@ A user can save many issues, and an issue can be saved by many users: a **many-t
 
 ### Authorisation checks
 
-After authentication (lesson 4.7) every request has a user. Authorisation decides what that user may do. Two common forms:
+After authentication (lesson 4.8) every request has a user. Authorisation decides what that user may do. Two common forms:
 
 - **Role-based**: "only admins may add repositories". Check the user's role.
 - **Ownership-based**: "you may edit only your own notes". Check the row's owner. The cleanest way is to put the owner into the query itself: `WHERE id = :note_id AND user_id = :me`. A row that isn't yours is simply not found.
@@ -112,7 +112,7 @@ def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[IssueOut]:
     return [issue_out(issue) for issue in session.scalars(statement)]
 ```
 
-`saved_issues.c.user_id` is how you refer to a column of a plain `Table` (`c` for columns). `selectinload` is explained in lesson 4.10.
+`saved_issues.c.user_id` is how you refer to a column of a plain `Table` (`c` for columns). `selectinload` is explained in lesson 4.12.
 
 ### Admin-only routes: a role dependency
 
@@ -145,7 +145,7 @@ def add_repo(body: RepoCreate, admin: AdminUser, session: SessionDep, ...) -> JS
     ...
 ```
 
-(The full version also handles idempotency keys, lesson 4.12.) A regular user, then the same user after `atlas make-admin`:
+(The full version also handles idempotency keys, lesson 4.16.) A regular user, then the same user after `atlas make-admin`:
 
 ```text
 $ curl -s -X POST http://localhost:8000/repos -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"full_name\": \"sktime/sktime\"}"
@@ -191,7 +191,7 @@ Saving is idempotent: doing it twice has the same effect as once. PUT promises t
 Write a test (or a curl session) showing that user B can't see user A's saved issues: A saves issue 1; B lists their saved issues.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-B's list is `[]`. The query filters by `saved_issues.c.user_id == user.id`, and `user` comes from B's token. The reference test `test_saving_is_idempotent_and_private` (lesson 4.15) does exactly this.
+B's list is `[]`. The query filters by `saved_issues.c.user_id == user.id`, and `user` comes from B's token. The reference test `test_saving_is_idempotent_and_private` (lesson 4.5) does exactly this.
 :::
 
 ## Stretch

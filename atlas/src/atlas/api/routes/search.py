@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from atlas.api.deps import SessionDep
-from atlas.api.schemas import SearchHit, SearchPage
+from atlas.api.schemas import RepoFullName, SearchHit, SearchPage
 from atlas.storage import chunk_search_statement, hit_from_row
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/search", tags=["search"])
 async def search(
     session: SessionDep,
     q: Annotated[str, Query(min_length=1, max_length=200, description="Words to look for")],
-    repo: str = "pytorch/ignite",
+    repo: Annotated[RepoFullName, Query()] = "pytorch/ignite",
     kind: Literal["code", "doc"] | None = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
     offset: Annotated[int, Query(ge=0, le=1000)] = 0,
@@ -37,7 +37,7 @@ async def search(
 
 @router.websocket("/live")
 async def search_as_you_type(websocket: WebSocket, repo: str = "pytorch/ignite") -> None:
-    """One open connection; each message is a query, each reply the top five hits (lesson 4.14).
+    """One open connection; each message is a query, each reply the top five hits (lesson 4.18).
 
     Compared with calling GET /search on every keystroke, the connection (and its TCP and
     TLS handshakes) is set up once, and the server could push updates without being asked.

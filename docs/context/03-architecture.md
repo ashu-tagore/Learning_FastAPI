@@ -26,7 +26,7 @@ flowchart LR
 
 | Component | Responsibility | Why separate |
 |---|---|---|
-| API service | HTTP, auth, validation, search, Q&A streaming, run control. Async (FastAPI + async SQLAlchemy) from lesson 4.13 | Must answer in well under a second |
+| API service | HTTP, auth, validation, search, Q&A streaming, run control. Async (FastAPI + async SQLAlchemy) from lesson 4.17 | Must answer in well under a second |
 | Worker | GitHub sync, cloning, parsing, chunking, embedding | Jobs take seconds to minutes and must retry safely |
 | Agent worker | Executes agent runs step by step | Runs take minutes, pause for approval, and need sandbox access the API must never have |
 | Sandbox | Runs untrusted generated code | Isolation: no network, no secrets, hard resource limits |

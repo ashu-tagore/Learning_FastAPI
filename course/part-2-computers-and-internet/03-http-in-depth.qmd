@@ -108,7 +108,7 @@ The rule of thumb: if the client can fix it by changing the request, it's a 4xx.
 |---|---|---|
 | `Content-Type` | both | format of the body: `application/json`, `text/html` |
 | `Accept` | request | formats the client wants back |
-| `Authorization` | request | credentials, e.g. `Bearer <token>` (lessons 2.5 and 4.7) |
+| `Authorization` | request | credentials, e.g. `Bearer <token>` (lessons 2.5 and 4.8) |
 | `User-Agent` | request | which program is calling; GitHub rejects requests without one |
 | `ETag` | response | a fingerprint of the response, for caching (lesson 5.3) |
 | `Cache-Control` | response | how long the response may be reused |

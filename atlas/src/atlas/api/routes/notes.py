@@ -1,4 +1,4 @@
-"""Private notes on issues (the review lesson's unguided build, 4.16).
+"""Private notes on issues (the review lesson's unguided build, 4.20).
 
 A note points at repository + issue number rather than at the issue row, so it survives
 the issue closing and being removed from the issues table (lesson 3.4's stretch).

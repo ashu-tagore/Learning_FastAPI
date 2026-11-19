@@ -1,5 +1,5 @@
 ---
-title: "4.11 Migrations with Alembic"
+title: "4.13 Migrations with Alembic"
 description: "Change a live database schema safely with versioned Alembic migrations: autogenerate, review, upgrade, downgrade, and adopt an existing database."
 ---
 
@@ -92,7 +92,7 @@ $ uv run alembic history
 
 ### Making a migration: the 0003 story
 
-Signing out everywhere (lesson 4.8) runs `UPDATE refresh_tokens ... WHERE user_id = ...`, and listing notes (lesson 4.16) filters by user, repository and issue. Postgres doesn't index foreign keys automatically (lesson 3.6), so both would scan whole tables as they grow. The fix in `models.py`: `index=True` on `RefreshToken.user_id`, and an `Index("ix_issue_notes_user_issue", "user_id", "repo_id", "issue_number")` on `IssueNote`. Then:
+Signing out everywhere (lesson 4.10) runs `UPDATE refresh_tokens ... WHERE user_id = ...`, and listing notes (lesson 4.20) filters by user, repository and issue. Postgres doesn't index foreign keys automatically (lesson 3.6), so both would scan whole tables as they grow. The fix in `models.py`: `index=True` on `RefreshToken.user_id`, and an `Index("ix_issue_notes_user_issue", "user_id", "repo_id", "issue_number")` on `IssueNote`. Then:
 
 ```text
 $ uv run alembic revision --autogenerate -m "index foreign keys used by queries"
@@ -163,7 +163,7 @@ No new upgrade operations detected.
 
 ```python
 def run_init_db() -> int:
-    """Bring the database schema up to date by running every pending migration (lesson 4.11)."""
+    """Bring the database schema up to date by running every pending migration (lesson 4.13)."""
     url = database_url()
     ...
     config = AlembicConfig()

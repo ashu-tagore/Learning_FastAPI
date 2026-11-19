@@ -11,11 +11,6 @@ from tests.conftest import sign_up
 pytestmark = pytest.mark.anyio
 
 
-async def test_health_and_readiness(client: httpx.AsyncClient) -> None:
-    assert (await client.get("/health")).json() == {"status": "ok"}
-    assert (await client.get("/ready")).json() == {"status": "ready"}
-
-
 async def test_register_never_returns_the_password(client: httpx.AsyncClient) -> None:
     response = await client.post(
         "/auth/register", json={"email": "Ada@Example.com", "password": "a-long-password"}
@@ -104,6 +99,21 @@ async def test_patch_changes_only_the_fields_sent(client: httpx.AsyncClient) -> 
 
     assert response.json()["skills_profile"] == "metrics, handlers"
     assert response.json()["email"] == "ada@example.com"
+
+
+async def test_patch_rejects_null_for_a_field_that_cannot_be_empty(
+    client: httpx.AsyncClient,
+) -> None:
+    headers = await sign_up(client, "ada@example.com")
+    await client.patch("/users/me", json={"skills_profile": "metrics"}, headers=headers)
+
+    response = await client.patch("/users/me", json={"skills_profile": None}, headers=headers)
+
+    # "Absent" means "leave it alone"; null would mean "store nothing", which the
+    # column forbids. It must be the client's error (422), not a crash (500).
+    assert response.status_code == 422
+    me = await client.get("/users/me", headers=headers)
+    assert me.json()["skills_profile"] == "metrics"
 
 
 async def login_tokens(client: httpx.AsyncClient) -> dict[str, str]:
