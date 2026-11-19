@@ -276,6 +276,7 @@ import boto3  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from atlas.config import Settings  # noqa: E402
+from atlas.events import EventStream  # noqa: E402
 from atlas.jobs import WorkerContext  # noqa: E402
 from atlas.snapshots import S3_CONFIG, SnapshotStore  # noqa: E402
 from tests.fake_github import FakeIssueTracker  # noqa: E402
@@ -353,5 +354,10 @@ def worker(
     with engine.connect() as connection:
         transaction = connection.begin()
         factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
-        yield WorkerContext(factory, queue, settings, snapshot_store, issue_tracker.transport())
+        events = EventStream(queue.client, name=f"test-events-{uuid.uuid4().hex}")
+        context = WorkerContext(
+            factory, queue, settings, snapshot_store, events, issue_tracker.transport()
+        )
+        yield context
+        events.client.delete(events.name)
         transaction.rollback()

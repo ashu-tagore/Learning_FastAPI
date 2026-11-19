@@ -8,7 +8,8 @@ repos ──< documents ──< chunks
 users ──< refresh_tokens
   ├──< saved_issues >── issues
   ├──< issue_notes             (point at repo + issue number, so they survive an issue closing)
-  └──< idempotency_keys
+  ├──< idempotency_keys
+  └──< notifications           (also by repo name + number: the issue may be gone)
 """
 
 from datetime import datetime
@@ -256,3 +257,26 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Notification(Base):
+    """Something a user should know about an issue they saved (lesson 5.6)."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        # One notification per user per change, however often the event is delivered.
+        UniqueConstraint("user_id", "event_key"),
+        CheckConstraint("change IN ('relabelled', 'closed')", name="notifications_change_valid"),
+        # Serves "my newest notifications", the query behind GET /notifications.
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    repo_full_name: Mapped[str] = mapped_column(String(200))
+    issue_number: Mapped[int]
+    title: Mapped[str] = mapped_column(String(500))
+    change: Mapped[str] = mapped_column(String(20))
+    labels: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    event_key: Mapped[str] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

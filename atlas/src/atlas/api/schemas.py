@@ -113,6 +113,18 @@ class SnapshotOut(BaseModel):
     expires_at: datetime
 
 
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    repo_full_name: str
+    issue_number: int
+    title: str
+    change: Literal["relabelled", "closed"]
+    labels: list[str]
+    created_at: datetime
+
+
 # ---------- Background jobs ----------
 
 

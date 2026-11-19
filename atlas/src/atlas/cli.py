@@ -12,6 +12,7 @@ atlas worker
 atlas scheduler
 atlas sync pytorch/ignite
 atlas jobs
+atlas notifier
 """
 
 import argparse
@@ -32,11 +33,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from atlas import issue_cache, storage, worker
 from atlas.config import Settings
+from atlas.events import EventStream
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
 from atlas.jobs import WorkerContext, create_job
 from atlas.logs import configure_logging
 from atlas.models import Job, Repo, User
+from atlas.notifier import run_notifier as run_notifier_loop
 from atlas.queue import RedisQueue
 from atlas.search import DEFAULT_EXTENSIONS, search
 from atlas.snapshots import SnapshotStore, make_s3_client
@@ -107,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("worker", help="run background jobs from the queue")
     commands.add_parser("scheduler", help="queue a sync of every repository, periodically")
+    commands.add_parser("notifier", help="turn issue events into users' notifications")
 
     sync_parser = commands.add_parser("sync", help="queue a sync of one repository now")
     sync_parser.add_argument("repo", help="owner/name of a tracked repository")
@@ -340,9 +344,10 @@ def worker_context() -> WorkerContext | None:
         open_database()  # prints the explanation
         return None
     factory = sessionmaker(create_engine(settings.database_url))
-    queue = RedisQueue(redis.Redis.from_url(settings.redis_url))
+    redis_client = redis.Redis.from_url(settings.redis_url)
     snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
-    return WorkerContext(factory, queue, settings, snapshots)
+    events = EventStream(redis_client)
+    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events)
 
 
 def run_worker() -> int:
@@ -361,6 +366,15 @@ def run_scheduler() -> int:
         return 1
     configure_logging()
     worker.run_scheduler(ctx, worker.stop_on_signals())
+    return 0
+
+
+def run_notifier() -> int:
+    ctx = worker_context()
+    if ctx is None:
+        return 1
+    configure_logging()
+    run_notifier_loop(ctx.session_factory, ctx.events, worker.stop_on_signals())
     return 0
 
 
@@ -454,6 +468,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_worker()
     if args.command == "scheduler":
         return run_scheduler()
+    if args.command == "notifier":
+        return run_notifier()
     if args.command == "sync":
         return run_sync(args)
     if args.command == "jobs":

@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from atlas import github, gitrepo, storage
 from atlas.config import Settings
+from atlas.events import EventStream
 from atlas.models import Job, Repo
 from atlas.queue import JobQueue
 from atlas.snapshots import SnapshotStore
@@ -45,6 +46,7 @@ class WorkerContext:
     queue: JobQueue
     settings: Settings
     snapshots: SnapshotStore
+    events: EventStream
     github_transport: httpx.AsyncBaseTransport | None = None
 
 
@@ -183,7 +185,7 @@ def _run_handler(ctx: WorkerContext, session: Session, job: Job) -> None:
     if job.kind == "snapshot_repo":
         snapshot_repo(repo, ctx.settings, ctx.snapshots)
         return
-    sync_issues(session, repo, ctx.settings, ctx.github_transport)
+    sync_issues(session, repo, ctx.settings, ctx.events, ctx.github_transport)
 
 
 def sync_repo(session: Session, repo: Repo, settings: Settings) -> storage.IndexSummary:
@@ -232,9 +234,10 @@ def sync_issues(
     session: Session,
     repo: Repo,
     settings: Settings,
+    events: EventStream,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> github.IssueChanges:
-    """Fetch only the issues that changed since the last poll, and apply them."""
+    """Fetch only the issues that changed since the last poll, apply them, and announce them."""
     token = settings.github_token.get_secret_value() if settings.github_token else None
     changes = asyncio.run(
         github.fetch_issue_changes(
@@ -248,9 +251,17 @@ def sync_issues(
     if changes.not_modified:
         return changes
 
-    storage.apply_issue_changes(
-        session, repo.full_name, changes.open_issues, changes.closed_numbers
+    # The poll is named by where it started. A retry of a failed job starts from the same
+    # watermark (the failed attempt's update was rolled back), so its events get the same
+    # keys and consumers ignore the copies.
+    poll = repo.issues_synced_until.isoformat() if repo.issues_synced_until else "first"
+    issue_events = storage.apply_issue_changes(
+        session, repo.full_name, changes.open_issues, changes.closed_numbers, poll=poll
     )
+    # Published before this job commits: the events describe what happened on GitHub,
+    # which is true whether or not Atlas's own write succeeds. If the commit fails, the
+    # retry publishes them again under the same keys.
+    events.publish(issue_events)
     repo.issues_etag = changes.etag
     repo.issues_synced_until = changes.newest_update
     return changes

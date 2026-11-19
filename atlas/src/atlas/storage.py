@@ -11,10 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import Row, Select, case, delete, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from atlas import github
-from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels
+from atlas.events import IssueEvent
+from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels, saved_issues
 from atlas.search import DEFAULT_EXTENSIONS, is_in_skipped_folder, iter_source_files
 
 DOC_EXTENSIONS = {".md", ".rst"}
@@ -212,8 +213,13 @@ def apply_issue_changes(
     repo_full_name: str,
     open_issues: list[github.Issue],
     closed_numbers: list[int],
-) -> None:
-    """Store new and updated open issues, and remove closed ones (lesson 5.3)."""
+    poll: str = "full",
+) -> list[IssueEvent]:
+    """Store new and updated open issues, remove closed ones, and say what changed.
+
+    `poll` names the GitHub poll these changes came from (lesson 5.6). A retry of the same
+    poll gives the same name, so the events it returns get the same keys.
+    """
     repo = get_or_create_repo(session, repo_full_name)
     labels_by_name = {
         label.name: label
@@ -221,16 +227,45 @@ def apply_issue_changes(
     }
     stored_by_number = {
         issue.number: issue
-        for issue in session.scalars(select(Issue).where(Issue.repo_id == repo.id))
+        for issue in session.scalars(
+            # selectinload: every stored issue's labels in one more query, not one each.
+            select(Issue).where(Issue.repo_id == repo.id).options(selectinload(Issue.labels))
+        )
     }
+    savers_by_issue_id: dict[int, list[int]] = {}
+    for issue_id, user_id in session.execute(
+        select(saved_issues.c.issue_id, saved_issues.c.user_id)
+        .join(Issue, Issue.id == saved_issues.c.issue_id)
+        .where(Issue.repo_id == repo.id)
+    ):
+        savers_by_issue_id.setdefault(issue_id, []).append(user_id)
+
+    events: list[IssueEvent] = []
+
+    def record(row: Issue, change: str, labels: list[str]) -> None:
+        events.append(
+            IssueEvent(
+                repo=repo_full_name,
+                number=row.number,
+                title=row.title,
+                change=change,
+                labels=labels,
+                saved_by=sorted(savers_by_issue_id.get(row.id, [])),
+                key=f"{repo_full_name}#{row.number}:{change}:{poll}",
+            )
+        )
 
     for number in closed_numbers:
         stored = stored_by_number.get(number)
         if stored is not None:
+            # Recorded before the delete, while who saved it is still known.
+            record(stored, "closed", sorted(label.name for label in stored.labels))
             session.delete(stored)
 
     for fetched in open_issues:
         row = stored_by_number.get(fetched.number)
+        is_new = row is None
+        old_labels = set() if row is None else {label.name for label in row.labels}
         if row is None:
             row = Issue(repo_id=repo.id, number=fetched.number)
             session.add(row)
@@ -244,7 +279,14 @@ def apply_issue_changes(
             _get_or_create_label(session, repo, labels_by_name, name) for name in fetched.labels
         ]
 
+        new_labels = sorted(fetched.labels)
+        if is_new:
+            record(row, "opened", new_labels)
+        elif old_labels != set(new_labels):
+            record(row, "relabelled", new_labels)
+
     session.flush()
+    return events
 
 
 def _get_or_create_label(
