@@ -43,6 +43,13 @@ The code is written for human brains. A reader can hold about four things in wor
 - **Original code only.** Never copy code from other courses or projects; write it fresh.
 - Python 3.13 for `atlas/`; type hints everywhere; `ruff` for lint and format; `mypy` for types.
 
+## API rules
+
+- Input is parsed at the edge into domain types (`Email`, `RepoFullName`, `IssueCursor`); routes don't re-check it. Request schemas use `REQUEST_BODY` (`extra="forbid"`).
+- Routes raise `ApiError(status, code, message)`. Codes are a contract: never change one's meaning, add a new one instead. Every error, the framework's included, has the shape `{"error": {code, message, request_id, details?}}`.
+- Logs go through `logging` (never `print`) as JSON lines via `atlas.logs`, and carry the request id. Never log passwords, tokens, keys, request or response bodies, or query strings.
+- The user id comes from the token, never from the URL or body.
+
 ## Lesson template
 
 Every lesson file is `course/part-P-<slug>/NN-<slug>.qmd`. After adding one, run `python3 course/_tools/generate_part_pages.py` to update the part page and sidebar (never edit those by hand):

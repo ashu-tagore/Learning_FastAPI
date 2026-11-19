@@ -50,7 +50,7 @@ The curriculum grows from 96 to 100 lessons. Parts 5, 6, 8 and 9 keep their numb
 
 ### Reference code changes (ship with the lessons)
 
-- `api/schemas.py`: domain types as `Annotated` Pydantic types; email normalised in the type, not in routes. (Done in block 1, which also found and fixed two real bugs: startup errors printed secrets, and `PATCH /users/me` with `null` answered 500. Block 2 (4.6 to 4.10) found a third: the API started with a guessable signing key, which let a forged token sign in as any user; it now requires 32 characters.)
+- `api/schemas.py`: domain types as `Annotated` Pydantic types; email normalised in the type, not in routes. (Done in block 1, which also found and fixed two real bugs: startup errors printed secrets, and `PATCH /users/me` with `null` answered 500. Block 2 (4.6 to 4.10) found a third: the API started with a guessable signing key, which let a forged token sign in as any user; it now requires 32 characters. Block 3 (4.11 to 4.15) found four more: unknown routes and 405s bypassed the error format, 500s lacked the `X-Request-ID` header, unknown request fields were silently ignored, and logs could not be searched by request id.)
 - Error handling: a small set of domain exceptions with a stable code and status, mapped once in `app.py`. Kept as one module; no per-resource exception classes.
 - New `atlas/logging.py`: JSON log formatter and a request-id context variable; request log line with method, path, status and duration.
 - Tests: synchronous API fixtures shown in 4.5 (kept in the lesson, converted in 4.17); new tests for every "Attack it" (alg none, mass assignment, IDOR, foreign origin, replayed refresh token); a lazy-load regression test using a fresh session.
