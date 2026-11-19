@@ -4,6 +4,8 @@ Nothing else in Atlas reads os.environ. Each setting is typed and validated here
 so a missing or malformed value fails at startup with a clear message.
 """
 
+from pathlib import Path
+
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,6 +20,14 @@ class Settings(BaseSettings):
     database_url: str | None = None
     # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
     github_token: SecretStr | None = None
+    # The job queue (lesson 5.1).
+    redis_url: str = "redis://localhost:6379/0"
+    # Where the worker keeps its clones of tracked repositories (lesson 5.1).
+    repos_dir: Path = Path.home() / ".cache" / "atlas" / "repos"
+    # Clones come from here; tests point it at local repositories instead of GitHub.
+    git_base_url: str = "https://github.com"
+    # How often the scheduler queues a sync of every repository (lesson 5.2).
+    sync_interval_minutes: int = 15
 
 
 class ApiSettings(Settings):
@@ -36,3 +46,5 @@ class ApiSettings(Settings):
     github_client_secret: SecretStr | None = None
     # Where the ready-made web interface lives on disk; unset to serve the API only.
     web_dir: str | None = None
+    # Shared with GitHub when creating the webhook (lesson 5.2). Unset disables the route.
+    github_webhook_secret: SecretStr | None = None
