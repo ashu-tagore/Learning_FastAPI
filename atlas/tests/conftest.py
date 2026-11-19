@@ -164,3 +164,49 @@ async def sign_up(
     await client.post("/auth/register", json={"email": email, "password": password})
     response = await client.post("/auth/login", data={"username": email, "password": password})
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+# ---------- Redis fixtures (lesson 5.1) ----------
+
+import uuid  # noqa: E402
+
+import redis  # noqa: E402
+
+from atlas.queue import RedisQueue  # noqa: E402
+
+
+@pytest.fixture
+def redis_client() -> Iterator[redis.Redis]:
+    url = os.environ.get("TEST_REDIS_URL")
+    if url is None:
+        pytest.skip("set TEST_REDIS_URL to run queue tests (see lesson 5.1)")
+    client = redis.Redis.from_url(url, decode_responses=True)
+    yield client
+    client.close()
+
+
+class FakeClock:
+    """A clock tests move by hand, so timeouts can pass without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def queue(redis_client: redis.Redis, clock: FakeClock) -> Iterator[RedisQueue]:
+    """A queue under a name no other test uses; its keys are deleted afterwards."""
+    name = f"test-jobs-{uuid.uuid4().hex}"
+    yield RedisQueue(redis_client, name=name, visibility_timeout=60, clock=clock)
+    for key in redis_client.scan_iter(f"{name}:*"):
+        redis_client.delete(key)

@@ -102,7 +102,7 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 | 5.1 | Queues and workers: at-least-once delivery, idempotency, retries, dead letters | Worker + Redis queue |
 | 5.2 | Scheduling and webhooks: cron, GitHub webhooks, HMAC signature checks | Scheduled sync, webhook route |
 | 5.3 | Syncing with GitHub properly: conditional requests, rate limits, incremental sync by commit | Incremental sync |
-| 5.4 | Object storage with the S3 API (MinIO locally) | Repo snapshots |
+| 5.4 | Object storage with the S3 API (SeaweedFS locally) | Repo snapshots |
 | 5.5 | Caching and rate limiting with Redis | Cache, per-user limits |
 | 5.6 | Publish/subscribe and event streams: Redis Streams, Kafka concepts, consumer groups | `issue.updated` events |
 | 5.7 | Review and practice | Unguided: a daily digest job |

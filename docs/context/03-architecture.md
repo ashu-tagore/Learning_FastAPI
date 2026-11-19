@@ -15,7 +15,7 @@ flowchart LR
   Q --> W[Worker<br/>sync, ingest, embed]
   Q --> AW[Agent worker<br/>agent runs]
   W --> GHAPI[GitHub REST API<br/>read-only token]
-  W --> OS[(Object storage<br/>MinIO locally, S3 on AWS)]
+  W --> OS[(Object storage<br/>SeaweedFS locally, S3 on AWS)]
   W --> PG
   W --> LLM[LLM + embedding providers]
   AW --> PG
@@ -162,7 +162,7 @@ erDiagram
 
 ## Local development stack
 
-`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `minio`, and optionally `ollama`. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
+`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage), and optionally `ollama`. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
 
 ## AWS deployment
 
