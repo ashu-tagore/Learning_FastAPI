@@ -26,12 +26,14 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 ```bash
 cd atlas && docker compose up -d                           # local Postgres (Part 3 onward)
 export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
-export TEST_REDIS_URL=redis://localhost:6379/15             # queue tests (Part 5 onward)
-cd atlas && uv sync && uv run pytest                       # reference tests (DB and Redis tests skip without their URLs)
+export TEST_REDIS_URL=redis://localhost:6379/15             # queue, cache, stream tests (Part 5 onward)
+export TEST_S3_URL=http://localhost:8333                   # object storage tests (lesson 5.4; SeaweedFS from compose)
+cd atlas && uv sync && uv run pytest                       # reference tests (DB, Redis and S3 tests skip without their URLs)
 cd atlas && uv run atlas init-db                           # run migrations (needs DATABASE_URL)
 cd atlas && uv run alembic revision --autogenerate -m "..."  # new migration; review it, rename the revision to the next number
 cd atlas && SECRET_KEY=dev-only-key-at-least-32-characters-long WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload --no-access-log  # API + web UI at /app; JSON request logs (lesson 4.15)
-cd atlas && uv run atlas worker                            # background jobs (lesson 5.1); `atlas scheduler` queues syncs (5.2)
+cd atlas && S3_ENDPOINT_URL=http://localhost:8333 AWS_ACCESS_KEY_ID=atlas AWS_SECRET_ACCESS_KEY=atlas-dev-secret-key uv run atlas worker  # background jobs (5.1, snapshots 5.4)
+cd atlas && uv run atlas scheduler                         # queues syncs and snapshots (5.2); `atlas notifier` (5.6); `atlas digest` (5.7)
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)

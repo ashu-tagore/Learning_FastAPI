@@ -14,4 +14,4 @@ title: "Part 5: Background work and integrations"
 | 5.4 | [Object storage with the S3 API (SeaweedFS locally)](04-object-storage.qmd) | Repo snapshots |
 | 5.5 | [Caching and rate limiting with Redis](05-caching-and-rate-limiting.qmd) | Cache, per-user limits |
 | 5.6 | [Publish/subscribe and event streams: Redis Streams, Kafka concepts, consumer groups](06-event-streams.qmd) | `issue.updated` events |
-| 5.7 | Review and practice *(coming soon)* | Unguided: a daily digest job |
+| 5.7 | [Review and practice](07-review-and-practice.qmd) | Unguided: a daily digest job |

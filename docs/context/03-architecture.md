@@ -31,9 +31,11 @@ flowchart LR
 | Agent worker | Executes agent runs step by step | Runs take minutes, pause for approval, and need sandbox access the API must never have |
 | Sandbox | Runs untrusted generated code | Isolation: no network, no secrets, hard resource limits |
 | Postgres | All durable state, full-text search, vectors (pgvector) | One database keeps the course simpler than adding a vector DB |
-| Redis | Local queue, cache, rate limits | Fast shared state between processes |
+| Scheduler and notifier | `atlas scheduler` queues syncs; `atlas notifier` turns `issue.updated` stream events into notifications | Small loops with one job each; safe to duplicate |
+| Redis | Local queue, search cache, rate limits, the `issue.updated` event stream | Fast shared state between processes |
+| Object storage | Repository snapshots (`snapshots/<repo>/<commit>.tar.gz`), downloaded through presigned links | Large immutable files don't belong in Postgres or pass through the API |
 
-The queue carries only a job id; the job's kind, repository, status, attempts and last error live in the Postgres `jobs` table. This makes jobs idempotent and inspectable (lessons 5.1 to 5.3, decision D26).
+The queue carries only a job id; the job's kind, repository, status, attempts and last error live in the Postgres `jobs` table. This makes jobs idempotent and inspectable (lessons 5.1 to 5.3, decision D26). Events are different from jobs: the issues sync publishes `issue.updated` to a Redis Stream, and each feature that cares reads it with its own consumer group (lesson 5.6, decision D27).
 
 ## LLM and embedding providers
 
@@ -162,7 +164,7 @@ erDiagram
 
 ## Local development stack
 
-`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage), and optionally `ollama`. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
+`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage, `weed mini`), and optionally `ollama`. (At checkpoint 5, compose runs the services only: `postgres`, `redis` and `seaweedfs`; the Atlas processes run from the command line until Part 7 containerises them.) Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
 
 ## AWS deployment
 

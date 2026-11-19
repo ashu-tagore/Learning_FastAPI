@@ -84,6 +84,7 @@ website:
           - part-5-background-work/04-object-storage.qmd
           - part-5-background-work/05-caching-and-rate-limiting.qmd
           - part-5-background-work/06-event-streams.qmd
+          - part-5-background-work/07-review-and-practice.qmd
       - section: "Part 6: AI engineering: Atlas"
         href: part-6-atlas-rag/index.qmd
         contents:

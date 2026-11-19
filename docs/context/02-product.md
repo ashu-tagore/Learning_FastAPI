@@ -77,7 +77,9 @@ All JSON unless noted. Auth is a bearer JWT except where marked public.
 | Area | Endpoints |
 |---|---|
 | Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `GET /auth/github/login`, `GET /auth/github/callback`, `GET /users/me`, `PATCH /users/me` (skills profile) |
-| Repositories | `GET /repos`, `POST /repos` (admin), `GET /repos/{id}`, `POST /repos/{id}/sync` (admin) |
+| Repositories | `GET /repos`, `POST /repos` (admin), `GET /repos/{id}`, `POST /repos/{id}/sync` (admin), `GET /repos/{id}/snapshot` (presigned download link) |
+| Jobs | `GET /jobs/{id}` |
+| Notifications | `GET /notifications` (changes to saved issues), `GET /digests/latest` (daily digest) |
 | Issues | `GET /issues?repo=&label=&state=&sort=fit`, `GET /issues/{id}`, `PUT /issues/{id}/saved`, `DELETE /issues/{id}/saved` |
 | Search | `GET /search?q=&repo=&mode=keyword\|semantic\|hybrid&limit=` |
 | Ask | `POST /ask` (Server-Sent Events stream), `GET /conversations`, `GET /conversations/{id}`, `POST /answers/{id}/feedback` |

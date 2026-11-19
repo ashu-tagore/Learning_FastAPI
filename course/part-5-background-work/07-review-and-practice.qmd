@@ -1,0 +1,312 @@
+---
+title: "5.7 Review and practice"
+description: "Pull Part 5 together, practise across it, review three planted reliability bugs (two of which no existing test caught), and build a daily digest on your own from a spec and acceptance tests."
+---
+
+::: {.lesson-meta}
+Part 5 · Lesson 7 · About 4 hours
+:::
+
+## Recap
+
+Atlas now works while nobody is watching. Start everything:
+
+```bash
+cd atlas && docker compose up -d
+```
+
+```bash
+uv run atlas init-db
+```
+
+Then, each in its own terminal (or as separate containers in Part 7), after exporting the local object storage settings in that terminal. boto3 reads its credentials from the environment, not from `.env`, and both the worker (uploading) and the API (signing links) need them:
+
+```bash
+export S3_ENDPOINT_URL=http://localhost:8333 AWS_ACCESS_KEY_ID=atlas AWS_SECRET_ACCESS_KEY=atlas-dev-secret-key
+```
+
+```bash
+SECRET_KEY=dev-only-key-at-least-32-characters-long WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --no-access-log
+```
+
+```bash
+uv run atlas worker
+```
+
+```bash
+uv run atlas scheduler
+```
+
+```bash
+uv run atlas notifier
+```
+
+An admin adds a repository; the scheduler queues its syncs; the worker clones, indexes, fetches issues and stores a snapshot; changes to saved issues reach their readers through the event stream; and searches are cached and rate-limited.
+
+| Idea | One line | Lesson |
+|---|---|---|
+| Queues and workers | Messages carry ids; acknowledge after the work; at least once, so jobs are idempotent | [5.1](01-queues-and-workers.qmd) |
+| Retries and dead jobs | Full-jitter backoff, five attempts, then a person; a lease for running jobs | [5.1](01-queues-and-workers.qmd) |
+| Scheduling | A scheduler only queues; a sweeper re-sends jobs that never started | [5.2](02-scheduling-and-webhooks.qmd) |
+| Webhooks | HMAC over the raw body, compared in constant time; answer fast, queue the work | [5.2](02-scheduling-and-webhooks.qmd) |
+| Uniqueness | A partial unique index, not check-then-insert; commit, then send | [5.2](02-scheduling-and-webhooks.qmd) |
+| Incremental sync | Watermarks from the data's clock; ETags make unchanged polls free; diff by commit | [5.3](03-syncing-with-github.qmd) |
+| Rate limits from others | Wait until the reset; it isn't the job's fault | [5.3](03-syncing-with-github.qmd) |
+| Object storage | Immutable keys by commit; stream uploads; short presigned links signed with SigV4 | [5.4](04-object-storage.qmd) |
+| Caching | Measure first; versioned keys never go stale | [5.5](05-caching-and-rate-limiting.qmd) |
+| Rate limits of our own | A sliding window log in Redis, shared by every process; fail open where availability matters | [5.5](05-caching-and-rate-limiting.qmd) |
+| Event streams | Streams keep what pub/sub drops; one group per feature; keys make consumers idempotent | [5.6](06-event-streams.qmd) |
+
+Part 5 also found more real bugs in Atlas than any part before it, each now a test: a worker crashing on an empty queue (5.1), a link signed with a deprecated scheme (5.4), an `INSERT` that failed on its eleventh run (5.5), a "don't wait" that waited forever (5.6), and a search that was slow for want of `ANALYZE` (5.5). Most of them only appeared when the code ran against the real service, for real, more than once.
+
+## Mixed practice
+
+No step-by-step hints; each relates to several lessons.
+
+1. **Dead jobs, visible.** Add `GET /jobs?status=dead` (admins only), newest first. Which index would serve it once the table is large, and should it be partial?
+2. **One more event.** Publish an event when a repository's code sync finds new commits (`repo.indexed`), and make the cache key's version come from that instead of a database read. What does this trade away?
+3. **A slower GitHub.** In `FakeIssueTracker`, make every response take 3 seconds (`time.sleep` in the handler). What does `sync_issues` do with httpx's 10-second timeout? With 15 seconds? Where should the timeout live, and should it be a setting?
+4. **Lag alarm.** Write `atlas events-lag`, which prints each consumer group's `lag` and `pending` from `XINFO GROUPS` and exits with code 1 if any lag is above a threshold. Where would Part 7 run it?
+5. **Snapshot by webhook.** After a push webhook, the snapshot waits for the next scheduler run (up to 15 minutes). Make `sync_repo` queue a `snapshot_repo` job when it indexes a new commit. Where must the queue `send` happen, given lesson 5.2's rule?
+
+## Review: three planted reliability bugs
+
+The bugs that hurt background systems rarely look wrong: they're a line in a slightly different place. Below are three changes someone might propose, each looking harmless. For each: what goes wrong, when would anyone notice, and does any of Atlas's tests catch it? Answer before opening the solutions. The answers about tests come from planting each bug in the reference code and running the suite.
+
+**Change 1**, in `worker.py`, "acknowledging promptly so the queue stays small":
+
+```python
+ctx.queue.ack(job_id)
+outcome = run_job(ctx, job_id)
+```
+
+**Change 2**, in the search route, "simplifying the cache key, since the offset rarely changes":
+
+```python
+params = {"q": q, "kind": kind, "limit": limit}
+```
+
+**Change 3**, in `notifier.py`, "acknowledging first, so a slow database can't cause redeliveries":
+
+```python
+events.ack(GROUP, entry_id)
+with session_factory() as session, session.begin():
+    created = notify(session, event)
+```
+
+::: {.callout-tip collapse="true" title="Change 1: what's wrong"}
+The job is acknowledged before it runs, which turns at-least-once delivery into at-most-once: if the worker dies mid-job (a deploy, an out-of-memory kill), the message is already gone and the job sits in `running` until its lease ends, with nothing left to deliver it. In practice, the scheduler's sweeper doesn't help either, because it only re-sends jobs that never started. Someone notices days later, when a repository has silently stopped syncing.
+
+**No test caught it.** The whole suite, 189 tests, passed with the bug planted: no test killed a worker mid-job. The reference code now has one, which fails with the bug (`assert None == 42`) and passes without it:
+
+```python
+class WorkerDied(BaseException):
+    """Stands in for the process being killed mid-job. A BaseException, like SystemExit,
+    so `except Exception` in run_job doesn't treat it as an ordinary job failure."""
+
+
+def test_a_job_whose_worker_dies_is_delivered_again(
+    worker: WorkerContext, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.queue.send(42)
+
+    def die(ctx: WorkerContext, job_id: int) -> str:
+        raise WorkerDied
+
+    monkeypatch.setattr("atlas.worker.run_job", die)
+    with pytest.raises(WorkerDied):
+        work(worker, threading.Event(), wait_seconds=0)
+    clock.advance(61)  # past the test queue's 60-second visibility timeout
+
+    assert worker.queue.receive(wait_seconds=0) == 42
+```
+
+`monkeypatch.setattr` (pytest) replaces a name for the duration of one test: here the worker's `run_job`, with a function that "dies".
+:::
+
+::: {.callout-tip collapse="true" title="Change 2: what's wrong"}
+Page 2 of a search gets page 1's cached answer, because the two requests now build the same key. It's noticed quickly by anyone paging through results, but only on the second request for the same words within ten minutes.
+
+**A test caught it:** `test_search_finds_and_pages`, one of Part 4's search tests, failed, because it requests two pages of the same search. That test was written before the cache existed, which is the point of keeping old tests: they check behaviour, so they catch new code that breaks it.
+:::
+
+::: {.callout-tip collapse="true" title="Change 3: what's wrong"}
+The event is acknowledged before its notifications are written. If the notifier dies in between, the event is no longer pending, no other notifier will claim it, and the users who saved the issue never hear about it. The motivation is also wrong: the unique constraint already makes redeliveries harmless, so there's nothing to avoid.
+
+**No test caught it**, for the same reason as change 1. The reference code's new test makes `notify` "die" and checks that the event can still be claimed; with the bug it fails with `assert [] == ['k1']`:
+
+```python
+def test_an_event_whose_notifier_dies_is_still_pending(
+    worker: WorkerContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.events.publish([event("k1")])
+
+    def die(session: Session, event: IssueEvent) -> int:
+        raise NotifierDied
+
+    monkeypatch.setattr("atlas.notifier.notify", die)
+    with pytest.raises(NotifierDied):
+        run_notifier(worker.session_factory, worker.events, threading.Event(), "doomed")
+
+    recovered = worker.events.read(GROUP, "survivor", block_ms=0, claim_after_ms=0)
+    assert [e.key for _, e in recovered] == ["k1"]
+```
+:::
+
+The lesson from changes 1 and 3: ordering bugs only show when something fails *between* two steps, so the tests must make something fail there. Ask of every pair of steps that touch two systems: "what if the process dies right here?"
+
+## Build it alone: a daily digest
+
+Learners asked for one message a day instead of checking Atlas: "what's new for beginners, and did anything happen to my saved issues?" Build a **daily digest**.
+
+### Spec
+
+- A **digest** belongs to one user and one day, and lists the issues *opened* during the previous day (UTC) in every tracked repository that carry a beginner label: `good first issue` or `help wanted`. Each listed issue has `repo`, `number`, `title`, `url` and `labels`. An issue with both labels appears once.
+- It also counts the user's notifications (lesson 5.6) created during that previous day.
+- `atlas digest` builds today's digest for every user; `atlas digest --day YYYY-MM-DD` builds a given day's. Running it twice for the same day creates nothing new, and prints how many digests it created.
+- A digest is a snapshot of that day: later changes to an issue don't change an old digest.
+- `GET /digests/latest` returns the signed-in user's newest digest (`day`, `issues`, `notification_count`), or 404 with code `digest_not_found`.
+- No email: sending is Part 7's problem. Storing it is this one's.
+
+### Acceptance tests
+
+Your implementation is done when these pass (they're `tests/test_digest.py` in the reference code; `sign_up` is from lesson 4.5, and `session` and `async_session` from lessons 3.11 and 4.17):
+
+```python
+DAY = date(2026, 11, 19)  # the digest of 19 November covers issues opened on 18 November
+
+
+def test_digest_lists_beginner_issues_opened_the_day_before(session: Session) -> None:
+    yesterday_noon = datetime(2026, 11, 18, 12, tzinfo=UTC)
+    issues = [
+        opened(1, yesterday_noon, ("good first issue",)),
+        opened(2, yesterday_noon, ("help wanted", "module: metrics")),
+        opened(3, yesterday_noon, ("bug",)),  # not for beginners
+        opened(4, yesterday_noon - timedelta(days=1), ("good first issue",)),  # too old
+        opened(5, datetime(2026, 11, 19, 0, 30, tzinfo=UTC), ("good first issue",)),  # today
+    ]
+    storage.save_issues(session, "pytorch/ignite", issues)
+    reader = add_user(session, "reader@example.com")
+
+    created = build_digests(session, DAY)
+
+    digest = session.scalars(select(Digest).where(Digest.user_id == reader.id)).one()
+    assert created == 1
+    assert [item["number"] for item in digest.issues] == [1, 2]
+    assert digest.issues[0]["repo"] == "pytorch/ignite"
+
+
+def test_building_the_same_day_twice_changes_nothing(session: Session) -> None:
+    add_user(session, "reader@example.com")
+
+    first = build_digests(session, DAY)
+    second = build_digests(session, DAY)
+
+    assert (first, second) == (1, 0)
+    assert len(session.scalars(select(Digest)).all()) == 1
+
+
+def test_digest_counts_the_days_notifications(session: Session) -> None:
+    reader = add_user(session, "reader@example.com")
+    for number, when in [
+        (1, datetime(2026, 11, 18, 9, tzinfo=UTC)),
+        (2, datetime(2026, 11, 17, 9, tzinfo=UTC)),
+    ]:
+        session.add(
+            Notification(
+                user_id=reader.id,
+                repo_full_name="pytorch/ignite",
+                issue_number=number,
+                title=f"Issue {number}",
+                change="closed",
+                labels=[],
+                event_key=f"k{number}",
+                created_at=when,
+            )
+        )
+    session.flush()
+
+    build_digests(session, DAY)
+
+    digest = session.scalars(select(Digest)).one()
+    assert digest.notification_count == 1
+
+
+@pytest.mark.anyio
+async def test_latest_digest_is_the_users_own(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    reader_headers = await sign_up(client, "reader@example.com")
+    before = await client.get("/digests/latest", headers=reader_headers)
+    await async_session.run_sync(lambda sync: build_digests(sync, DAY - timedelta(days=1)))
+    await async_session.run_sync(lambda sync: build_digests(sync, DAY))
+    await async_session.commit()
+    other_headers = await sign_up(client, "other@example.com")
+
+    mine = await client.get("/digests/latest", headers=reader_headers)
+    theirs = await client.get("/digests/latest", headers=other_headers)
+
+    assert before.json()["error"]["code"] == "digest_not_found"
+    assert mine.json()["day"] == "2026-11-19"
+    assert theirs.json()["error"]["code"] == "digest_not_found"  # signed up after both
+```
+
+The helpers `opened(number, when, labels)` (a `github.Issue`) and `add_user(session, email)` are a few lines each; write them yourself.
+
+::: {.callout-tip collapse="true" title="One possible solution: the design"}
+The reference code's `Digest` model stores `user_id`, `day`, `notification_count`, and the issues as a JSON copy (`JSONB`), not as references to `issues` rows: closed issues are deleted, and a digest must still read correctly a week later. A unique constraint on `(user_id, day)` makes rebuilding a day a no-op, through `INSERT ... ON CONFLICT DO NOTHING` (lesson 5.2), and its index also serves `GET /digests/latest`. Migration `0007` was autogenerated and reviewed.
+
+`atlas/digest.py`'s `build_digests(session, day)` runs three queries: the beginner issues created in the 24 hours before `day` began (joined to labels, `DISTINCT` so an issue with both labels appears once, with labels and repository loaded by `selectinload`); the day's notification counts per user (`GROUP BY user_id`); and the users. Then one multi-row insert. It's a command, not a job kind: once a day, from cron or an EventBridge schedule (lesson 5.2), and idempotent, so a schedule that fires twice is harmless.
+
+On the development database:
+
+```text
+$ atlas digest
+9 digests created for 2026-11-19
+$ atlas digest
+0 digests created for 2026-11-19
+$ atlas digest --day 2026-11-03
+9 digests created for 2026-11-03
+```
+
+The 3 November digest lists the two Ignite issues with beginner labels opened on 2 November. Compare your version with the reference after your tests pass.
+:::
+
+## From earlier parts
+
+**1.** (Part 4) The digest's unique constraint does for a scheduled command what an idempotency key (lesson 4.16) does for a POST. What plays the role of the key?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The pair `(user_id, day)`. An idempotency key names "this one operation" so a repeat can be recognised; here the operation "build this user's digest for this day" is named by its own data, so no separate key is needed.
+:::
+
+**2.** (Part 3) `chunks` and `documents` were slow to search until `ANALYZE` ran (lesson 5.5). What did `EXPLAIN ANALYZE` show that the plain `EXPLAIN` of lesson 3.6 would not have?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The actual row counts and times: `Rows Removed by Join Filter: 13833584` and `Execution Time: 1910.904 ms`. Plain `EXPLAIN` shows only the plan and Postgres's *estimates*; with missing statistics, the estimates were exactly what was wrong, so only the actual numbers revealed the problem.
+:::
+
+**3.** (Part 2) The worker stops cleanly on `SIGTERM` (lesson 5.1). Which signal can't it catch at all, and what in Part 5 makes that survivable?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`SIGKILL` (`kill -9`), which lesson 2.1 showed can't be caught: the process just stops, mid-job. Nothing in the worker can react, so safety comes from outside it: the job's message was never acknowledged, so the queue delivers it again after the visibility timeout, and the job's lease lets another worker claim it. Lesson 5.1's "The problem" did exactly that with `kill -9`.
+:::
+
+## Self-check
+
+Without notes, you should be able to:
+
+- Explain at-least-once delivery, and make a job safe to run twice.
+- Say where to acknowledge a message, and test what happens if the process dies before it.
+- Choose backoff with jitter, and say when a failure shouldn't count as an attempt.
+- Make the database enforce "only one", and explain why check-then-insert races.
+- Verify a webhook signature correctly, and say what it doesn't protect against.
+- Sync incrementally with watermarks, ETags and commit diffs.
+- Store and share large files with object storage and presigned URLs.
+- Decide whether a cache is worth it by measuring, and design keys that can't go stale.
+- Pick a rate-limit algorithm and decide whether it fails open or closed.
+- Choose between a job, pub/sub and a stream, and design idempotent consumers.
+
+## What changed in the project
+
+Checkpoint 5: Atlas syncs tracked repositories by itself (scheduler, webhooks, worker) with incremental code and issue sync, stores snapshots in S3-compatible storage, caches and rate-limits search, publishes `issue.updated` events to a Redis Stream read by the notifier, and builds a daily digest. Seven migrations, 191 tests with 91% coverage. New in this lesson: `atlas digest`, the `digests` table (migration `0007`), `GET /digests/latest`, and two crash tests from the review. Commits: `feat: Added the daily digest`, `test: Checked that a crashed worker or notifier leaves its message for another`.
