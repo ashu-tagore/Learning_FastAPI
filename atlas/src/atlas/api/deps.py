@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atlas.api.errors import ApiError
 from atlas.config import ApiSettings
 from atlas.models import User
+from atlas.queue import JobQueue
 from atlas.security import InvalidToken, decode_access_token
 
 # tokenUrl tells the interactive docs where to send the login form.
@@ -33,8 +34,14 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+def get_queue(request: Request) -> JobQueue:
+    queue: JobQueue = request.app.state.queue
+    return queue
+
+
 SettingsDep = Annotated[ApiSettings, Depends(get_settings)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+QueueDep = Annotated[JobQueue, Depends(get_queue)]
 
 
 async def get_current_user(

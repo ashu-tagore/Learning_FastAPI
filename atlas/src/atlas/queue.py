@@ -14,8 +14,17 @@ Four Redis keys per queue:
 
 import time
 from collections.abc import Callable
+from typing import Protocol
 
 import redis
+
+
+class JobQueue(Protocol):
+    """What Atlas needs from a queue. RedisQueue provides it locally; Part 7 adds SQS."""
+
+    def send(self, job_id: int, delay_seconds: float = 0) -> None: ...
+    def receive(self, wait_seconds: int = 5) -> int | None: ...
+    def ack(self, job_id: int) -> None: ...
 
 
 class RedisQueue:

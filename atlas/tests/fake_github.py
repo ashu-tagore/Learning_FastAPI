@@ -142,3 +142,51 @@ def bad_code() -> httpx.Response:
             "error_description": "The code passed is incorrect or expired.",
         },
     )
+
+
+class FakeIssueTracker:
+    """A repository's issues that tests can change, served like GitHub's issues endpoint.
+
+    It follows the rules Atlas relies on in lesson 5.3: `since`, `state`, sorting by update
+    time, and an ETag on every answer; a request whose If-None-Match matches gets 304.
+    """
+
+    def __init__(self, repo: str = "pytorch/ignite") -> None:
+        self.repo = repo
+        self.issues: dict[int, dict[str, object]] = {}
+        self.requests: list[httpx.Request] = []
+        self.rate_limited_until: int | None = None  # epoch seconds, like x-ratelimit-reset
+
+    def put(self, number: int, title: str, updated_at: str, state: str = "open") -> None:
+        issue = issue_json(number, title, ["good first issue"])
+        issue["state"] = state
+        issue["updated_at"] = updated_at
+        self.issues[number] = issue
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.rate_limited_until is not None:
+            reset = str(self.rate_limited_until)
+            headers = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}
+            return httpx.Response(403, json={"message": "API rate limit exceeded"}, headers=headers)
+        if request.url.path != f"/repos/{self.repo}/issues":
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        wanted_state = request.url.params.get("state", "open")
+        since = request.url.params.get("since", "")
+        matching = [
+            issue
+            for issue in self.issues.values()
+            if (wanted_state == "all" or issue["state"] == wanted_state)
+            and str(issue["updated_at"]) >= since  # ISO 8601 in UTC sorts as text
+        ]
+        matching.sort(key=lambda issue: str(issue["updated_at"]))
+
+        body = httpx.Response(200, json=matching).content
+        etag = f'"{hashlib.sha256(request.url.query + body).hexdigest()[:16]}"'
+        if request.headers.get("If-None-Match") == etag:
+            return httpx.Response(304, headers={"etag": etag})
+        return httpx.Response(200, content=body, headers={"etag": etag})
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)

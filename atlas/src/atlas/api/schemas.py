@@ -101,6 +101,30 @@ class RepoOut(BaseModel):
     id: int
     full_name: str
     indexed_at: datetime | None
+    indexed_commit: str | None
+    issues_synced_until: datetime | None
+
+
+# ---------- Background jobs ----------
+
+
+class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    kind: Literal["sync_repo", "sync_issues"]
+    repo_id: int
+    status: Literal["queued", "running", "succeeded", "dead"]
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class QueuedJobs(BaseModel):
+    """The jobs a request led to; an empty list means there was nothing to do."""
+
+    jobs: list[JobOut]
 
 
 # ---------- Issues ----------

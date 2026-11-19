@@ -198,13 +198,15 @@ async def fetch_issue_changes(
     clock, so the two machines' clocks never need to agree. The URL stays the same until
     something changes, which is what lets the etag produce 304 Not Modified.
     """
-    params: dict[str, str | int] | None
+    # Oldest change first: if max_pages cuts the list short, newest_update is still the
+    # last change seen, and the next poll carries on from there without a gap.
+    params: dict[str, str | int] = {"sort": "updated", "direction": "asc", "per_page": 100}
     if since is None:
-        params = {"state": "open", "per_page": 100}
+        params["state"] = "open"
     else:
-        stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         # state=all: an issue closed since the last poll must be seen, to be removed.
-        params = {"state": "all", "since": stamp, "per_page": 100}
+        params["state"] = "all"
+        params["since"] = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     conditional = {"If-None-Match": etag} if etag else {}
 
     async with httpx.AsyncClient(

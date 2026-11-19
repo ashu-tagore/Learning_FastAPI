@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 
 import httpx
+import redis
 from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,10 +26,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from atlas import __version__
 from atlas.api.deps import SessionDep
 from atlas.api.errors import ApiError
-from atlas.api.routes import auth, issues, notes, repos, search, users
+from atlas.api.routes import auth, issues, jobs, notes, repos, search, users, webhooks
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
 from atlas.logs import configure_logging, current_request_id
+from atlas.queue import RedisQueue
 
 logger = logging.getLogger("atlas.api")
 
@@ -67,9 +69,13 @@ def create_app(
         # expire_on_commit=False: objects stay readable after commit without a surprise reload,
         # which in async code would be an implicit (and forbidden) database call.
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        # Connects lazily, on the first send: the API starts even while Redis is down.
+        redis_client = redis.Redis.from_url(settings.redis_url)
+        app.state.queue = RedisQueue(redis_client)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
         await engine.dispose()
+        redis_client.close()
 
     app = FastAPI(
         title="Atlas API",
@@ -168,7 +174,7 @@ def create_app(
             ) from None
         return {"status": "ready"}
 
-    for module in (auth, users, repos, issues, notes, search):
+    for module in (auth, users, repos, issues, notes, search, jobs, webhooks):
         app.include_router(module.router)
 
     if settings.web_dir is not None:
