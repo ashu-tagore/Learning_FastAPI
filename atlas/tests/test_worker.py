@@ -4,11 +4,13 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select, update
 
 from atlas.jobs import WorkerContext
 from atlas.models import Document, Job, Repo
 from atlas.worker import schedule_once, work
+from tests.conftest import FakeClock
 
 
 def add_repo(worker: WorkerContext) -> int:
@@ -69,3 +71,24 @@ def test_stop_event_ends_the_loop_before_the_next_job(worker: WorkerContext) -> 
     worker.queue.send(12345)
 
     assert work(worker, stop, wait_seconds=0) == 0
+
+
+class WorkerDied(BaseException):
+    """Stands in for the process being killed mid-job. A BaseException, like SystemExit,
+    so `except Exception` in run_job doesn't treat it as an ordinary job failure."""
+
+
+def test_a_job_whose_worker_dies_is_delivered_again(
+    worker: WorkerContext, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.queue.send(42)
+
+    def die(ctx: WorkerContext, job_id: int) -> str:
+        raise WorkerDied
+
+    monkeypatch.setattr("atlas.worker.run_job", die)
+    with pytest.raises(WorkerDied):
+        work(worker, threading.Event(), wait_seconds=0)
+    clock.advance(61)  # past the test queue's 60-second visibility timeout
+
+    assert worker.queue.receive(wait_seconds=0) == 42

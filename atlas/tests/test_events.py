@@ -14,7 +14,7 @@ from atlas import github, storage
 from atlas.events import EventStream, IssueEvent
 from atlas.jobs import WorkerContext, run_job
 from atlas.models import Issue, Notification, User, saved_issues
-from atlas.notifier import notify, run_notifier
+from atlas.notifier import GROUP, notify, run_notifier
 from tests.conftest import sign_up
 from tests.fake_github import FakeIssueTracker
 from tests.test_jobs import add_repo, queue_job
@@ -187,3 +187,23 @@ async def test_users_see_only_their_own_notifications(
 
     assert [(n["issue_number"], n["change"]) for n in mine.json()] == [(1, "closed")]
     assert theirs.json() == []
+
+
+class NotifierDied(BaseException):
+    """Stands in for the notifier being killed while writing notifications."""
+
+
+def test_an_event_whose_notifier_dies_is_still_pending(
+    worker: WorkerContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.events.publish([event("k1")])
+
+    def die(session: Session, event: IssueEvent) -> int:
+        raise NotifierDied
+
+    monkeypatch.setattr("atlas.notifier.notify", die)
+    with pytest.raises(NotifierDied):
+        run_notifier(worker.session_factory, worker.events, threading.Event(), "doomed")
+
+    recovered = worker.events.read(GROUP, "survivor", block_ms=0, claim_after_ms=0)
+    assert [e.key for _, e in recovered] == ["k1"]
