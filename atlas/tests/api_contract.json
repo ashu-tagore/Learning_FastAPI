@@ -97,6 +97,12 @@
       "422"
     ]
   },
+  "/repos/{repo_id}/snapshot": {
+    "get": [
+      "200",
+      "422"
+    ]
+  },
   "/repos/{repo_id}/sync": {
     "post": [
       "202",

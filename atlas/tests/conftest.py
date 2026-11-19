@@ -70,9 +70,11 @@ def session(engine: Engine) -> Iterator[Session]:
 
 # ---------- Web API fixtures (lessons 4.5 and 4.17) ----------
 
+import uuid  # noqa: E402
 from collections.abc import AsyncIterator  # noqa: E402
 
 import httpx  # noqa: E402
+import redis.asyncio  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
@@ -80,6 +82,7 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
 from atlas.api.deps import get_queue, get_session  # noqa: E402
+from atlas.api.limits import RateLimiter, ResponseCache, get_cache, get_limiter  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
 
@@ -156,12 +159,51 @@ def sent_jobs() -> RecordingQueue:
     return RecordingQueue()
 
 
+class FakeClock:
+    """A clock tests move by hand, so timeouts can pass without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+async def api_redis(clock: FakeClock) -> AsyncIterator[tuple[RateLimiter, ResponseCache]]:
+    """Rate limiter and cache on real Redis, under key prefixes no other test uses.
+
+    Without TEST_REDIS_URL they point at a port nothing listens on, and fail open: every
+    request is allowed and nothing is cached, so API tests still run (lesson 5.5).
+    """
+    url = os.environ.get("TEST_REDIS_URL", "redis://127.0.0.1:1/0")
+    client = redis.asyncio.Redis.from_url(url)
+    prefix = f"test-{uuid.uuid4().hex}"
+    yield (
+        RateLimiter(client, prefix=f"{prefix}:ratelimit", clock=clock),
+        ResponseCache(client, prefix=f"{prefix}:cache"),
+    )
+    if "TEST_REDIS_URL" in os.environ:
+        async for key in client.scan_iter(f"{prefix}:*"):
+            await client.delete(key)
+    await client.aclose()
+
+
 @pytest.fixture
 def api_app(
     async_session: AsyncSession,
     api_settings: ApiSettings,
     github: FakeGitHubSignIn,
     sent_jobs: RecordingQueue,
+    api_redis: tuple[RateLimiter, ResponseCache],
 ) -> FastAPI:
     """The real app, wired to the test's rolled-back session, the fake GitHub and queue."""
     app = create_app(api_settings, github_transport=github.transport)
@@ -172,6 +214,9 @@ def api_app(
     # Every route that asks for a database session gets the test's rolled-back one.
     app.dependency_overrides[get_session] = test_session
     app.dependency_overrides[get_queue] = lambda: sent_jobs
+    limiter, cache = api_redis
+    app.dependency_overrides[get_limiter] = lambda: limiter
+    app.dependency_overrides[get_cache] = lambda: cache
     return app
 
 
@@ -198,7 +243,6 @@ async def sign_up(
 
 # ---------- Redis fixtures (lesson 5.1) ----------
 
-import uuid  # noqa: E402
 
 import redis  # noqa: E402
 
@@ -215,24 +259,6 @@ def redis_client() -> Iterator[redis.Redis]:
     client.close()
 
 
-class FakeClock:
-    """A clock tests move by hand, so timeouts can pass without waiting."""
-
-    def __init__(self) -> None:
-        self.now = 1_000_000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-@pytest.fixture
-def clock() -> FakeClock:
-    return FakeClock()
-
-
 @pytest.fixture
 def queue(redis_client: redis.Redis, clock: FakeClock) -> Iterator[RedisQueue]:
     """A queue under a name no other test uses; its keys are deleted afterwards."""
@@ -246,10 +272,12 @@ def queue(redis_client: redis.Redis, clock: FakeClock) -> Iterator[RedisQueue]:
 
 import subprocess  # noqa: E402
 
+import boto3  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from atlas.config import Settings  # noqa: E402
 from atlas.jobs import WorkerContext  # noqa: E402
+from atlas.snapshots import S3_CONFIG, SnapshotStore  # noqa: E402
 from tests.fake_github import FakeIssueTracker  # noqa: E402
 
 
@@ -282,8 +310,35 @@ def issue_tracker() -> FakeIssueTracker:
 
 
 @pytest.fixture
+def snapshot_store() -> Iterator[SnapshotStore]:
+    """A real S3 API (SeaweedFS from compose.yml) with a bucket of its own, emptied after."""
+    url = os.environ.get("TEST_S3_URL")
+    if url is None:
+        pytest.skip("set TEST_S3_URL to run object storage tests (see lesson 5.4)")
+    client = boto3.client(
+        "s3",
+        endpoint_url=url,
+        region_name="us-east-1",
+        # The throwaway local credentials from compose.yml.
+        aws_access_key_id="atlas",
+        aws_secret_access_key="atlas-dev-secret-key",
+        config=S3_CONFIG,
+    )
+    bucket = f"test-{uuid.uuid4().hex}"
+    client.create_bucket(Bucket=bucket)
+    yield SnapshotStore(client, bucket)
+    for item in client.list_objects_v2(Bucket=bucket).get("Contents", []):
+        client.delete_object(Bucket=bucket, Key=item["Key"])
+    client.delete_bucket(Bucket=bucket)
+
+
+@pytest.fixture
 def worker(
-    engine: Engine, queue: RedisQueue, tmp_path: Path, issue_tracker: FakeIssueTracker
+    engine: Engine,
+    queue: RedisQueue,
+    snapshot_store: SnapshotStore,
+    tmp_path: Path,
+    issue_tracker: FakeIssueTracker,
 ) -> Iterator[WorkerContext]:
     """A worker's world: real Postgres (rolled back), real Redis, local Git, fake GitHub.
 
@@ -298,5 +353,5 @@ def worker(
     with engine.connect() as connection:
         transaction = connection.begin()
         factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
-        yield WorkerContext(factory, queue, settings, issue_tracker.transport())
+        yield WorkerContext(factory, queue, settings, snapshot_store, issue_tracker.transport())
         transaction.rollback()

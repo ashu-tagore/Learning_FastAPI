@@ -81,6 +81,8 @@ website:
           - part-5-background-work/01-queues-and-workers.qmd
           - part-5-background-work/02-scheduling-and-webhooks.qmd
           - part-5-background-work/03-syncing-with-github.qmd
+          - part-5-background-work/04-object-storage.qmd
+          - part-5-background-work/05-caching-and-rate-limiting.qmd
       - section: "Part 6: AI engineering: Atlas"
         href: part-6-atlas-rag/index.qmd
         contents:

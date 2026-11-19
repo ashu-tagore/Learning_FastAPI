@@ -13,6 +13,7 @@ from http import HTTPStatus
 
 import httpx
 import redis
+import redis.asyncio
 from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,11 +27,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from atlas import __version__
 from atlas.api.deps import SessionDep
 from atlas.api.errors import ApiError
+from atlas.api.limits import RateLimiter, ResponseCache
 from atlas.api.routes import auth, issues, jobs, notes, repos, search, users, webhooks
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
 from atlas.logs import configure_logging, current_request_id
 from atlas.queue import RedisQueue
+from atlas.snapshots import SnapshotStore, make_s3_client
 
 logger = logging.getLogger("atlas.api")
 
@@ -72,10 +75,18 @@ def create_app(
         # Connects lazily, on the first send: the API starts even while Redis is down.
         redis_client = redis.Redis.from_url(settings.redis_url)
         app.state.queue = RedisQueue(redis_client)
+        # Creating the client makes no network call; nor does signing a download link.
+        app.state.snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
+        # The asyncio flavour of the same client library: rate limits and the cache are
+        # checked on every request, so they mustn't block the event loop (lesson 5.5).
+        async_redis = redis.asyncio.Redis.from_url(settings.redis_url)
+        app.state.limiter = RateLimiter(async_redis)
+        app.state.cache = ResponseCache(async_redis)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
         await engine.dispose()
         redis_client.close()
+        await async_redis.aclose()
 
     app = FastAPI(
         title="Atlas API",

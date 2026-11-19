@@ -230,7 +230,9 @@ class Job(Base):
 
     __tablename__ = "jobs"
     __table_args__ = (
-        CheckConstraint("kind IN ('sync_repo', 'sync_issues')", name="jobs_kind_valid"),
+        CheckConstraint(
+            "kind IN ('sync_repo', 'sync_issues', 'snapshot_repo')", name="jobs_kind_valid"
+        ),
         CheckConstraint(
             "status IN ('queued', 'running', 'succeeded', 'dead')", name="jobs_status_valid"
         ),

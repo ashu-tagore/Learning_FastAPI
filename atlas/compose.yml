@@ -27,5 +27,24 @@ services:
       interval: 2s
       retries: 15
 
+  # S3-compatible object storage for repository snapshots (lesson 5.4). On AWS: real S3.
+  # `weed mini` runs every SeaweedFS part in one process, which is plenty for development.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.54
+    command: ["mini", "-dir=/data", "-bucket=atlas-snapshots"]
+    environment:
+      # Throwaway local credentials, like the database password above.
+      AWS_ACCESS_KEY_ID: atlas
+      AWS_SECRET_ACCESS_KEY: atlas-dev-secret-key
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - atlas-objects:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      retries: 30
+
 volumes:
   atlas-db:
+  atlas-objects:
