@@ -101,6 +101,25 @@ async def test_repository_names_are_validated(
     assert response.status_code == 422
 
 
+async def test_idempotency_keys_belong_to_one_user(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    """Keys are chosen by clients and can collide or be guessed (lesson 4.16)."""
+    ada = {**await admin_headers(client, async_session), "Idempotency-Key": "add-1"}
+    grace = await sign_up(client, "grace@example.com")
+    await async_session.execute(
+        update(User).where(User.email == "grace@example.com").values(role="admin")
+    )
+    await async_session.commit()
+    grace = {**grace, "Idempotency-Key": "add-1"}
+
+    await client.post("/repos", json={"full_name": "pytorch/ignite"}, headers=ada)
+    graces = await client.post("/repos", json={"full_name": "sktime/sktime"}, headers=grace)
+
+    assert graces.status_code == 201
+    assert graces.json()["full_name"] == "sktime/sktime"
+
+
 # ---------- Issues ----------
 
 
