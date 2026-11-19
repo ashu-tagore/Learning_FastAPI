@@ -1,26 +1,57 @@
 ---
 title: "4.17 Async FastAPI with async SQLAlchemy"
-description: "Convert Atlas's API to async database access, keep CPU-heavy work off the event loop, and avoid the lazy-loading trap of async ORMs."
+description: "Measure when a thread pool runs out, convert Atlas's API and its tests to async database access, keep CPU-heavy work off the event loop, and catch the lazy-loading trap of async ORMs with a test."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 17 · About 90 minutes
+Part 4 · Lesson 17 · About 2 hours
 :::
 
 ::: {.callout-note title="Analogy: one waiter, many tables"}
 A restaurant can hire one waiter per table, who stands beside it while the kitchen cooks (threads). Or one waiter can serve twenty tables: take an order, hand it to the kitchen, and serve other tables until the kitchen calls (async). The single waiter is efficient only if they never stand still waiting: a waiter who personally cooks a slow dish (blocking work) leaves every other table unattended.
 :::
 
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* helps you decide whether a project of your own should be async at all.
+:::
+
+## The problem
+
+Atlas's routes have been plain `def`, because SQLAlchemy's `Session` is synchronous: every query blocks its thread until Postgres answers. Lesson 4.1 showed that FastAPI runs `def` routes in a **thread pool** so a blocking call holds up only its own thread. But a pool has a size. Starlette's default allows 40 threads to run route code at once.
+
+Atlas's queries take milliseconds, so 40 is plenty today. Part 6 changes that: answering a question means waiting several seconds for a language model, and Part 5's worker waits on GitHub. Here is a small app with two routes that each wait one second, one the `def` way and one the `async def` way, and many requests arriving at once:
+
+```python
+@app.get("/sync-wait")
+def sync_wait() -> dict[str, str]:
+    time.sleep(1)  # a slow call that blocks: a synchronous HTTP client or database driver
+    return {"waited": "1s in a worker thread"}
+
+
+@app.get("/async-wait")
+async def async_wait() -> dict[str, str]:
+    await asyncio.sleep(1)  # the same wait, awaited
+    return {"waited": "1s on the event loop"}
+```
+```text
+40 requests to /sync-wait: 1.1s
+200 requests to /sync-wait: 5.7s
+40 requests to /async-wait: 1.1s
+200 requests to /async-wait: 1.7s
+```
+
+Up to 40 at once, both are the same. At 200, the `def` route took five times as long: requests queued for the 40 threads, which worked through them in five rounds of one second. The `async def` route kept all 200 waits in flight on one thread. With multi-second model calls, that queue is the difference between an app that works and one that times out.
+
 ## Theory
 
-Lesson 2.6 introduced `async`/`await` and the **event loop**; lesson 4.1 measured what happens when an `async def` route blocks. Atlas's routes have been plain `def`, running in FastAPI's thread pool, because SQLAlchemy's `Session` is synchronous: every query blocks its thread until Postgres answers.
+Lesson 2.6 introduced `async`/`await` and the **event loop**; lesson 4.1 measured what happens when an `async def` route blocks. Converting Atlas means:
 
-That works. Why change?
+- database calls through SQLAlchemy's async layer, awaited;
+- outgoing HTTP calls (GitHub sign-in) through an async client, awaited;
+- CPU-heavy work (password hashing) handed to the thread pool;
+- tests that call the app asynchronously too.
 
-- A thread pool has a fixed size (Starlette's default allows 40 threads at once). Each request waiting on the database holds a thread. Async code waits without holding a thread, so one process can keep many more requests in flight.
-- Part 6 streams LLM answers that take many seconds each, and the WebSocket in lesson 4.18 holds a connection open indefinitely. Both are long *waits*, exactly what async is good at.
-
-The cost: everything slow must be awaited, and a single blocking call stalls everyone.
+Part 6 streams LLM answers that take many seconds each, and the WebSocket in lesson 4.18 holds a connection open indefinitely. Both are long *waits*, exactly what async is good at. The cost: everything slow must be awaited, and a single blocking call stalls everyone.
 
 ### Async SQLAlchemy
 
@@ -145,13 +176,120 @@ async def register(body: UserCreate, session: SessionDep) -> User:
         user_response = await client.get(f"{GITHUB_API}/user", headers={...})
 ```
 
-### Loading relationships explicitly
+### Red, then green: the lazy load the tests missed
 
-`get_issue_or_404` gained `selectinload(Issue.repo)` because `issue_out` reads `issue.repo.full_name`. In the synchronous version that was a silent lazy load; without the option, the async version answers 500 with the `MissingGreenlet` error above. The tests happen not to catch this one; lesson 4.20's practice asks you why.
+`get_issue_or_404` reads `issue.repo.full_name` (through `issue_out`), so it must load the repository up front with `selectinload(Issue.repo)`. In the synchronous version a missing option was a silent extra query; in the async version it's a 500. Yet when the option was missing, the whole test suite still passed. Why? The tests stored their sample issues through the same session the route then used, and that session still held the `Repo` object in memory, so no query was needed. A fresh request in production starts with an empty session.
+
+The test that would have caught it says exactly that:
+
+```python
+async def test_reading_an_issue_loads_everything_it_needs(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    """Async code can't load relationships lazily (lesson 4.17), so the route must ask up front.
+
+    expunge_all() empties the session's memory of objects, as a fresh request's session
+    would be; without it, the repository loaded while storing would hide a missing load.
+    """
+    ids = await store_numbers(async_session, [7])
+    async_session.expunge_all()
+
+    response = await client.get(f"/issues/{ids[7]}")
+
+    assert response.status_code == 200
+    assert response.json()["repo"] == "pytorch/ignite"
+```
+
+Without `selectinload(Issue.repo)`:
+
+```text
+E           sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place? (Background on this error at: https://sqlalche.me/e/21/xd2s)
+```
+
+With it, the test passes. The general lesson: a test's setup can make a bug invisible. Ask "what does the real situation have that my test doesn't?" (here: an empty session).
+
+### Converting the tests
+
+The routes are `async def` now, so the tests call the app asynchronously too, with three changes in `tests/conftest.py`.
+
+**Async tests.** The **anyio** pytest plugin (installed with FastAPI) runs `async def` tests; each test module opts in with `pytestmark = pytest.mark.anyio`, and a fixture picks the event loop:
+
+```python
+@pytest.fixture
+def anyio_backend() -> str:
+    # Async tests run on asyncio, the event loop FastAPI and SQLAlchemy use.
+    return "asyncio"
+```
+
+**An async rolled-back session**, the same idea as lesson 4.5's, with async names:
+
+```python
+@pytest.fixture
+async def async_session(engine: Engine) -> AsyncIterator[AsyncSession]:
+    """Like the `session` fixture, but async: one transaction, rolled back after the test.
+
+    Depends on `engine` so the tables exist (and so the test is skipped without a database).
+    NullPool: a fresh connection per test, created on this test's own event loop.
+    """
+    async_engine = create_async_engine(
+        str(engine.url.render_as_string(hide_password=False)), poolclass=NullPool
+    )
+    async with async_engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(
+            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
+        try:
+            yield session
+        finally:
+            await session.close()
+            await transaction.rollback()
+    await async_engine.dispose()
+```
+
+`NullPool` matters here: each test runs on its own event loop, and a pooled async connection from one loop can't be reused on another.
+
+**An async client.** `httpx.AsyncClient` with an `ASGITransport` calls the app in-process, like `TestClient` did, but awaitably:
+
+```python
+def browser(app: FastAPI) -> httpx.AsyncClient:
+    """A client with its own cookies, like a separate browser (lesson 4.9's attacks need two)."""
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+```
+
+and every test changes the same mechanical way: `def` becomes `async def`, `client.get(...)` becomes `await client.get(...)`. `ASGITransport` doesn't run the app's lifespan, which is fine: the session override supplies the database.
+
+Tests that need data from `storage.py`, which stays synchronous because the command line uses it, run it on the async session's connection with `run_sync`:
+
+```python
+async def store_issues(session: AsyncSession, issues: list[github.Issue]) -> dict[int, int]:
+    await session.run_sync(lambda sync: storage.save_issues(sync, "pytorch/ignite", issues))
+    await session.commit()
+    rows = await session.execute(select(Issue.number, Issue.id))
+    return {number: issue_id for number, issue_id in rows}
+```
 
 ### Results
 
-The behaviour is identical, so every test from the synchronous version passes unchanged in meaning (lesson 4.19 shows the async test setup). All the curl output in lessons 4.1 to 4.16 was in fact captured from the async version.
+```text
+$ uv run pytest -q
+...
+124 passed in 9.90s
+```
+
+The behaviour is identical, so every test from the synchronous version passes, converted. All the curl output in lessons 4.1 to 4.16 was in fact captured from the async version.
+
+## Trade-offs: should a project be async? *(deep dive)*
+
+| Situation | Better choice | Why |
+|---|---|---|
+| Short database queries, modest traffic | plain `def` | simpler; the thread pool is never the bottleneck |
+| Many slow waits at once (LLM calls, other APIs, long polls) | `async def` | waits don't hold threads, as measured above |
+| WebSockets or streaming responses | `async def` | the connection stays open for a long time |
+| Heavy computation per request | neither alone | move it to a worker process (Part 5) or the thread pool |
+| A library you need has no async version | `def`, or `run_in_threadpool` around it | one blocking call in `async def` stalls everything |
+
+Mixing is allowed: FastAPI runs each route the way it's declared. But a codebase where half the routes are async and half aren't makes every reader ask "is this one safe to block?". Atlas converts everything at once, in one lesson, for that reason.
 
 ## Common mistakes
 
@@ -217,28 +355,18 @@ Remove `.options(...)` to see `MissingGreenlet`.
 
 ## Stretch
 
-Load-test the difference yourself: start the API, then fire 50 concurrent `GET /search?q=engine` requests with an async httpx client and `asyncio.gather`, timing the batch. Compare against the synchronous version (`git switch --detach` to the commit before the conversion) with the same script.
+Find blocking calls automatically: run a test app containing an `async def` route that calls `time.sleep(1)` with Python's asyncio **debug mode** switched on (`PYTHONASYNCIODEBUG=1 uv run uvicorn ...`), call that route and an awaiting one, and read the server's output.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-```python
-import asyncio
-import time
+Debug mode makes the event loop report any single step that holds it for longer than 0.1 seconds. Only the blocking route is reported:
 
-import httpx
-
-
-async def main() -> None:
-    async with httpx.AsyncClient(base_url="http://localhost:8000") as client:
-        started = time.perf_counter()
-        await asyncio.gather(*(client.get("/search", params={"q": "engine"}) for _ in range(50)))
-        print(f"{time.perf_counter() - started:.2f}s for 50 requests")
-
-
-asyncio.run(main())
+```text
+Executing <Task finished name='Task-3' coro=<RequestResponseCycle.run_asgi() done, defined at .../uvicorn/protocols/http/httptools_impl.py:420> result=None ...> took 1.002 seconds
 ```
-With fast queries and only 50 requests both versions finish quickly and close to each other: the thread pool isn't exhausted. The difference shows when each request *waits* long (slow queries, LLM calls) and concurrency exceeds the pool size. Measuring before believing is the point; lesson 7.12 does proper load testing.
+
+The awaiting route waits just as long but gives the loop back, so it isn't. Debug mode slows everything down, so it's a development tool, not a production setting.
 :::
 
 ## What changed in the project
 
-All API routes and dependencies are `async def` on `AsyncSession`; `github_oauth.exchange_code` is async; password hashing runs in the thread pool; `sqlalchemy[asyncio]` added. Commit: `feat: Converted the Atlas API to async`.
+All API routes and dependencies are `async def` on `AsyncSession`; `github_oauth.exchange_code` is async; password hashing runs in the thread pool; the tests use `anyio`, `async_session` and an async client; a regression test for lazy loads. `sqlalchemy[asyncio]` added. Commits: `feat: Converted the Atlas API to async`, `test: Caught routes that rely on lazy loading, which async sessions can't do`.
