@@ -1,10 +1,10 @@
 ---
 title: "4.18 API styles: REST, GraphQL, gRPC and WebSockets"
-description: "Compare the main ways programs talk over a network, know when each fits, and add a search-as-you-type WebSocket to Atlas."
+description: "Compare the main ways programs talk over a network, measure what a WebSocket really saves, know when each style fits, and add a search-as-you-type WebSocket to Atlas."
 ---
 
 ::: {.lesson-meta}
-Part 4 · Lesson 18 · About 75 minutes
+Part 4 · Lesson 18 · About 90 minutes
 :::
 
 ::: {.callout-note title="Analogy: letters, a questionnaire, an internal phone line, a phone call"}
@@ -13,6 +13,22 @@ Part 4 · Lesson 18 · About 75 minutes
 - **gRPC** is an internal phone line between departments: fast, with a fixed script both sides learned beforehand.
 - **A WebSocket** is a phone call that stays open: either side can speak at any time, until someone hangs up.
 :::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", the REST and WebSockets parts of "Theory", and "In the project". GraphQL and gRPC are worth knowing to recognise; you won't build them in this course.
+:::
+
+## The problem
+
+Atlas's web UI offers search as you type: every keystroke sends a query. Typing "metric reset" means 12 queries in a couple of seconds. Is plain HTTP good enough for that, or does it need a connection that stays open? Rather than guess, measure. Twelve queries, one per keystroke, three ways, against the running API (median of five runs, on one machine, so no network or TLS delay):
+
+```text
+HTTP, new connection per keystroke   12 queries: median 274 ms
+HTTP, one reused connection          12 queries: median 84 ms
+WebSocket                            12 queries: median 65 ms
+```
+
+Opening a new connection for each request is what costs: the TCP handshake (lesson 2.2) every time, and over the internet a TLS handshake too, which multiplies it. Reusing one HTTP connection (browsers do this automatically, with **keep-alive**) gets most of the way to a WebSocket. So for *this* feature the WebSocket saves little. What it does that HTTP can't is let the **server** speak first: tell the page "a new issue arrived" without being asked. Choosing an API style is about questions like that one, not about fashion. This lesson surveys the main styles and when each fits.
 
 ## Theory
 
@@ -140,7 +156,28 @@ asyncio.run(main())
 
 ### When not to use it
 
-The same feature works with plain `GET /search` on each keystroke (with a short delay). The WebSocket saves a connection setup per keystroke. That's real, but modest; for most features REST is the right default, and the WebSocket here is mainly a working example of the style.
+The same feature works with plain `GET /search` on each keystroke (with a short delay so not every keystroke is sent). "The problem" measured the difference: 84 ms against 65 ms for twelve queries over a reused connection. That's real, but modest; for most features REST is the right default, and the WebSocket here is mainly a working example of the style, ready for features where the server needs to push.
+
+### Testing it
+
+Lesson 4.5's `TestClient` drives WebSockets too:
+
+```python
+def test_search_as_you_type(indexed_sample: None, api_settings: ApiSettings) -> None:
+    app = create_app(api_settings)
+
+    with TestClient(app) as client, client.websocket_connect(f"/search/live?repo={REPO}") as ws:
+        ws.send_text("fire")
+        first = ws.receive_json()
+        ws.send_text("   ")
+        blank = ws.receive_json()
+
+    assert first["query"] == "fire"
+    assert [hit["path"] for hit in first["items"]] == ["ignite/engine/engine.py"]
+    assert blank == {"query": "", "items": []}
+```
+
+`TestClient` runs the app on its own event loop, in another thread, so it can't share the test's rolled-back session; the `indexed_sample` fixture commits its data for real under a repository name no other test uses, and deletes it afterwards. Lesson 4.19 discusses this exception.
 
 ## Common mistakes
 

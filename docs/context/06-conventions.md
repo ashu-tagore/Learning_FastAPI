@@ -98,6 +98,10 @@ Writing rules for lessons:
 - Tests are independent: fixtures build their own data; order does not matter.
 - Test the unhappy paths (401, 403, 404, 409, 422) and security properties (no secret ever in a response).
 - LLM-dependent code is tested with a fake provider implementing the same interface; real-model checks live in `evals/`, not in unit tests.
+- Fakes replace only what crosses the process boundary, and are as strict as the real service. Atlas's own code is never mocked.
+- Every new test is seen failing once (red first, or break the code on purpose) before it's trusted.
+- Coverage is reported in CI, not enforced; read the `Missing` column for blind spots. Async code needs `concurrency = ["greenlet", "thread"]` to be measured correctly.
+- `tests/api_contract.json` pins paths, methods and status codes; refresh it with `UPDATE_CONTRACT=1` only for deliberate changes, and review the diff.
 
 ## Git
 

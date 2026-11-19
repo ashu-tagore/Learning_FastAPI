@@ -101,6 +101,25 @@ async def test_repository_names_are_validated(
     assert response.status_code == 422
 
 
+async def test_idempotency_keys_belong_to_one_user(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    """Keys are chosen by clients and can collide or be guessed (lesson 4.16)."""
+    ada = {**await admin_headers(client, async_session), "Idempotency-Key": "add-1"}
+    grace = await sign_up(client, "grace@example.com")
+    await async_session.execute(
+        update(User).where(User.email == "grace@example.com").values(role="admin")
+    )
+    await async_session.commit()
+    grace = {**grace, "Idempotency-Key": "add-1"}
+
+    await client.post("/repos", json={"full_name": "pytorch/ignite"}, headers=ada)
+    graces = await client.post("/repos", json={"full_name": "sktime/sktime"}, headers=grace)
+
+    assert graces.status_code == 201
+    assert graces.json()["full_name"] == "sktime/sktime"
+
+
 # ---------- Issues ----------
 
 
@@ -148,6 +167,23 @@ async def test_missing_issue_is_404(client: httpx.AsyncClient) -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "issue_not_found"
+
+
+async def test_reading_an_issue_loads_everything_it_needs(
+    client: httpx.AsyncClient, async_session: AsyncSession
+) -> None:
+    """Async code can't load relationships lazily (lesson 4.17), so the route must ask up front.
+
+    expunge_all() empties the session's memory of objects, as a fresh request's session
+    would be; without it, the repository loaded while storing would hide a missing load.
+    """
+    ids = await store_numbers(async_session, [7])
+    async_session.expunge_all()
+
+    response = await client.get(f"/issues/{ids[7]}")
+
+    assert response.status_code == 200
+    assert response.json()["repo"] == "pytorch/ignite"
 
 
 async def test_saving_is_idempotent_and_private(
