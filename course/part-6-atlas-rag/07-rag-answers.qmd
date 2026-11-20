@@ -391,7 +391,7 @@ In this run the sources arrived after 0.25 seconds, the first words after 15, an
 
 ## Trade-offs *(deep dive)*
 
-**How many sources.** More sources give the model more chances to find the answer and make every answer slower and costlier: a small CPU model reads roughly 100 tokens a second, so five 60-line chunks cost about 12 seconds before the first word. Hosted models read far faster, which is why hosted RAG systems often send 10 to 20.
+**How many sources.** More sources give the model more chances to find the answer and make every answer slower and costlier: the stretch below measures about 150 tokens a second of reading on a CPU, so five sources cost about 12 seconds before the first word. Hosted models read far faster, which is why hosted RAG systems often send 10 to 20.
 
 **Rewriting follow-ups.** Atlas searches the previous question with the new one: cheap, and enough for "what are its arguments?". A common alternative asks the chat model to rewrite the follow-up into a standalone question first ("What are the arguments of EarlyStopping?"). It handles longer conversations better and costs one more model call, several seconds on a CPU, per question.
 
@@ -488,7 +488,22 @@ async def delete_conversation(conversation_id: int, user: CurrentUser, session: 
 
 ## Stretch
 
-STRETCH_67
+Measure what each source costs. For one question, answer with 3, 5 and 8 sources (`find_sources(..., limit=n)`) and time the first `TextDelta` and the end of the stream. Our first attempt:
+
+```text
+3 sources: 1321 tokens in, first word 1.2 s, done 9.1 s, 89 tokens out
+5 sources: 1809 tokens in, first word 4.4 s, done 12.3 s, 75 tokens out
+```
+
+1.2 seconds to read 1,321 tokens is too good to be true, and it wasn't: Ollama keeps the start of the last prompt it read, and an earlier `/ask` had sent the same system prompt and first sources. Only the new part was read. Making every prompt unique (a random first line in the system prompt) gives the honest numbers:
+
+```text
+3 sources: 1357 tokens in, first word 8.8 s, done 17.6 s, 92 tokens out
+5 sources: 1843 tokens in, first word 11.9 s, done 21.3 s, 89 tokens out
+8 sources: 2405 tokens in, first word 17.3 s, done 27.7 s, 90 tokens out
+```
+
+About 150 tokens a second of reading, on top of a fixed cost; writing 90 tokens takes 9 to 10 seconds whatever the prompt. Each source adds about two seconds before the first word. Whether the extra sources are worth it is a question about answer quality, which lesson 6.8 can measure. (The cache itself is worth knowing: a conversation's follow-ups share their start with the previous prompt, so they begin faster.)
 
 ## What changed in the project
 

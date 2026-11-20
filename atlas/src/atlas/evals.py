@@ -169,9 +169,12 @@ def answer_case(
         text = chat.complete(answer.answer_request(case.question, sources, history=[])).text
     seconds = time.monotonic() - started
 
-    refused = answer.NOT_FOUND.rstrip(".") in text
     cited, invalid = answer.check_citations(text, sources)
     cited_paths = [source.path for source in cited]
+    # A refusal says so and cites nothing. A small model sometimes writes a made-up answer
+    # with citations and then adds "I couldn't find this..."; that isn't declining (6.8).
+    says_not_found = answer.NOT_FOUND.rstrip(".") in text
+    refused = says_not_found and not cited
     cites_expected = any(path in case.expected_paths for path in cited_paths)
 
     # Only answers that make claims are judged: a refusal has nothing to support.

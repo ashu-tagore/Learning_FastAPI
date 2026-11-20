@@ -24,7 +24,8 @@ from atlas.models import Chunk, Document, Repo
 from atlas.storage import CANDIDATES, keyword_ranking, reciprocal_rank_fusion, semantic_ranking
 
 # How many chunks the model reads. More gives it more chances to find the answer, and
-# makes every answer slower and costlier: a small CPU model reads about 100 tokens a second.
+# makes every answer slower and costlier: qwen3:1.7b on a CPU reads about 150 tokens a
+# second, so five sources mean 12 seconds before the first word (lesson 6.7's stretch).
 SOURCES = 5
 # Below this cosine similarity (with nomic-embed-text), the nearest chunk is about
 # something else. Measured on lesson 6.8's questions: answerable ones scored 0.62 to 0.81,

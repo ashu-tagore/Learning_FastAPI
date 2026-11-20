@@ -120,3 +120,23 @@ def test_a_whole_run_checks_retrieval_citations_refusals_and_grounding(
     bread = report["answers"][1]
     assert (bread["answer"], bread["refused"]) == (NOT_FOUND, True)
     assert len(ollama.requests) == 2
+
+
+def test_an_answer_that_cites_sources_and_then_says_it_couldnt_find_isnt_a_refusal(
+    session: Session, embedded: FakeEmbeddings
+) -> None:
+    ollama = FakeOllama()
+    chat = OllamaChat(model="fake-chat", transport=ollama.transport())
+    case = Case("accuracy", "def accuracy return", ["ignite/metrics.py"])
+    # What qwen3:1.7b did with the Core ML question: an invented answer, citations, then
+    # the not-found sentence at the end.
+    ollama.replies += [
+        f"Use torch.core.export [1]. {NOT_FOUND}",
+        json.dumps({"supported": False, "unsupported_claims": ["torch.core.export"]}),
+    ]
+    vector = embedded.embed([case.question], "query")[0]
+
+    outcome = evals.answer_case(session, chat, "pytorch/ignite", case, vector, "fake-embed")
+
+    assert outcome.refused is False
+    assert outcome.cited_paths == ["ignite/metrics.py"]

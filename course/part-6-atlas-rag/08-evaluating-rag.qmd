@@ -225,7 +225,7 @@ Lesson 6.7 set the similarity threshold at 0.6 from two questions. Here is the n
 0.811  answerable   supervised-trainer
 ```
 
-No threshold separates the two kinds. Everyday questions sit below 0.6; but "How do I write a Kubernetes deployment manifest?" (0.653) and "How do I export a model to Core ML?" (0.654) sound like the codebase and score above three questions it can answer. Raising the threshold to 0.66 would block them, and three answerable questions with them. 0.6 stays; the technical ones have to be caught by the prompt's "couldn't find" rule. In every run, they were.
+No threshold separates the two kinds. Everyday questions sit below 0.6; but "How do I write a Kubernetes deployment manifest?" (0.653) and "How do I export a model to Core ML?" (0.654) sound like the codebase and score above three questions it can answer. Raising the threshold to 0.66 would block them, and three answerable questions with them. 0.6 stays; the technical ones have to be caught by the prompt's "couldn't find" rule. Whether they are is what `correctly_refused` measures, and the runs below show it isn't always.
 
 ### Answers: the first run
 
@@ -278,7 +278,63 @@ So a 1.7-billion-parameter model can't judge grounding here. That's what checkin
 
 ### Variation and thresholds
 
-VARIANCE_RUNS
+Two more full runs, with the fixed citation rule:
+
+```text
+== run 2
+30 cases in 12.9 min
+retrieval hybrid   recall_at_5 0.64, recall_at_10 0.72, mrr 0.442
+answers   cites_expected 0.52, valid_citations 1.0, wrongly_refused 0.0, correctly_refused 0.8, supported 1.0, judged 25
+judge     agreed with the hand grades on 4 of 10
+== run 3
+30 cases in 6.4 min
+retrieval hybrid   recall_at_5 0.64, recall_at_10 0.72, mrr 0.442
+answers   cites_expected 0.56, valid_citations 1.0, wrongly_refused 0.0, correctly_refused 1.0, supported 1.0, judged 25
+judge     agreed with the hand grades on 4 of 10
+```
+
+Retrieval is identical every time: no model samples anything there. `cites_expected` went 0.48, 0.52, 0.56, which looks like a trend and is noise (the exercise below shows the cases underneath). And in run 2, the Core ML question wasn't declined:
+
+```text
+To export a model to Core ML for iPhones, you can use the `torch-core-ml` library. First, ensure your
+model is saved as a PyTorch checkpoint. Then, use the `coremltools` library to convert the model. ...
+[2] provides guidance on logging model weights, which is useful for debugging, but the actual
+conversion is handled by `coremltools`. ... [2]
+```
+
+A made-up library, cited to an unrelated example file. Run 3's "correctly_refused 1.0" hid a worse version:
+
+```text
+To export a model to Core ML for iPhones, you can use the `torch.core` module to convert the model to
+the Core ML format. ... using the `torch.core.export` function. ... [1] outlines the addition of
+gradient scaling ... Therefore, the answer is: I couldn't find this in the indexed code.
+```
+
+An invented function, four citations, and *then* the refusal sentence. The check counted any answer containing that sentence as a refusal, so this counted as correct. That's a bug in the evaluation, not just the model, and it's the reason to read answers rather than only scores. A refusal now has to say so *and cite nothing*:
+
+```python
+# A refusal says so and cites nothing. A small model sometimes writes a made-up answer
+# with citations and then adds "I couldn't find this..."; that isn't declining (6.8).
+says_not_found = answer.NOT_FOUND.rstrip(".") in text
+refused = says_not_found and not cited
+```
+
+with a test built from run 3's answer, which fails on the old check (`assert True is False`) and passes on the new one. Re-scored with it, `correctly_refused` across the three runs is 1.0, 0.8 and 0.8: the Core ML question was declined once in three. Kubernetes was declined every time.
+
+The thresholds, in `evals/thresholds.json`, sit below the worst of the three runs with room for about one more unlucky case, and only on exact checks:
+
+```json
+{
+  "retrieval.hybrid.recall_at_5": 0.6,
+  "retrieval.hybrid.mrr": 0.4,
+  "answers.cites_expected": 0.4,
+  "answers.valid_citations": 0.9,
+  "answers.wrongly_refused": 0.1,
+  "answers.correctly_refused": 0.6
+}
+```
+
+All three runs pass them. Retrieval's margin is one case (0.64 to 0.60), because retrieval doesn't vary: a drop there is always a real change. `answers.supported` has no threshold, for the reasons above.
 
 ## Trade-offs *(deep dive)*
 
@@ -326,12 +382,65 @@ Without them, a system that always answers (never declines) can't lose. They mea
 Write `atlas eval-diff old.json new.json`, which compares two reports and prints each case whose hybrid retrieval rank or `cites_expected` changed, with the old and new value, then the change in each score. Test the comparison as a function on two small report dictionaries.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-EXERCISE_68
+```python
+def diff_reports(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """What changed between two `atlas eval` reports: cases first, then scores."""
+    lines = []
+    for case_id, ranks in new["ranks"].items():
+        before = old["ranks"].get(case_id, {}).get("hybrid")
+        after = ranks["hybrid"]
+        if before != after:
+            lines.append(f"{case_id}: hybrid rank {before} -> {after}")
+
+    old_answers = {a["case_id"]: a for a in old.get("answers", [])}
+    for outcome in new.get("answers", []):
+        previous = old_answers.get(outcome["case_id"])
+        changed = previous is not None and previous["cites_expected"] != outcome["cites_expected"]
+        if changed:
+            lines.append(
+                f"{outcome['case_id']}: cites_expected "
+                f"{previous['cites_expected']} -> {outcome['cites_expected']}"
+            )
+
+    old_hybrid = old["scores"]["retrieval"]["hybrid"]
+    for name, value in new["scores"]["retrieval"]["hybrid"].items():
+        lines.append(f"retrieval.hybrid.{name}: {old_hybrid[name]} -> {value} ({value - old_hybrid[name]:+.3f})")
+    old_answer_scores = old["scores"].get("answers", {})
+    for name, value in new["scores"].get("answers", {}).items():
+        if name in old_answer_scores:
+            lines.append(f"answers.{name}: {old_answer_scores[name]} -> {value} ({value - old_answer_scores[name]:+.3f})")
+    return lines
+```
+
+Two tests (a changed case and an unchanged one) pass. Run 1 against run 2:
+
+```text
+save-every-epochs: cites_expected False -> True
+add-event-handler: cites_expected False -> True
+time-limit: cites_expected True -> False
+retrieval.hybrid.recall_at_5: 0.64 -> 0.64 (+0.000)
+...
+answers.cites_expected: 0.48 -> 0.52 (+0.040)
+answers.correctly_refused: 1.0 -> 0.8 (-0.200)
+```
+
+"+0.04" is two cases gained and one lost: the per-case view shows how much of a difference is churn. (Between these two runs the citation rule also changed, so not all of it is luck; separating the two would need several runs of each.) The command itself is a few lines of `argparse` around the function. Not in the reference code.
 :::
 
 ## Stretch
 
-STRETCH_68
+Use the retrieval part of the evaluation, which takes seconds, to test a choice from lesson 6.6: reciprocal rank fusion's constant `k = 60`. Replace `storage.reciprocal_rank_fusion` with `functools.partial(original, k=k)` (search looks the function up each time it runs, so the replacement takes effect) and score hybrid retrieval for several values:
+
+```text
+k=1     {'recall_at_5': 0.64, 'recall_at_10': 0.68, 'mrr': 0.436}
+k=10    {'recall_at_5': 0.64, 'recall_at_10': 0.72, 'mrr': 0.42}
+k=30    {'recall_at_5': 0.64, 'recall_at_10': 0.72, 'mrr': 0.442}
+k=60    {'recall_at_5': 0.64, 'recall_at_10': 0.72, 'mrr': 0.442}
+k=120   {'recall_at_5': 0.64, 'recall_at_10': 0.72, 'mrr': 0.442}
+k=1000  {'recall_at_5': 0.64, 'recall_at_10': 0.72, 'mrr': 0.442}
+```
+
+From 30 up, nothing changes; very small values cost a little. The paper's 60 is safely on the flat part, and there's nothing to tune here: a result worth having, because it means time is better spent elsewhere (the 36% of questions retrieval misses). Being able to answer "does this setting matter?" in seconds is the point of having the evaluation.
 
 ## What changed in the project
 
