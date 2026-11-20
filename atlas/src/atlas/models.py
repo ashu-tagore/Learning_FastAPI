@@ -11,9 +11,12 @@ users ──< refresh_tokens
   ├──< idempotency_keys
   ├──< notifications           (also by repo name + number: the issue may be gone)
   └──< digests                 (one per user per day)
+
+llm_calls                      (every request to a language model, with its cost)
 """
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -24,6 +27,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Numeric,
     String,
     Table,
     Text,
@@ -296,4 +300,24 @@ class Digest(Base):
     # A copy of each issue as it was that day, so the digest still reads right later.
     issues: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     notification_count: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LlmCall(Base):
+    """One request to a language model: what it was for, its size, time and cost (6.2)."""
+
+    __tablename__ = "llm_calls"
+    __table_args__ = (Index("ix_llm_calls_created", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20))
+    model: Mapped[str] = mapped_column(String(100))
+    purpose: Mapped[str] = mapped_column(String(50))
+    input_tokens: Mapped[int]
+    output_tokens: Mapped[int]
+    # Exact decimal dollars: floats would drift when thousands of tiny costs are summed.
+    # Null when the price isn't known (a model added to the API after this code).
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    latency_ms: Mapped[float]
+    stop_reason: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

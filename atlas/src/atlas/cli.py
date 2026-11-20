@@ -14,6 +14,8 @@ atlas sync pytorch/ignite
 atlas jobs
 atlas notifier
 atlas digest --day 2026-11-19
+atlas llm "What is an event in a training loop?" --stream
+atlas llm-usage
 """
 
 import argparse
@@ -28,7 +30,7 @@ from pathlib import Path
 import redis
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -38,8 +40,10 @@ from atlas.events import EventStream
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
 from atlas.jobs import WorkerContext, create_job
+from atlas.llm import ChatProvider, ChatRequest, ChatResult, LLMError, TextDelta, user
+from atlas.llm.calls import cost_usd, make_chat, record
 from atlas.logs import configure_logging
-from atlas.models import Job, Repo, User
+from atlas.models import Job, LlmCall, Repo, User
 from atlas.notifier import run_notifier as run_notifier_loop
 from atlas.queue import RedisQueue
 from atlas.search import DEFAULT_EXTENSIONS, search
@@ -112,6 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("worker", help="run background jobs from the queue")
     commands.add_parser("scheduler", help="queue a sync of every repository, periodically")
     commands.add_parser("notifier", help="turn issue events into users' notifications")
+
+    llm_parser = commands.add_parser("llm", help="ask the configured language model")
+    llm_parser.add_argument("prompt")
+    llm_parser.add_argument("--system", default="", help="instructions for the model")
+    llm_parser.add_argument("--max-tokens", type=int, default=1024)
+    llm_parser.add_argument("--stream", action="store_true", help="print the answer as it comes")
+
+    commands.add_parser("llm-usage", help="calls, tokens and cost per purpose, from the log")
 
     digest_parser = commands.add_parser("digest", help="build every user's daily digest")
     digest_parser.add_argument(
@@ -387,6 +399,76 @@ def run_notifier() -> int:
     return 0
 
 
+def run_llm(args: argparse.Namespace) -> int:
+    settings = Settings()
+    chat = make_chat(settings)
+    request = ChatRequest(
+        messages=[user(args.prompt)],
+        system=args.system,
+        max_tokens=args.max_tokens,
+        purpose="cli",
+    )
+    try:
+        result = stream_to_stdout(chat, request) if args.stream else chat.complete(request)
+    except LLMError as error:
+        print(f"atlas: {error}", file=sys.stderr)
+        return 1
+    if not args.stream:
+        print(result.text)
+
+    cost = cost_usd(result)
+    cost_text = "unknown cost" if cost is None else f"${cost}"
+    print(
+        f"{result.model} via {result.provider}: {result.input_tokens} tokens in, "
+        f"{result.output_tokens} out, {result.latency_ms / 1000:.1f} s, {cost_text}, "
+        f"stopped: {result.stop_reason}",
+        file=sys.stderr,
+    )
+    if settings.database_url is not None:
+        with Session(create_engine(settings.database_url)) as session, session.begin():
+            record(session, result)
+    return 0
+
+
+def stream_to_stdout(chat: ChatProvider, request: ChatRequest) -> ChatResult:
+    for event in chat.stream(request):
+        if isinstance(event, TextDelta):
+            print(event.text, end="", flush=True)
+            continue
+        print()
+        return event
+    raise LLMError("the stream ended without a result")
+
+
+def run_llm_usage() -> int:
+    session = open_database()
+    if session is None:
+        return 1
+    with session:
+        rows = session.execute(
+            select(
+                LlmCall.purpose,
+                LlmCall.model,
+                func.count(),
+                func.sum(LlmCall.input_tokens),
+                func.sum(LlmCall.output_tokens),
+                func.avg(LlmCall.latency_ms),
+                func.sum(LlmCall.cost_usd),
+            )
+            .group_by(LlmCall.purpose, LlmCall.model)
+            .order_by(LlmCall.purpose, LlmCall.model)
+        ).all()
+    header = ("purpose", "model", "calls", "in", "out", "avg s", "cost")
+    print("{:<12} {:<18} {:>5} {:>8} {:>7} {:>6} {:>10}".format(*header))
+    for purpose, model, calls, tokens_in, tokens_out, avg_ms, cost in rows:
+        cost_text = "?" if cost is None else f"${cost:.4f}"
+        print(
+            f"{purpose:<12} {model:<18} {calls:>5} {tokens_in:>8} {tokens_out:>7} "
+            f"{avg_ms / 1000:>6.1f} {cost_text:>10}"
+        )
+    return 0
+
+
 def run_digest(args: argparse.Namespace) -> int:
     session = open_database()
     if session is None:
@@ -489,6 +571,10 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_worker()
     if args.command == "scheduler":
         return run_scheduler()
+    if args.command == "llm":
+        return run_llm(args)
+    if args.command == "llm-usage":
+        return run_llm_usage()
     if args.command == "digest":
         return run_digest(args)
     if args.command == "notifier":
