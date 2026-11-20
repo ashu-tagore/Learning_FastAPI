@@ -13,6 +13,9 @@ users ──< refresh_tokens
   ├──< notifications           (also by repo name + number: the issue may be gone)
   └──< digests                 (one per user per day)
 
+  └──< conversations ──< messages ──< citations    (questions and answers, lesson 6.7)
+                             └──── feedback        (a rating of an answer)
+
 llm_calls                      (every request to a language model, with its cost)
 """
 
@@ -369,3 +372,79 @@ class IssueFit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     issue: Mapped[Issue] = relationship()
+
+
+class Conversation(Base):
+    """A user's questions about one repository, and Atlas's answers (lesson 6.7)."""
+
+    __tablename__ = "conversations"
+    # Serves "my conversations, most recent first", the query behind GET /conversations.
+    __table_args__ = (Index("ix_conversations_user_updated", "user_id", "updated_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    repo_full_name: Mapped[str] = mapped_column(String(200))
+    title: Mapped[str] = mapped_column(String(200))  # the first question, shortened
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="conversation", order_by="Message.id"
+    )
+
+
+class Message(Base):
+    """One question (role "user") or one answer (role "assistant")."""
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="messages_role_valid"),
+        Index("ix_messages_conversation", "conversation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(10))
+    content: Mapped[str] = mapped_column(Text)
+    # The model call that wrote an answer, for its cost; none for questions, and none for
+    # "couldn't find this", which is answered without a model.
+    llm_call_id: Mapped[int | None] = mapped_column(ForeignKey("llm_calls.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    citations: Mapped[list["Citation"]] = relationship(order_by="Citation.number")
+    feedback: Mapped["Feedback | None"] = relationship()
+
+
+class Citation(Base):
+    """A source an answer cited, copied rather than linked: re-indexing replaces chunks,
+    and an old answer must keep pointing at the code it was based on."""
+
+    __tablename__ = "citations"
+    __table_args__ = (UniqueConstraint("message_id", "number"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    number: Mapped[int]  # the [n] in the answer's text
+    path: Mapped[str] = mapped_column(String(500))
+    start_line: Mapped[int]
+    end_line: Mapped[int]
+    symbol: Mapped[str | None] = mapped_column(String(300))
+    # The commit the cited lines come from; None for a repository indexed from a folder.
+    commit: Mapped[str | None] = mapped_column(String(40))
+
+
+class Feedback(Base):
+    """The asker's rating of an answer: thumbs up or down, with an optional note."""
+
+    __tablename__ = "feedback"
+    __table_args__ = (
+        UniqueConstraint("message_id"),  # rating again replaces the earlier rating
+        CheckConstraint("rating IN ('up', 'down')", name="feedback_rating_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    rating: Mapped[str] = mapped_column(String(4))
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -29,6 +29,7 @@ from atlas.api.deps import SessionDep
 from atlas.api.errors import ApiError
 from atlas.api.limits import RateLimiter, ResponseCache
 from atlas.api.routes import (
+    ask,
     auth,
     digests,
     issues,
@@ -42,7 +43,7 @@ from atlas.api.routes import (
 )
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
-from atlas.llm.calls import make_embeddings
+from atlas.llm.calls import make_chat, make_embeddings
 from atlas.logs import configure_logging, current_request_id
 from atlas.queue import RedisQueue
 from atlas.snapshots import SnapshotStore, make_s3_client
@@ -95,6 +96,8 @@ def create_app(
         app.state.limiter = RateLimiter(async_redis)
         # Embeds search queries for semantic and hybrid search (lesson 6.6).
         app.state.embedder = make_embeddings(settings)
+        # Writes answers for POST /ask (lesson 6.7). Makes no network call until used.
+        app.state.chat = make_chat(settings)
         app.state.cache = ResponseCache(async_redis)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).
@@ -210,6 +213,7 @@ def create_app(
         webhooks,
         notifications,
         digests,
+        ask,
     ):
         app.include_router(module.router)
 
