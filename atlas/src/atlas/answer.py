@@ -43,11 +43,12 @@ SYSTEM = (
 )
 
 # Repeated after the sources, right before the model writes: a small model forgot the
-# system prompt's citation rule after reading 1,300 tokens of code (lesson 6.7).
+# system prompt's citation rule after reading 1,300 tokens of code (lesson 6.7). The
+# example shows only the format: an earlier example sentence ("EarlyStopping takes a
+# patience argument [2].") turned up, word for word, in an answer about F1 scores (6.8).
 CITATION_RULE = (
-    "Answer in at most 150 words. After every sentence that uses a source, put its number "
-    "in square brackets, for example: EarlyStopping takes a patience argument [2]. "
-    "Use only the sources above."
+    "Answer in at most 150 words. End every sentence that uses a source with the source's "
+    "number in square brackets, like this: [2]. Use only the sources above."
 )
 
 CITATION = re.compile(r"\[(\d+)\]")
