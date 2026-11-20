@@ -12,6 +12,10 @@ expected files is one Atlas should decline. Three kinds of checks:
 - Grounding: is every claim in the answer supported by what it cites? Only a reader can
   tell, so a model reads (the judge). The judge makes mistakes too, so its verdicts are
   compared with a person's on a fixed set of answers (hand_grades.jsonl).
+
+The judge is only as trustworthy as that comparison says. With qwen3:1.7b it agreed with
+the hand grades on 4 of 10 answers, calling every one supported (lesson 6.8), so its
+verdict is reported but no threshold depends on it. Thresholds gate only the exact checks.
 """
 
 import json

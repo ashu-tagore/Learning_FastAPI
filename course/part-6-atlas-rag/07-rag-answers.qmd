@@ -65,7 +65,7 @@ number of epochs [1]. The `EarlyStopping` handler is configured with a `patience
 determines how many epochs to wait for no improvement before stopping training [1]. ...
 ```
 
-Citations on every sentence, and shorter (the rule also asks for at most 150 words), so it finished in a fifth of the time. Models attend most reliably to the start and the end of a long prompt; put the rules that matter at the end too.
+Citations on every sentence, and shorter (the rule also asks for at most 150 words), so it finished in a fifth of the time. Models attend most reliably to the start and the end of a long prompt; put the rules that matter at the end too. (The rule's example sentence later caused trouble of its own; lesson 6.8 shows how it was found, and the reference code's rule shows only the format.)
 
 ### No relevant sources, no model
 

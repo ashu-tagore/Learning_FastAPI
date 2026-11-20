@@ -1,0 +1,338 @@
+---
+title: "6.8 Evaluating RAG: datasets, recall@k, answer grading, regression checks in CI"
+description: "Measure Atlas's answers instead of admiring a few: a set of questions with known answers, retrieval scores (recall@k, mean reciprocal rank), exact checks on citations and refusals, a model as judge checked against a person's grades, and thresholds that fail CI when quality drops."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 8 · About 3 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "What the measurements found". The trade-offs section *(deep dive)* covers dataset size, nondeterminism and stronger judges.
+:::
+
+::: {.callout-note title="Analogy: a driving test with a fixed route"}
+You can't judge a driver from one trip they chose themselves. A driving test uses a fixed route, with known hard spots, the same for everyone; the examiner ticks a checklist, and some boxes are exact ("stopped at the line") while others need judgement ("drove smoothly"). And examiners are themselves checked: a second examiner sometimes rides along, to see whether they agree.
+
+An **evaluation** is that test for Atlas: fixed questions with known answers, exact checks wherever possible, a judge for what can't be checked exactly, and a check on the judge.
+:::
+
+## The problem
+
+Lesson 6.7 ended with an answer that looked good, cited real lines, and was half wrong. Every change to Atlas (a new prompt, more sources, another embedding model, a different chunk size) might make answers better or worse, and trying three questions by hand tells you almost nothing: you remember the impressive answers and forget the bad ones, and the model gives a different answer each time anyway.
+
+What Atlas needs is a number per quality that matters, measured the same way every time, on enough questions that one lucky or unlucky answer doesn't decide it, and checked automatically on every pull request, so a change that makes Atlas worse can't be merged without someone deciding that's acceptable.
+
+## Theory
+
+### An evaluation set
+
+An **evaluation set** is a fixed list of **cases**: inputs with something known about the right output. Atlas's cases are questions about Ignite, each with the files a good answer must come from:
+
+```json
+{"id": "nan-loss", "question": "How do I stop training if the loss becomes NaN?", "expected_paths": ["ignite/handlers/terminate_on_nan.py"]}
+{"id": "coreml", "question": "How do I export a model to Core ML for iPhones?", "expected_paths": []}
+```
+
+Expected files, not expected answers: an answer can be worded a hundred ways, but if it's right, it cites `terminate_on_nan.py`. A case with no expected files is one Atlas should **decline**, because Ignite doesn't contain the answer. Both kinds matter: a system that never declines looks great on answerable questions.
+
+Each expected file was checked by reading Ignite at commit `0abbcab`, and the set pins that commit: when files move, cases can silently stop meaning what they say.
+
+### Retrieval metrics
+
+Retrieval comes first because it is the ceiling (lesson 6.7): if search doesn't find the file, no model can cite it. For each answerable case, take the **rank** of the first result from an expected file (1 if it's the top result, none if it's not in the top 10). Then:
+
+- **recall@k** is the share of cases whose rank is at most k. recall@5 = 0.6 means "for 60% of the questions, a right file was in the top five".
+- **Mean reciprocal rank** (MRR) is the average of 1/rank, counting 0 when not found. It rewards finding things *early*: rank 1 counts fully, rank 2 half, rank 7 a seventh.
+
+Worked example, the one in the tests: four questions found at ranks 1, 2, 7 and never.
+
+| | rank 1 | rank 2 | rank 7 | not found | result |
+|---|---|---|---|---|---|
+| in top 5? | yes | yes | no | no | recall@5 = 2/4 = 0.5 |
+| in top 10? | yes | yes | yes | no | recall@10 = 3/4 = 0.75 |
+| 1/rank | 1 | 0.5 | 0.143 | 0 | MRR = 1.643/4 = 0.411 |
+
+Retrieval metrics are **exact**: no model, no judgement, the same number every run (given the same index), and they take seconds.
+
+### Checking answers exactly
+
+Some things about an answer are exact too:
+
+- **Cites an expected file**: did any `[n]` point at one of the case's files?
+- **Valid citations**: does every `[n]` match a source (lesson 6.7)?
+- **Wrongly refused**: did Atlas decline an answerable question?
+- **Correctly refused**: did it decline an unanswerable one?
+
+None of these say whether the answer is *true*. An answer can cite the right file and misread it, which is exactly what lesson 6.7's `every` answer did.
+
+### A model as judge
+
+Whether every claim in an answer is supported by the lines it cites is a question only a reader can answer. Reading every answer by hand doesn't scale to every pull request, so a common approach is **LLM-as-judge**: give a model the sources and the answer, and ask for a structured verdict (lesson 6.3):
+
+```python
+class Verdict(BaseModel):
+    supported: bool
+    unsupported_claims: list[str]
+```
+
+The catch is that the judge is a model, with all the failure modes of the model it judges. So the judge is evaluated too: a person grades a fixed set of answers by hand, and the judge's verdicts on *the same answers* are compared with theirs. The **agreement rate** is how far the judge can be trusted. A judge that hasn't been checked this way is a random number generator with good manners.
+
+### Regression checks
+
+A **regression** is something that used to work and no longer does. A **regression check** runs the evaluation on every change and fails if a score drops below a **threshold**, the lowest acceptable value. Thresholds come from measured scores, minus a margin for run-to-run variation (the chat model doesn't give the same answer twice), and only for metrics that can be trusted.
+
+```{mermaid}
+flowchart LR
+    C[evals/ignite.jsonl<br/>30 cases] --> R[Retrieval<br/>rank of first expected file]
+    R --> RM[recall@5, recall@10, MRR<br/>per search mode]
+    C --> A[Answer each question<br/>as POST /ask would]
+    A --> X[Exact checks<br/>expected file, valid citations,<br/>refusals]
+    A --> J[Judge model<br/>every claim supported?]
+    H[evals/hand_grades.jsonl<br/>10 answers graded by a person] --> JA[Judge agreement]
+    J -.checked by.-> JA
+    RM --> T{evals/thresholds.json}
+    X --> T
+    T -->|below| F[CI fails]
+    T -->|at or above| P[CI passes]
+```
+
+## In the project
+
+### Red: the arithmetic and the gate
+
+```python
+def test_recall_and_mean_reciprocal_rank() -> None:
+    # Found first, found second, found seventh, never found.
+    scores = retrieval_scores([1, 2, 7, None])
+
+    assert scores == {
+        "recall_at_5": 0.5,  # two of four in the top 5
+        "recall_at_10": 0.75,
+        "mrr": round((1 + 1 / 2 + 1 / 7) / 4, 3),
+    }
+
+
+def test_scores_below_a_threshold_are_reported_and_unmeasured_ones_skipped() -> None:
+    scores = {
+        "retrieval": {"hybrid": {"recall_at_5": 0.6}},
+        "answers": {"cites_expected": 0.9, "wrongly_refused": 0.2},
+    }
+    thresholds = {
+        "retrieval.hybrid.recall_at_5": 0.7,
+        "answers.cites_expected": 0.8,
+        "answers.wrongly_refused": 0.1,  # lower is better
+        "answers.supported": 0.5,  # not in this run
+    }
+
+    problems = evals.below_thresholds(scores, thresholds)
+
+    assert problems == [
+        "retrieval.hybrid.recall_at_5 is 0.6, below the threshold of 0.7",
+        "answers.wrongly_refused is 0.2, above the threshold of 0.1",
+    ]
+```
+
+And a whole run against the sample repository, with the fake embedder and a fake model playing both answerer and judge: one answerable case ("def accuracy return") and one to decline ("bake bread"). It checks every score, and that "bake bread" never reached the model (`len(ollama.requests) == 2`: one answer, one verdict). A last test reads the committed cases and checks their ids are unique and that both kinds exist.
+
+### Green: `atlas/evals.py`
+
+The rank and the scores:
+
+```python
+def first_relevant_rank(paths: list[str], expected: list[str]) -> int | None:
+    """The position (from 1) of the first result from an expected file, if any."""
+    for position, path in enumerate(paths, start=1):
+        if path in expected:
+            return position
+    return None
+
+
+def retrieval_scores(ranks: list[int | None]) -> dict[str, float]:
+    count = len(ranks)
+    found_in_5 = sum(1 for rank in ranks if rank is not None and rank <= 5)
+    found_in_10 = sum(1 for rank in ranks if rank is not None and rank <= 10)
+    reciprocal = sum(1 / rank for rank in ranks if rank is not None)
+    return {
+        "recall_at_5": round(found_in_5 / count, 3),
+        "recall_at_10": round(found_in_10 / count, 3),
+        "mrr": round(reciprocal / count, 3),
+    }
+```
+
+Answering a case reuses lesson 6.7's functions, so the evaluation measures exactly what `POST /ask` does:
+
+```python
+def answer_case(session, chat, repo, case, query_vector, model) -> AnswerOutcome:
+    """Answer one question as POST /ask would, then check the answer."""
+    started = time.monotonic()
+    sources = answer.find_sources(session, repo, case.question, query_vector, model)
+    text = answer.NOT_FOUND
+    if sources:
+        text = chat.complete(answer.answer_request(case.question, sources, history=[])).text
+    seconds = time.monotonic() - started
+
+    refused = answer.NOT_FOUND.rstrip(".") in text
+    cited, invalid = answer.check_citations(text, sources)
+    cited_paths = [source.path for source in cited]
+    cites_expected = any(path in case.expected_paths for path in cited_paths)
+
+    # Only answers that make claims are judged: a refusal has nothing to support.
+    verdict = None
+    should_judge = case.answerable and not refused and bool(cited)
+    if should_judge:
+        verdict = judge_answer(chat, cited, text)
+    return AnswerOutcome(...)
+```
+
+(Type hints trimmed.) `judge_answer` sends the cited sources and the answer with the `Verdict` schema, and returns `None` if the reply isn't a valid verdict, which counts as "not judged" rather than as either answer. `judge_agreement` re-judges the answers in `evals/hand_grades.jsonl`, which stores each graded answer *with the exact sources it cited*, so the judge sees what the person saw. And `below_thresholds` compares scores with `evals/thresholds.json`, where names like `"retrieval.hybrid.recall_at_5"` are paths into the report.
+
+`atlas eval` runs it all and prints a summary; `--retrieval-only` skips the chat model and takes seconds, `--report` writes every case's result as JSON, and `--thresholds` makes the exit code 1 when a score is below its threshold.
+
+### In CI: `.github/workflows/evals.yml`
+
+A separate workflow, so it doesn't slow down the fast checks. On every pull request that touches `atlas/` or `evals/`, it starts Postgres and Ollama, pulls both models (cached between runs: 1.4 GB), fetches Ignite at the pinned commit, runs `atlas index` and `atlas embed`, then `atlas eval` with the thresholds and hand grades, and uploads the report as an artifact even when the evaluation fails, so the failing cases can be read. It takes about an hour, almost all of it embedding Ignite on the runner's CPU.
+
+FIRST_CI_RUN
+
+## What the measurements found
+
+### Retrieval
+
+```text
+retrieval keyword  recall_at_5 0.2, recall_at_10 0.24, mrr 0.186
+retrieval semantic recall_at_5 0.56, recall_at_10 0.64, mrr 0.403
+retrieval hybrid   recall_at_5 0.64, recall_at_10 0.72, mrr 0.442
+```
+
+The same story as lesson 6.6's ten questions, on twenty-five: hybrid search beats either alone. It also sets the ceiling: for 36% of the questions, no expected file reaches the five sources the model reads.
+
+### The similarity gate
+
+Lesson 6.7 set the similarity threshold at 0.6 from two questions. Here is the nearest chunk's similarity for all thirty:
+
+```text
+0.548  UNANSWERABLE capital
+0.554  UNANSWERABLE weather
+0.587  UNANSWERABLE bread
+0.624  answerable   time-limit
+0.653  UNANSWERABLE kubernetes
+0.654  answerable   change-lr
+0.654  UNANSWERABLE coreml
+0.655  answerable   every-n
+0.690  answerable   save-every-epochs
+...
+0.811  answerable   supervised-trainer
+```
+
+No threshold separates the two kinds. Everyday questions sit below 0.6; but "How do I write a Kubernetes deployment manifest?" (0.653) and "How do I export a model to Core ML?" (0.654) sound like the codebase and score above three questions it can answer. Raising the threshold to 0.66 would block them, and three answerable questions with them. 0.6 stays; the technical ones have to be caught by the prompt's "couldn't find" rule. In every run, they were.
+
+### Answers: the first run
+
+```text
+30 cases in 14.9 min
+answers   cites_expected 0.48, valid_citations 1.0, wrongly_refused 0.0, correctly_refused 1.0, supported 1.0, judged 25
+```
+
+Every citation pointed at a real source, every answerable question got an answer, every unanswerable one was declined. But only 12 of 25 answers cited an expected file, fewer than retrieval's 16 of 25 in the top five: given the right file among five sources, the model sometimes cited another. And the judge said every one of 25 answers was fully supported. That last number is the one to be suspicious of.
+
+### A bug the evaluation found
+
+Reading the answers (the report has every one) turned up this, answering "How do I combine precision and recall into one score?":
+
+```text
+... The `Rouge` class in `_pyrouge.py` [5] also uses a similar approach to compute a score based on
+precision and recall.
+
+EarlyStopping takes a patience argument [2].
+```
+
+The last sentence is the example from lesson 6.7's citation rule, copied word for word into an answer about F1 scores. A small model can treat an example as content. The rule now shows only the format (`like this: [2]`), and the runs below use it. Nobody would have found this from a handful of manual tries.
+
+### Checking the judge
+
+Ten answers from the first run, graded by hand against their cited sources, with a reason for each: four fully supported, six not. Two of the six:
+
+- *How often are predictions correct?* The answer presents ROUGE's `Score.precision` (`match / candidate`) as the general measure of correct predictions. The source doesn't say that.
+- *How do I smooth a metric over recent iterations?* Its claims about BLEU's smoothing functions are accurate; its conclusion, that they smooth a metric over iterations, is in no source.
+
+The judge on the same ten answers, twice:
+
+```text
+run 1: agreed 4/10 in 13s; disagreements: [how-often-correct, running-average, save-every-epochs, f1, time-limit, confusion]
+run 2: agreed 4/10 in 12s; ...the same six
+```
+
+It called every answer supported, so it agreed only on the four that were. A second design asked the judge to list each claim with the exact source words that state it, and computed the verdict in code. Same 4 of 10, twice, at 35 seconds an answer instead of 1.3. Its claims for the F1 answer show why:
+
+```text
+- supported=True  claim: The `precision` is calculated as `tp_summation / y_true_positive_count`.
+    evidence: 'recall = tp_summation / y_true_positive_count'
+- supported=True  claim: EarlyStopping takes a patience argument.
+    evidence: 'EarlyStopping takes a patience argument'
+```
+
+The first "evidence" is the line for *recall*. The second is quoted from the answer itself, not from any source. The judge skipped the answer's real errors (the F1 formula appears in no source) and invented support for the rest.
+
+So a 1.7-billion-parameter model can't judge grounding here. That's what checking the judge is for: without the hand grades, "supported 1.0" would have looked like excellent news. Atlas keeps the simple judge (same agreement, 25 times faster), reports its verdict and its agreement in every run, and lets **no threshold depend on it**. A stronger judge, such as a hosted model (lesson 6.2's `ClaudeChat`), would be measured against the same ten hand grades before being trusted.
+
+### Variation and thresholds
+
+VARIANCE_RUNS
+
+## Trade-offs *(deep dive)*
+
+**How many cases.** With 25 answerable cases, one case is 4 percentage points: a change that moves `cites_expected` from 0.48 to 0.52 might be one lucky answer. Hundreds of cases make small differences meaningful, at the cost of writing and checking them, and of longer runs.
+
+**Exact checks or judges.** Exact checks are cheap, repeatable and never wrong about what they measure, but they measure proxies ("cited the right file"). Judges measure what you care about ("is it true?") and must earn trust first. Use exact checks wherever a proxy is good enough, and judges only where it isn't.
+
+**Nondeterminism.** Atlas's chat model samples its words, so answers vary between runs. Setting the sampling temperature to 0 makes most local models nearly repeatable, but not every hosted model accepts a temperature, and real users see the varied answers anyway. Atlas measures the variation and sets thresholds below it instead.
+
+**Strict expected files.** Many "misses" cited examples rather than the library: `examples/mnist/mnist_with_tensorboard_logger.py` for the TensorBoard question, a reasonable answer. Accepting more files per case would raise the score; it would also make it easier to pass by citing anything nearby. The strictness is a choice; write it down and keep it fixed.
+
+**Evaluation data in the database.** The architecture once planned `eval_cases` and `eval_results` tables. Cases and grades are files instead, reviewed in pull requests like code, and each run's report is a CI artifact (decision D30).
+
+## Common mistakes
+
+- **Judging by a few memorable examples.** Measure on a fixed set, the same way every time.
+- **Trusting a judge you haven't checked.** Grade some answers by hand and measure agreement first.
+- **Only answerable cases.** A system that never declines passes them all.
+- **Thresholds at last run's exact scores.** Answers vary; leave a margin, or CI fails at random.
+- **Moving the target.** Changing cases, pinned commit and code in one pull request makes the scores incomparable.
+- **Gating on a metric nobody trusts.** It either fails at random or passes everything.
+
+## Check yourself
+
+**1.** Five questions find an expected file at ranks 1, 3, none, 2, none. What are recall@5 and MRR?
+
+::: {.callout-tip collapse="true" title="Answer"}
+recall@5 = 3/5 = 0.6. MRR = (1 + 1/3 + 0 + 1/2 + 0) / 5 = 1.833 / 5 ≈ 0.367.
+:::
+
+**2.** The judge reports "supported 1.0". Why isn't that good news on its own?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It says nothing until the judge has been checked against a person's grades. A judge that calls everything supported also reports 1.0. Atlas's did exactly that: 4 of 10 agreement, all four on answers that really were supported.
+:::
+
+**3.** Why does the evaluation have five questions Atlas must decline?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Without them, a system that always answers (never declines) can't lose. They measure the "no citation, no claim" rule, and two of them (Kubernetes, Core ML) are the hard kind: they pass the similarity gate, so only the prompt's rule stops a made-up answer.
+:::
+
+## Exercise
+
+Write `atlas eval-diff old.json new.json`, which compares two reports and prints each case whose hybrid retrieval rank or `cites_expected` changed, with the old and new value, then the change in each score. Test the comparison as a function on two small report dictionaries.
+
+::: {.callout-tip collapse="true" title="Solution"}
+EXERCISE_68
+:::
+
+## Stretch
+
+STRETCH_68
+
+## What changed in the project
+
+`atlas/evals.py` (`load_cases`, `retrieval_scores`, `evaluate_retrieval`, `judge_answer`, `answer_case`, `answer_scores`, `run_eval`, `below_thresholds`, `judge_agreement`); `atlas eval`; `evals/ignite.jsonl` (30 cases), `evals/hand_grades.jsonl` (10 graded answers), `evals/thresholds.json`; `.github/workflows/evals.yml`; the citation rule without an example sentence; `tests/test_evals.py`. Decision D30. Commits: `feat: Added the evaluation runner, the Ignite cases and the evals workflow`, `fix: Kept the citation rule's example from leaking into answers, and added hand grades for the judge`.
