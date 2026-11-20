@@ -64,7 +64,7 @@ Some things about an answer are exact too:
 - **Wrongly refused**: did Atlas decline an answerable question?
 - **Correctly refused**: did it decline an unanswerable one?
 
-None of these say whether the answer is *true*. An answer can cite the right file and misread it, which is exactly what lesson 6.7's `every` answer did.
+None of these say whether the answer is *true*. An answer can cite the right file and misread it, which is exactly what lesson 6.7's `n_saved` answer did.
 
 ### A model as judge
 

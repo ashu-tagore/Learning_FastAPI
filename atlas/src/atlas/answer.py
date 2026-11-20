@@ -127,7 +127,7 @@ def find_sources(
 
 
 # "Explain this file" (lesson 6.9) reads the file's own chunks, in order, up to this many:
-# about 360 lines, which a CPU model reads in roughly half a minute.
+# at most 360 lines. early_stopping.py's first six (159 lines) took 25 seconds to read.
 EXPLAIN_SOURCES = 6
 
 

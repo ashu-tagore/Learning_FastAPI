@@ -387,7 +387,7 @@ A network chunk can end in the middle of an event, so the last piece after split
 
 ![The Ask tab after a real answer: the question, the answer with its citation [4] as a link, the five sources with their lines and symbols, and the rating buttons.](images/6-7-ask-page.png){fig-alt="The Atlas web page on its Ask tab. The question reads 'How do I save a checkpoint of the model every few epochs?'. Below it, an answer ends with a linked [4]. A list of five sources follows, each a link such as '[4] ignite/handlers/checkpoint.py:205-264 Checkpoint'. Two buttons read Helpful and Not helpful."}
 
-In this run the sources arrived after 0.25 seconds, the first words after 15, and the whole answer after 22. Read it closely, though: "attaching a Checkpoint handler to the EPOCH_COMPLETED event with a `every` parameter". In source [4], `every` is an argument to the *event* (`Events.ITERATION_COMPLETED(every=1000)`), not to `Checkpoint`. The citation is real and the answer is half right. Lesson 6.8 is about catching exactly this.
+In this run the sources arrived after 0.14 seconds, the first words after 16, and the whole answer after 26. Read it closely, though: "if you want to save every 2 epochs, set `n_saved=2`". Ignite's documentation says `n_saved` is the "number of objects that should be kept on disk"; how often to save is set on the event, as source [4] itself shows (`Events.ITERATION_COMPLETED(every=1000)`). The citation is real, the handler is the right one, and the answer is half wrong. Lesson 6.8 is about catching exactly this.
 
 ## Trade-offs *(deep dive)*
 

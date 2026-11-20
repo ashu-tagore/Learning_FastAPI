@@ -83,7 +83,7 @@ All JSON unless noted. Auth is a bearer JWT except where marked public.
 | Fit | `GET /users/me/fits` (issues ranked by a model's fit score for my skills profile, scored ahead of time by `atlas fit`) |
 | Issues | `GET /issues?repo=&label=` (newest first; fit ranking is `GET /users/me/fits`), `GET /issues/{id}`, `PUT /issues/{id}/saved`, `DELETE /issues/{id}/saved` |
 | Search | `GET /search?q=&repo=&mode=keyword\|semantic\|hybrid&limit=` |
-| Ask | `POST /ask` (Server-Sent Events stream), `GET /conversations`, `GET /conversations/{id}`, `POST /answers/{id}/feedback` |
+| Ask | `POST /ask` (Server-Sent Events stream), `GET /conversations`, `GET /conversations/{id}`, `POST /answers/{id}/feedback`, `POST /explain` (one file, streamed like an answer) |
 | Runs | `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events` (SSE), `POST /runs/{id}/approve`, `POST /runs/{id}/reject`, `POST /runs/{id}/cancel` |
 | Briefs | `GET /briefs/{id}`, `GET /briefs/{id}.md` |
 | Usage | `GET /usage` (tokens and cost per day, per feature) |

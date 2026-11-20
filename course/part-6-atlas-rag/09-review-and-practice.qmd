@@ -36,7 +36,7 @@ Then the API, the worker and the scheduler as in lesson 5.7. The worker's `embed
 | RAG | Retrieve, number, cite; no relevant source, no model; stream over SSE | [6.7](07-rag-answers.qmd) |
 | Evaluation | Cases with known answers; recall@k and MRR; a judge checked against people | [6.8](08-evaluating-rag.qmd) |
 
-Part 6 found real problems by measuring, each now in a test or a number: HNSW quietly returning 40 rows for `LIMIT 50` (6.6), a small model forgetting the citation rule after a long prompt (6.7), technical questions slipping past the similarity gate (6.8), and a judge that EVAL_JUDGE_RECAP (6.8).
+Part 6 found real problems by measuring, each now in a test or a number: HNSW quietly returning 40 rows for `LIMIT 50` (6.6), a small model forgetting the citation rule after a long prompt (6.7), technical questions slipping past the similarity gate (6.8), a refusal check that counted a made-up answer as declining (6.8), and a judge that called every answer supported, right or wrong (6.8).
 
 ## Mixed practice
 
@@ -86,7 +86,7 @@ nothing_close = not semantic
 ```
 
 ::: {.callout-tip collapse="true" title="Solution"}
-Every question now reaches the model, with the five least irrelevant chunks: "bake bread" gets Ignite's code as sources. Whether the model then declines depends on the model, the prompt and luck; lesson 6.8 measured the prompt rule alone on the two technical questions that pass the gate: EVAL_PROMPT_RULE. And every off-topic question now costs a model call. Two tests catch it: `test_nothing_is_a_source_when_even_the_nearest_chunk_is_far` (`assert [Source(...)] == []`), and the API test, where the fake model was called with no reply queued (`IndexError: pop from empty list`). The number is measured, not magic: lesson 6.8 shows where it came from and where it fails.
+Every question now reaches the model, with the five least irrelevant chunks: "bake bread" gets Ignite's code as sources. Whether the model then declines depends on the model, the prompt and luck; lesson 6.8 measured the prompt rule alone on the two technical questions that pass the gate: Kubernetes was declined in all three runs, Core ML in one of three. And every off-topic question now costs a model call. Two tests catch it: `test_nothing_is_a_source_when_even_the_nearest_chunk_is_far` (`assert [Source(...)] == []`), and the API test, where the fake model was called with no reply queued (`IndexError: pop from empty list`). The number is measured, not magic: lesson 6.8 shows where it came from and where it fails.
 :::
 
 **Change 3**, in `web/app.js`, "build the links with a regular expression instead of all that DOM code":
@@ -205,7 +205,127 @@ with `explain` a two-line helper that posts `{"path": path}` with the headers. T
 :::
 
 ::: {.callout-tip collapse="true" title="The reference solution"}
-EXPLAIN_SOLUTION
+In `answer.py`, choosing the sources and the question; the prompt is lesson 6.7's `answer_request`, unchanged:
+
+```python
+EXPLAIN_SOURCES = 6
+
+
+def file_sources(
+    session: Session, repo_full_name: str, path: str, limit: int = EXPLAIN_SOURCES
+) -> tuple[list[Source], bool]:
+    """A file's chunks in line order, numbered from 1, and whether the file had more.
+
+    No search: the question names the file, so its chunks are the sources.
+    """
+    commit = session.scalar(select(Repo.indexed_commit).where(Repo.full_name == repo_full_name))
+    rows = session.execute(
+        select(Chunk.start_line, Chunk.end_line, Chunk.symbol, Chunk.text)
+        .join(Chunk.document)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name, Document.path == path)
+        .order_by(Chunk.start_line)
+        .limit(limit + 1)  # one more than needed: if it comes back, the file is longer
+    ).all()
+    truncated = len(rows) > limit
+    sources = [
+        Source(number, path, row.start_line, row.end_line, row.symbol, row.text, commit)
+        for number, row in enumerate(rows[:limit], start=1)
+    ]
+    return sources, truncated
+
+
+def explain_question(path: str, truncated: bool) -> str:
+    question = f"Explain what {path} does, part by part, for someone new to the project."
+    if truncated:
+        question += " The sources cover only the start of the file; say so."
+    return question
+```
+
+In `routes/ask.py`, a dependency that loads the chunks before streaming (so a missing file is a 404, and the route doesn't query twice), and the route, which is `/ask`'s streaming loop without the conversation:
+
+```python
+async def file_to_explain(body: ExplainIn, user: CurrentUser, session: SessionDep) -> FileToExplain:
+    """The file's chunks, loaded before the stream starts, so a missing file is a 404."""
+    sources, truncated = await session.run_sync(
+        lambda sync: file_sources(sync, body.repo, body.path)
+    )
+    if not sources:
+        raise ApiError(
+            status.HTTP_404_NOT_FOUND, "file_not_found", f"{body.path} isn't indexed in {body.repo}"
+        )
+    return FileToExplain(sources, truncated)
+
+
+@router.post(
+    "/explain",
+    response_class=EventSourceResponse,
+    dependencies=[Depends(limit_per_user("explain", ASKS_PER_MINUTE))],
+    responses={404: {"description": "The file isn't indexed"}},
+)
+async def explain(
+    body: ExplainIn,
+    target: Annotated[FileToExplain, Depends(file_to_explain)],
+    session: SessionDep,
+    chat: ChatDep,
+) -> AsyncIterator[ServerSentEvent]:
+    """Explain one file from its own chunks, streamed like an answer, with citations."""
+    sources = target.sources
+    yield ServerSentEvent(
+        event="sources", data=[source_out(body.repo, source) for source in sources]
+    )
+    question = explain_question(body.path, target.truncated)
+    # The same prompt as an answer; logged under its own purpose, for the cost breakdown.
+    request = replace(answer_request(question, sources, history=[]), purpose="explain")
+    parts: list[str] = []
+    result: ChatResult | None = None
+    try:
+        async for event in iterate_in_threadpool(chat.stream(request)):
+            if isinstance(event, TextDelta):
+                parts.append(event.text)
+                yield ServerSentEvent(event="delta", data={"text": event.text})
+            else:
+                result = event
+    except LLMError:
+        yield model_unavailable()
+        return
+
+    assert result is not None  # a stream ends with its ChatResult
+    await session.run_sync(lambda sync: record(sync, result))
+    await session.commit()
+    cited, invalid = check_citations("".join(parts), sources)
+    done = ExplainDone(
+        cited=[source.number for source in cited],
+        invalid_citations=invalid,
+        stop_reason=result.stop_reason,
+        truncated=target.truncated,
+    )
+    yield ServerSentEvent(event="done", data=done)
+```
+
+`replace` (from `dataclasses`) copies the request with one field changed, so explanations are logged as `explain` in the cost log. The four tests pass.
+
+Against the real Ignite index, through the running API:
+
+```text
+6 sources, lines 1-159
+first word 25.0s; done 48.6s: {'cited': [2], 'invalid_citations': [], 'stop_reason': 'end', 'truncated': True}
+The file `ignite/handlers/early_stopping.py` defines a class `EarlyStopping` that handles early stopping
+in a training process. It supports monitoring a score and stopping the training if no improvement is
+observed after a certain number of events. ...
+```
+
+An accurate explanation, but with one citation in four paragraphs, and no mention that it covers only the first 159 lines although the prompt asked for that. The first attempt, right after the model had been loaded, cited nothing at all and ended with a stray `[I2]`. A short file did better:
+
+```text
+4 sources, lines 1-53
+done 17.1s: {'cited': [2, 3, 1, 4], 'invalid_citations': [], 'stop_reason': 'end', 'truncated': False}
+The `ignite/handlers/terminate_on_nan.py` file defines a handler to stop training when a NaN or
+infinite value is detected in the output of a training engine. [2] explains that the handler checks if
+the output contains a NaN or infinite number or tensor. ...
+```
+
+The pattern from lesson 6.7 again: the longer the prompt, the less a small model follows the rules at its end. The page should therefore show the `truncated` flag itself rather than rely on the model to mention it, and an evaluation for explanations (a few files, checking `cited` is not empty) would show whether a change, such as fewer sources, helps.
 :::
 
 ## From earlier parts
