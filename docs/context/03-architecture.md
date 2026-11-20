@@ -85,8 +85,9 @@ flowchart LR
 
 1. Keyword search (Postgres full-text) and vector search (pgvector HNSW index, `hnsw.ef_search` raised to the candidate count) each return 50 candidates, filtered by repository, kind and, for vectors, embedding model.
 2. Results merge with reciprocal rank fusion (k = 60). `GET /search?mode=` also offers each search alone; if the embedding model is down, search falls back to keywords and says so in `X-Search-Mode`.
-3. The top chunks go into the prompt with their ids; the model must cite ids, which become `file:line` links.
-4. The answer streams to the client over Server-Sent Events.
+3. `POST /ask` (lesson 6.7) first checks the nearest chunk's cosine similarity: below 0.6 (measured for `nomic-embed-text`), Atlas answers "I couldn't find this in the indexed code." without calling a model. Otherwise the five best fused chunks go into the prompt, numbered, after up to three earlier turns of the conversation (without their sources); the citation rule is repeated after the sources, where a small model still follows it. A follow-up is searched together with the previous question.
+4. The model cites sources as `[n]`; Atlas checks each number against the sources, reports made-up ones, and stores citations as copies (path, lines, symbol, commit) so they survive re-indexing. Links point at the indexed commit on GitHub.
+5. The answer streams to the client over Server-Sent Events (FastAPI's `EventSourceResponse`): `sources`, then `delta` events, then `done` or `error`. Checks that should be a 404 run in a dependency, before the stream starts. Nothing is stored unless the answer completes.
 
 ## Agent runs
 
@@ -162,7 +163,8 @@ erDiagram
 | `approvals` | run_id, decision, explanation, decided_at |
 | `issue_briefs` | run_id, sections (JSON), markdown, repro_verified |
 | `llm_calls` | provider, model, purpose, tokens in/out, cost, latency_ms, run_id |
-| `eval_cases`, `eval_results` | retrieval and agent evaluation data |
+
+Evaluation data is not in the database: cases, thresholds and hand grades are files in `evals/` (reviewed in pull requests like code), and each run writes a JSON report that CI keeps as an artifact (D30).
 
 ## Local development stack
 
