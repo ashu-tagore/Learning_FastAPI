@@ -60,7 +60,7 @@ def schedule_once(ctx: WorkerContext) -> tuple[int, int]:
         repo_ids = list(session.scalars(select(Repo.id)))
         new_job_ids = []
         for repo_id in repo_ids:
-            for kind in ("sync_repo", "sync_issues", "snapshot_repo"):
+            for kind in ("sync_repo", "sync_issues", "snapshot_repo", "embed_repo"):
                 job_id, created = create_job(session, kind, repo_id)
                 if created:
                     new_job_ids.append(job_id)

@@ -29,7 +29,7 @@ def sample_repo(tmp_path: Path) -> Path:
 import os  # noqa: E402
 from collections.abc import Iterator  # noqa: E402
 
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Engine  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -46,6 +46,10 @@ def engine() -> Iterator[Engine]:
     engine = create_engine(url)
     # Start from empty tables every run, whatever a previous run left behind.
     Base.metadata.drop_all(engine)
+    with engine.begin() as connection:
+        # The vector type comes from the pgvector extension (lesson 6.4); migration 0010
+        # creates it in real databases.
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
@@ -81,10 +85,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E4
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
-from atlas.api.deps import get_queue, get_session  # noqa: E402
+from atlas.api.deps import get_embedder, get_queue, get_session  # noqa: E402
 from atlas.api.limits import RateLimiter, ResponseCache, get_cache, get_limiter  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
+from tests.fake_llm import FakeEmbeddings  # noqa: E402
 
 
 @pytest.fixture
@@ -217,6 +222,9 @@ def api_app(
     limiter, cache = api_redis
     app.dependency_overrides[get_limiter] = lambda: limiter
     app.dependency_overrides[get_cache] = lambda: cache
+    # Semantic and hybrid search embed the query: a deterministic fake, no Ollama needed.
+    embedder = FakeEmbeddings()
+    app.dependency_overrides[get_embedder] = lambda: embedder
     return app
 
 
@@ -356,7 +364,13 @@ def worker(
         factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
         events = EventStream(queue.client, name=f"test-events-{uuid.uuid4().hex}")
         context = WorkerContext(
-            factory, queue, settings, snapshot_store, events, issue_tracker.transport()
+            factory,
+            queue,
+            settings,
+            snapshot_store,
+            events,
+            FakeEmbeddings(),
+            issue_tracker.transport(),
         )
         yield context
         events.client.delete(events.name)

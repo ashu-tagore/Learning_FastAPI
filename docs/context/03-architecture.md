@@ -47,8 +47,9 @@ class ChatProvider(Protocol):
     def stream(self, request: ChatRequest) -> Iterator[ChatEvent]: ...
 
 class EmbeddingProvider(Protocol):
+    model: str
     dimensions: int
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
+    def embed(self, texts: list[str], purpose: Literal["document", "query"]) -> list[list[float]]: ...
 ```
 
 | Implementation | Used for | Notes |
@@ -75,14 +76,15 @@ flowchart LR
   E --> DB[(chunks: text, tsvector,<br/>embedding, commit_sha)]
 ```
 
-- Python is chunked by structure (module docstring, class, function) using `ast`, so a chunk is a complete unit with exact line numbers.
-- Markdown and reStructuredText are chunked by heading.
-- Re-indexing touches only changed files; deleted files remove their chunks.
+- Python is chunked by structure (module header, function, method as `Class.method`, class header) using `ast`, so a chunk is a complete unit with exact line numbers. Python that doesn't parse, and other text, falls back to 40-line windows; no chunk exceeds 60 lines.
+- Markdown and reStructuredText are chunked by heading; a chunk's symbol is its heading path (`Install > From pip`).
+- Re-indexing touches only changed files; deleted files remove their chunks. A new chunk identical to an old chunk of the same file keeps its vector.
+- Embedding is its own job, `embed_repo`: batches of 16, one transaction each, about three minutes per run, then the job re-queues itself ("continued") until nothing is pending (D29).
 
 ## Retrieval and answering
 
-1. Keyword search (Postgres full-text) and vector search (pgvector HNSW index) run in parallel.
-2. Results merge with reciprocal rank fusion, filtered by repo and commit.
+1. Keyword search (Postgres full-text) and vector search (pgvector HNSW index, `hnsw.ef_search` raised to the candidate count) each return 50 candidates, filtered by repository, kind and, for vectors, embedding model.
+2. Results merge with reciprocal rank fusion (k = 60). `GET /search?mode=` also offers each search alone; if the embedding model is down, search falls back to keywords and says so in `X-Search-Mode`.
 3. The top chunks go into the prompt with their ids; the model must cite ids, which become `file:line` links.
 4. The answer streams to the client over Server-Sent Events.
 

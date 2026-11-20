@@ -37,6 +37,7 @@ cd atlas && uv run atlas scheduler                         # queues syncs and sn
 cd atlas && docker compose exec ollama ollama pull qwen3:1.7b      # local chat model (Part 6); also nomic-embed-text
 cd atlas && uv run atlas llm "question" --stream             # ask the configured model (6.2); `atlas llm-usage` sums the cost log
 cd atlas && uv run atlas fit --email ada@example.com --limit 5  # score issues against a skills profile (6.3)
+cd atlas && uv run atlas find "stop training early" --repo pytorch/ignite --mode hybrid  # search (keyword|semantic|hybrid, 6.6); the worker's embed_repo job fills vectors (6.4)
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)

@@ -91,6 +91,9 @@ website:
           - part-6-atlas-rag/01-llms-for-engineers.qmd
           - part-6-atlas-rag/02-the-provider-interface.qmd
           - part-6-atlas-rag/03-structured-outputs.qmd
+          - part-6-atlas-rag/04-embeddings-and-pgvector.qmd
+          - part-6-atlas-rag/05-ingestion.qmd
+          - part-6-atlas-rag/06-hybrid-search.qmd
       - section: "Part 7: Production on AWS"
         href: part-7-production-aws/index.qmd
         contents:

@@ -1,0 +1,411 @@
+---
+title: "6.4 Embeddings and vector search with pgvector"
+description: "Search by meaning, not just by matching words: turn chunks into vectors with a local embedding model, store them in Postgres with pgvector, find nearest neighbours with an HNSW index, and embed thousands of chunks in a background job that survives crashes and stays inside its lease."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 4 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers exact versus approximate search, dimensions and dedicated vector databases.
+:::
+
+::: {.callout-note title="Analogy: a library arranged by subject"}
+An index at the back of a book finds pages containing a word. Ask it for "stopping early" and it can't help with a page that says "halt once there's no improvement". A library shelved by subject works differently: books about similar things sit near each other, so you walk to the right shelf and browse what's close.
+
+An **embedding** gives every chunk an address on such a shelf, a point in a space where nearby means similar. **Vector search** walks to the question's address and picks up what's nearest.
+:::
+
+## The problem
+
+Atlas's search (lesson 3.6) matches words. Ask it a question the way a newcomer would:
+
+```text
+$ atlas find "stop training when the validation loss stops improving" --limit 5
+0 chunks
+```
+
+Nothing. Ignite has exactly this feature, `EarlyStopping`, but its code and docstrings say "patience", "score" and "no improvement", not "stops improving". Full-text search requires every meaningful word of the query to appear in a chunk, so one missing word sinks the match. Rephrase and it sometimes works:
+
+```text
+$ atlas find "save the model every few epochs" --limit 5
+ignite/handlers/checkpoint.py:205-264  Checkpoint  0.923  [save], '/tmp/models', n_[saved]=2 ) trainer.add_event_handler(Events.ITERATION_
+examples/transformers/main.py:83-126  training  0.768  [epochs] / 2: best_[model]_handler = Checkpoint( {"[model]": [model]}, utils.get
+...
+```
+
+That one found the right file because the words happen to match. Newcomers don't know Ignite's vocabulary; that's why they're asking. Atlas needs a search that matches meaning, and later (lesson 6.7) the model answering questions needs it too: the answer can only be as good as the chunks retrieved for it.
+
+## Theory
+
+### Embeddings
+
+An **embedding model** turns a piece of text into a list of numbers, a **vector**, such that texts with similar meanings get similar vectors. `nomic-embed-text`, the local model Atlas uses, produces 768 numbers per text:
+
+```text
+query: 'stop training when the validation loss stops improving' -> 768 numbers, first five [0.062, 0.016, -0.162, -0.009, 0.081]
+```
+
+No single number means anything a person could name. Together they place the text at a point in a 768-dimensional space, learned from training on huge numbers of text pairs that should (or shouldn't) be close. It's a different kind of model from the chat model of lessons 6.1 to 6.3: it produces no text, only a vector, and it's much smaller and faster.
+
+### Similarity
+
+"Close" is measured by **cosine similarity**: the cosine of the angle between two vectors, 1 when they point the same way, 0 when unrelated. Its opposite, **cosine distance**, is 1 minus that. The same question against four passages, with real vectors from the local model:
+
+```text
+0.823  same words, other meaning
+0.693  EarlyStopping docstring
+0.614  LR scheduler docstring
+0.571  unrelated: progress bar
+```
+
+The passages were:
+
+- *EarlyStopping docstring*: "EarlyStopping handler can be used to stop the training if no improvement after a given number of events."
+- *LR scheduler docstring*: "Scheduler that changes the learning rate of an optimizer during training, following a cosine curve."
+- *unrelated: progress bar*: "Displays a progress bar with tqdm while the engine runs over the data."
+- *same words, other meaning*: "Validation of the loss function arguments: training stops with an error when they are wrong."
+
+Much of the ordering is right: the early-stopping text is closer than the learning-rate text, which is closer than the progress bar. But the closest of all is the decoy, a sentence built from the question's own words ("validation", "loss", "training stops") that means something else. A small embedding model still leans on surface words. Embeddings are a powerful second signal, not a replacement for keywords, which is why lesson 6.6 combines the two and lesson 6.8 measures the result.
+
+### Queries and documents
+
+Some embedding models are trained to embed a question differently from a passage that answers it, because a question ("how do I stop early?") and its answer ("EarlyStopping halts training when...") don't look alike. `nomic-embed-text` expects a prefix saying which: `search_query: ` for questions, `search_document: ` for passages. Leaving them out works, but less well. Atlas's interface makes the purpose a required argument, so nobody can forget it:
+
+```python
+class EmbeddingProvider(Protocol):
+    model: str
+    dimensions: int
+
+    def embed(self, texts: list[str], purpose: EmbeddingPurpose) -> list[list[float]]: ...
+```
+
+### Vectors in Postgres: pgvector
+
+**pgvector** is a Postgres extension that adds a `vector(n)` column type and distance operators: `<=>` is cosine distance. Atlas keeps vectors next to the chunks they describe, so one query can filter by repository and file kind, and one transaction covers text and vector together (decision D8 explains why there's no separate vector database).
+
+Finding the nearest vectors by checking every row (exact search) is fine for thousands of chunks and slow for millions. An **HNSW index** (Hierarchical Navigable Small World) builds a graph of vectors, each linked to near neighbours, in layers from sparse to dense; a search walks the graph from a coarse entry point toward the query. It's **approximate**: very occasionally it misses a true neighbour, in exchange for searching millions of vectors in milliseconds.
+
+```{mermaid}
+flowchart LR
+    C[Chunk text<br/>with file and symbol header] -->|search_document: ...| E[Embedding model<br/>nomic-embed-text]
+    E --> V[(chunks.embedding<br/>vector 768)]
+    Q[Question] -->|search_query: ...| E2[Embedding model]
+    E2 --> QV[Query vector]
+    QV -->|ORDER BY embedding &lt;=&gt; query<br/>HNSW index| V
+    V --> R[Nearest chunks]
+```
+
+### Embedding is slow: plan for it
+
+Measured on this course's machine (a 4-core CPU, no GPU), 64 real Ignite chunks:
+
+```text
+batch  1: 64 chunks in  39.5 s =  1.6 chunks/s; dims 768
+batch 16: 64 chunks in  39.2 s =  1.6 chunks/s; dims 768
+batch 64: 64 chunks in  39.4 s =  1.6 chunks/s; dims 768
+```
+
+Sending several texts per request didn't help here: the CPU was the bottleneck either way (on a GPU, batching usually helps a lot). At that rate Ignite's whole index takes the better part of an hour. So embedding must be a background job, it must never redo work it has already done, and it must survive being interrupted.
+
+## In the project
+
+### Postgres with pgvector
+
+`compose.yml` (and CI) switch the database image to `pgvector/pgvector:pg17`: Postgres 17 with the extension installed. The switch brought a real surprise. Starting it on the existing data volume, every connection printed:
+
+```text
+WARNING:  database "atlas" has a collation version mismatch
+DETAIL:  The database was created using collation version 2.41, but the operating system provides version 2.36.
+HINT:  Rebuild all objects in this database that use the default collation and run ALTER DATABASE atlas REFRESH COLLATION VERSION, or build PostgreSQL with the right library version.
+```
+
+The pgvector image is built on an older Debian release than the official `postgres:17` image, with an older C library, and the C library decides how text sorts. An index on text built under one set of rules can give wrong answers under another, so Postgres refuses to stay quiet about it. The fix is what the hint says, for each database:
+
+```sql
+REINDEX DATABASE atlas;
+ALTER DATABASE atlas REFRESH COLLATION VERSION;
+```
+```text
+NOTICE:  changing version from 2.41 to 2.36
+```
+
+On a fresh volume none of this happens. The lesson stands for production, though: changing a database's base image can change its sorting rules, and Part 7's upgrade plans check for it.
+
+### The column, the index and the migration
+
+```python
+# The size of nomic-embed-text's vectors. A model with another size needs a migration.
+EMBEDDING_DIMENSIONS = 768
+
+
+class Chunk(Base):
+    __table_args__ = (
+        ...
+        # HNSW: an approximate nearest-neighbour index for "which chunks mean something
+        # close to this?" by cosine distance (lesson 6.4).
+        Index(
+            "ix_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+    ...
+    # Filled in later by the embed_repo job (lesson 6.4); null until then.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS))
+    # Which model made the embedding: vectors from different models can't be compared.
+    embedding_model: Mapped[str | None] = mapped_column(String(100))
+```
+
+`Vector` comes from the `pgvector` Python package (0.5.1). `vector_cosine_ops` tells the index which distance it serves; an index built for one distance can't answer queries using another. Migration `0010` was autogenerated and then given two hand-written parts: `CREATE EXTENSION IF NOT EXISTS vector` first (autogenerate knows nothing of extensions), and, as in lesson 5.4, the CHECK constraint for a new job kind. Its downgrade leaves the extension installed: dropping it would break anything else using vectors.
+
+The model name is stored with every vector because vectors from different models live in different spaces: comparing them gives numbers that mean nothing. Changing `EMBEDDING_MODEL` makes every stored vector "pending" again.
+
+### The provider: `OllamaEmbeddings`
+
+```python
+# nomic-embed-text was trained with these prefixes, and works best when given them: the
+# same words embed differently as a question and as a passage (lesson 6.4).
+NOMIC_PREFIXES: dict[EmbeddingPurpose, str] = {
+    "document": "search_document: ",
+    "query": "search_query: ",
+}
+```
+
+`embed` posts to Ollama's `/api/embed` and checks every vector has the expected 768 numbers: a model swapped without a migration would otherwise fail later, inside Postgres, with a less helpful error. Its test feeds it a fake server answering with 3 numbers and expects `LLMError: ... returned 3 dimensions, expected 768`.
+
+### What gets embedded
+
+A method's body often doesn't mention its file or class. So each chunk is embedded with a header naming them:
+
+```python
+def embedding_input(path: str, symbol: str | None, text: str) -> str:
+    header = f"{path}\n{symbol}" if symbol else path
+    return f"{header}\n\n{text}"
+```
+
+`symbol` (`Engine.run`, `Ignite > Installation`) comes from lesson 6.5's chunker.
+
+### Red: the rules for embedding
+
+`tests/test_embedding.py` uses `FakeEmbeddings`, a deterministic stand-in that hashes words into positions. It knows nothing about meaning, which is the point: the tests check Atlas's plumbing (which chunks, how many per batch, what's committed), not a model.
+
+```python
+def test_a_time_budget_stops_early_and_says_what_remains(
+    session: Session, factory: sessionmaker[Session], sample_repo: Path
+) -> None:
+    storage.index_folder(session, "pytorch/ignite", sample_repo)
+    ticks = iter([0.0, 999.0])  # started at 0; after the first batch, the budget is spent
+
+    summary = embed_pending(
+        factory, FakeEmbeddings(), repo_id(session), batch_size=2, seconds=60,
+        clock=lambda: next(ticks),
+    )
+
+    assert (summary.embedded, summary.remaining) == (2, 2)
+    assert missing(session) == 2  # the first batch was committed before stopping
+```
+
+Others: pending chunks are embedded in batches (`[(3, "document"), (1, "document")]` for four chunks in batches of three); a chunk embedded by another model counts as pending.
+
+### Green: `atlas/embedding.py`
+
+```python
+def embed_pending(session_factory, embedder, repo_id, batch_size=16, seconds=SECONDS_PER_RUN, clock=time.monotonic):
+    """Embed the repository's chunks that need it, until done or out of time."""
+    needs_embedding = (
+        (Document.repo_id == repo_id)
+        & or_(Chunk.embedding.is_(None), Chunk.embedding_model != embedder.model)
+    )
+    started = clock()
+    embedded = 0
+    while True:
+        # At least one batch per run, whatever the budget: a run that could stop before
+        # doing anything would requeue itself forever without progress.
+        out_of_time = embedded > 0 and clock() - started >= seconds
+        if out_of_time:
+            break
+        with session_factory() as session, session.begin():
+            batch = session.execute(
+                select(Chunk, Document.path)
+                .join(Chunk.document)
+                .where(needs_embedding)
+                .order_by(Chunk.id)
+                .limit(batch_size)
+            ).all()
+            if not batch:
+                break
+            texts = [embedding_input(path, chunk.symbol, chunk.text) for chunk, path in batch]
+            vectors = embedder.embed(texts, "document")
+            for (chunk, _), vector in zip(batch, vectors, strict=True):
+                chunk.embedding = vector
+                chunk.embedding_model = embedder.model
+            ...
+        embedded += len(batch)
+```
+
+(Type hints are trimmed here.) Each batch is its own transaction, so a crash loses one batch, not an hour. `or_` builds SQL `OR`. `zip(..., strict=True)` raises if the model returned a different number of vectors than texts, instead of silently pairing the wrong ones.
+
+### A job in slices
+
+At 1.6 chunks a second, embedding Ignite takes far longer than a job's 10-minute lease (lesson 5.1) or the queue's 5-minute visibility timeout. A single long job would be "abandoned" and taken over by another worker while still running. So `embed_pending` stops after `SECONDS_PER_RUN` (180 seconds), and the job tells the runner there's more:
+
+```python
+class MoreWorkRemains(Exception):
+    """A job made progress and stopped early, on purpose, to stay inside its lease."""
+
+
+def embed_repo(ctx: WorkerContext, repo_id: int) -> EmbedSummary:
+    summary = embed_pending(ctx.session_factory, ctx.embedder, repo_id)
+    if summary.remaining:
+        raise MoreWorkRemains(f"embedded {summary.embedded}; {summary.remaining} chunks remain")
+    return summary
+```
+
+`run_job` catches it like a rate limit (lesson 5.3): queue the job again, at once, without counting an attempt. The new outcome is `"continued"`.
+
+Two bugs showed up while building this, both caught by the test for it. First, the test itself was wrong: with a budget of zero, it expected the job to keep continuing, which really meant a job that never progresses requeues forever. The fix is the "at least one batch per run" rule above. Second, with that fixed, the embeddings still weren't saved:
+
+```text
+slice: EmbedSummary(embedded=1, remaining=2)
+run: continued embedded 1; 2 chunks remain
+slice: EmbedSummary(embedded=1, remaining=2)
+run: continued embedded 1; 2 chunks remain
+```
+
+The same chunk was embedded every time. `run_job` wraps every handler in one transaction (so a sync's writes and its "succeeded" commit together, lesson 5.1), and when the slice ended early, that outer transaction rolled back, taking the batches with it. In the tests, all sessions share one connection, so the batches' commits were nested inside it. In production each session has its own connection, so they would have survived; but the job would still have held a transaction open, doing nothing, for three minutes per slice. The fix runs the embedding job outside any surrounding transaction:
+
+```python
+if job.kind == "embed_repo":
+    # Minutes of work that commits batch by batch: it must not run inside one
+    # long transaction, which would hold a connection idle for minutes and, if
+    # the slice ends early, undo the batches it finished (lesson 6.4).
+    embed_repo(ctx, job.repo_id)
+    with ctx.session_factory() as session, session.begin():
+        session.execute(mark_succeeded(job))
+```
+
+The scheduler queues `embed_repo` with the other jobs (migration `0010` adds it to the CHECK constraint). The real run on Ignite, through the same `embed_pending`:
+
+```text
+  3.2 min: 448 embedded, 4183 remaining, 2.35 chunks/s
+  6.3 min: 912 embedded, 3719 remaining, 2.41 chunks/s
+  9.4 min: 1376 embedded, 3255 remaining, 2.45 chunks/s
+  ...
+ 28.9 min: 4631 embedded, 0 remaining, 2.67 chunks/s
+```
+
+Each line is one slice: about three minutes (`SECONDS_PER_RUN`), then a "continued" job in production. Ten slices and 29 minutes for the whole repository, on a CPU, with a model running locally. That is a one-time cost: lesson 6.5 makes later syncs re-embed only what changed.
+
+### Searching by vector
+
+```python
+distance = Chunk.embedding.cosine_distance(query_vector)
+statement = (
+    select(Chunk.id, distance)
+    .join(Chunk.document)
+    .join(Document.repo)
+    .where(Repo.full_name == repo_full_name, Chunk.embedding_model == model)
+    .order_by(distance)
+    .limit(limit)
+)
+```
+
+`cosine_distance` is pgvector's `<=>`. Lesson 6.6 puts this next to keyword search. Does Postgres use the index?
+
+```sql
+EXPLAIN ANALYZE
+SELECT c.id FROM chunks c
+ORDER BY c.embedding <=> '[0.012, -0.034, ...]'   -- the question's 768 numbers
+LIMIT 10;
+```
+```text
+Limit  (cost=1014.16..1056.92 rows=10 width=12) (actual time=1.435..1.515 rows=10 loops=1)
+  ->  Index Scan using ix_chunks_embedding on chunks c  (cost=1014.16..20816.62 rows=4631 width=12) (actual time=1.434..1.512 rows=10 loops=1)
+Execution Time: 1.545 ms
+```
+
+`Index Scan using ix_chunks_embedding`: yes. Postgres uses an HNSW index only for `ORDER BY embedding <=> ... LIMIT n`, with the same operator the index was built for (`vector_cosine_ops` goes with `<=>`). Order by `<->` (Euclidean distance) and it would read every row.
+
+## Trade-offs *(deep dive)*
+
+**Exact or approximate.** Without the index, Postgres compares the query with every vector: exact, and at Atlas's size (thousands of chunks) quick enough. HNSW makes millions of vectors searchable in milliseconds at the cost of occasional misses, more memory, and slower inserts (each new vector is linked into the graph). Its knobs, `m` and `ef_construction` at build time and `hnsw.ef_search` at query time, trade accuracy against speed.
+
+**Filters and approximate indexes.** An HNSW search finds the nearest vectors first and applies `WHERE` filters after. With a filter that matches a small fraction of rows, it can return fewer results than asked. pgvector 0.8 can keep searching until it has enough (`hnsw.iterative_scan`). A related limit does bite Atlas: an HNSW scan returns at most `hnsw.ef_search` rows (40 by default), whatever the `LIMIT`; lesson 6.6 finds it by measuring.
+
+**Dimensions.** More dimensions can hold finer distinctions and cost proportionally more storage and time: 768 numbers of 4 bytes is 3 KB per chunk, 14 MB for Ignite. Some models offer shorter vectors at a small accuracy cost.
+
+**A dedicated vector database.** Products built only for vectors scale to billions and offer more index types. For Atlas, keeping vectors in Postgres means one database, one backup, one transaction for text and vector, and joins with everything else (D8).
+
+**Local or hosted embeddings.** Hosted embedding APIs are fast and strong, and cost money per token; local ones are free and slow on a CPU. Either way the stored model name keeps vectors from different models apart.
+
+## Common mistakes
+
+- **Comparing vectors from different models.** Store the model with every vector; filter by it.
+- **Forgetting the query/document prefixes** for models trained with them.
+- **Embedding inside a request or one long transaction.** Background job, one transaction per batch.
+- **Re-embedding everything after every change.** Embed only what's missing or stale (and lesson 6.5 keeps unchanged chunks' vectors).
+- **An index for the wrong distance.** `vector_cosine_ops` serves `<=>`; L2 or inner-product queries need their own.
+- **Trusting similarity as meaning.** Shared words can outrank shared meaning, as the decoy did.
+
+## Check yourself
+
+**1.** Why does the job stop after 180 seconds instead of embedding until it's done?
+
+::: {.callout-tip collapse="true" title="Answer"}
+A job that runs longer than its 10-minute lease looks abandoned and can be claimed by another worker while still running, and its queue message reappears after the 5-minute visibility timeout. Stopping at 180 seconds keeps each run inside both; `MoreWorkRemains` requeues it immediately, so the total work continues without anyone mistaking a long job for a dead one.
+:::
+
+**2.** A teammate changes `EMBEDDING_MODEL` to another 768-dimension model. What happens to search until the embed job catches up, and why doesn't it return nonsense?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Every stored vector now has the old model's name, so `embed_pending` treats them all as pending and re-embeds them over the following runs. Meanwhile semantic search filters on `embedding_model == model` (the new one), so it only uses vectors made by the new model: results are incomplete until the job finishes, but never compare vectors from two models.
+:::
+
+**3.** Why does `embed_pending` always finish at least one batch, even with no time left?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Otherwise a run could stop before embedding anything, report that work remains, and be requeued to do the same again: a loop that never progresses. One batch per run guarantees every run moves forward.
+:::
+
+## Exercise
+
+Write one SQL query that shows, for Ignite, how many chunks of each kind (`code`, `doc`) exist, how many are embedded, and how many are pending. Run it while the embed job is working.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+SELECT d.kind, count(*) AS chunks, count(c.embedding) AS embedded,
+       count(*) - count(c.embedding) AS pending
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+JOIN repos r ON r.id = d.repo_id
+WHERE r.full_name = 'pytorch/ignite'
+GROUP BY d.kind ORDER BY d.kind;
+```
+`count(column)` counts only rows where the column isn't null, which is exactly "embedded". Eight minutes into the real run:
+```text
+ kind | chunks | embedded | pending
+------+--------+----------+---------
+ code |   4372 |      941 |    3431
+ doc  |    259 |      259 |       0
+```
+The docs were already done: they come first in chunk-id order, which is the order `embed_pending` works in. (To count "embedded by the current model" exactly, add `AND c.embedding_model = 'nomic-embed-text'` inside a `count(*) FILTER (WHERE ...)`.)
+:::
+
+## Stretch
+
+Measure what "approximate" costs. In a session, run `SET enable_indexscan = off` and the vector query reads every row, giving the exact answer. For three questions, compare the top 10 with and without the index, and time both. Our run:
+
+```text
+stop training when the validation loss stops imp same top 10: 10/10; hnsw 1.4 ms, exact 20.0 ms
+show a progress bar during training              same top 10: 10/10; hnsw 1.7 ms, exact 17.5 ms
+save the model every few epochs                  same top 10: 10/10; hnsw 2.1 ms, exact 22.9 ms
+```
+
+At 4631 chunks the index found exactly the right answers, about ten times faster. Both are fast enough here; the gap grows with the number of rows, because the exact scan grows with them and the index barely does.
+
+## What changed in the project
+
+Postgres image `pgvector/pgvector:pg17` in compose and CI (with a collation refresh for existing volumes); `pgvector` 0.5.1; `EmbeddingProvider` and `OllamaEmbeddings`; `chunks.embedding` (vector 768), `chunks.embedding_model`, HNSW index (migration `0010`); `repos.embedded_at` (migration `0011`); `atlas/embedding.py` (`embed_pending`, `embedding_input`); job kind `embed_repo` with `MoreWorkRemains` and the `"continued"` outcome, run outside the job transaction; `tests/test_embedding.py`. Commits: `feat: Added structural chunking, embeddings in pgvector and a sliced embed_repo job`, `feat: Added semantic and hybrid search with reciprocal rank fusion`.

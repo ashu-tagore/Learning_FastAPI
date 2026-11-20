@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     # Claude only: how hard the model thinks (low, medium, high, xhigh, max).
     llm_effort: str = "medium"
+    # Embeddings for semantic search (lesson 6.4). Changing the model means re-embedding
+    # everything, and a model with other dimensions needs a migration of the vector column.
+    embedding_model: str = "nomic-embed-text"
 
 
 class ApiSettings(Settings):

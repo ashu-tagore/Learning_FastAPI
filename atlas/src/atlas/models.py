@@ -20,6 +20,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -50,6 +51,9 @@ class Repo(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     full_name: Mapped[str] = mapped_column(String(200), unique=True)  # "pytorch/ignite"
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When chunks were last embedded (lesson 6.4): semantic results change with it, so it
+    # is part of the search cache's version, like indexed_at.
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The commit the stored index reflects; the next sync indexes only what changed since.
     indexed_commit: Mapped[str | None] = mapped_column(String(40))
     # Conditional requests (lesson 5.3): GitHub's etag for the last issues poll, and the
@@ -82,6 +86,10 @@ class Document(Base):
     chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
 
 
+# The size of nomic-embed-text's vectors. A model with another size needs a migration.
+EMBEDDING_DIMENSIONS = 768
+
+
 class Chunk(Base):
     """A run of consecutive lines from one document: the unit search returns."""
 
@@ -90,13 +98,27 @@ class Chunk(Base):
         CheckConstraint("start_line <= end_line", name="chunks_line_range_valid"),
         # A GIN index makes "which chunks contain these words?" fast (lesson 3.6).
         Index("ix_chunks_tsv", "tsv", postgresql_using="gin"),
+        # HNSW: an approximate nearest-neighbour index for "which chunks mean something
+        # close to this?" by cosine distance (lesson 6.4).
+        Index(
+            "ix_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
     start_line: Mapped[int]
     end_line: Mapped[int]
+    # The function, class, method or heading the chunk belongs to (lesson 6.5).
+    symbol: Mapped[str | None] = mapped_column(String(300))
     text: Mapped[str] = mapped_column(Text)
+    # Filled in later by the embed_repo job (lesson 6.4); null until then.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS))
+    # Which model made the embedding: vectors from different models can't be compared.
+    embedding_model: Mapped[str | None] = mapped_column(String(100))
     # Postgres computes and stores the searchable form whenever text changes.
     # Punctuation becomes spaces first: the English parser would otherwise read
     # code like `self.fire_event` as a web address instead of the words "fire" and "event".
@@ -238,7 +260,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('sync_repo', 'sync_issues', 'snapshot_repo')", name="jobs_kind_valid"
+            "kind IN ('sync_repo', 'sync_issues', 'snapshot_repo', 'embed_repo')",
+            name="jobs_kind_valid",
         ),
         CheckConstraint(
             "status IN ('queued', 'running', 'succeeded', 'dead')", name="jobs_status_valid"

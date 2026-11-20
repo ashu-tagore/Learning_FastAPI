@@ -5,15 +5,16 @@ starts and ends, so several operations can succeed or fail together.
 """
 
 import hashlib
-from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
-from sqlalchemy import Row, Select, case, delete, func, select
+from sqlalchemy import Row, Select, case, delete, func, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from atlas import github
+from atlas.chunking import chunk_file
 from atlas.events import IssueEvent
 from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels, saved_issues
 from atlas.search import DEFAULT_EXTENSIONS, is_in_skipped_folder, iter_source_files
@@ -35,6 +36,7 @@ class Hit:
     end_line: int
     rank: float
     snippet: str
+    symbol: str | None = None
 
 
 def get_or_create_repo(session: Session, full_name: str) -> Repo:
@@ -47,17 +49,7 @@ def get_or_create_repo(session: Session, full_name: str) -> Repo:
     return repo
 
 
-def split_into_chunks(lines: list[str], size: int) -> Iterator[tuple[int, int, str]]:
-    """Yield (start_line, end_line, text) for consecutive blocks of `size` lines.
-
-    Fixed-size blocks are deliberately naive; lesson 6.5 splits by structure instead.
-    """
-    for start in range(0, len(lines), size):
-        block = lines[start : start + size]
-        yield start + 1, start + len(block), "\n".join(block)
-
-
-def read_document(repo: Repo, root: Path, path: Path, chunk_lines: int) -> Document | None:
+def read_document(repo: Repo, root: Path, path: Path) -> Document | None:
     """A Document with its chunks for one file, or None if it can't be stored as text."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -68,16 +60,18 @@ def read_document(repo: Repo, root: Path, path: Path, chunk_lines: int) -> Docum
         return None
 
     lines = text.splitlines()
+    relative = path.relative_to(root).as_posix()
     document = Document(
         repo=repo,
-        path=str(path.relative_to(root)),
+        path=relative,
         kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         line_count=len(lines),
     )
+    # By structure: functions, methods, sections (lesson 6.5).
     document.chunks = [
-        Chunk(start_line=start, end_line=end, text=block)
-        for start, end, block in split_into_chunks(lines, chunk_lines)
+        Chunk(start_line=p.start_line, end_line=p.end_line, symbol=p.symbol, text=p.text)
+        for p in chunk_file(relative, text)
     ]
     return document
 
@@ -88,23 +82,24 @@ def index_folder(
     root: Path,
     *,
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
-    chunk_lines: int = 40,
 ) -> IndexSummary:
     """Replace the stored copy of a codebase with the files under root."""
     repo = get_or_create_repo(session, repo_full_name)
 
     # Delete-then-insert inside the caller's transaction: other sessions keep seeing
     # the old index until the commit, then the whole new one at once.
+    kept = stored_embeddings(session, repo.id, paths=None)
     session.execute(delete(Document).where(Document.repo_id == repo.id))
 
     document_count = 0
     chunk_count = 0
     skipped = 0
     for path in iter_source_files(root, extensions):
-        document = read_document(repo, root, path, chunk_lines)
+        document = read_document(repo, root, path)
         if document is None:
             skipped += 1
             continue
+        reuse_embeddings(document, kept)
         session.add(document)
         document_count += 1
         chunk_count += len(document.chunks)
@@ -112,6 +107,39 @@ def index_folder(
     repo.indexed_at = datetime.now(UTC)
     session.flush()
     return IndexSummary(documents=document_count, chunks=chunk_count, skipped=skipped)
+
+
+# (path, chunk text) -> (vector, model that made it)
+StoredEmbeddings = dict[tuple[str, str], tuple[list[float], str]]
+
+
+def stored_embeddings(session: Session, repo_id: int, paths: list[str] | None) -> StoredEmbeddings:
+    """The vectors of chunks about to be deleted, so unchanged ones can keep theirs (6.5)."""
+    statement = (
+        select(Document.path, Chunk.text, Chunk.embedding, Chunk.embedding_model)
+        .join(Chunk.document)
+        .where(Document.repo_id == repo_id, Chunk.embedding.is_not(None))
+    )
+    if paths is not None:
+        statement = statement.where(Document.path.in_(paths))
+    kept: StoredEmbeddings = {}
+    for path, chunk_text, vector, model in session.execute(statement):
+        if vector is None or model is None:
+            continue
+        kept[(path, chunk_text)] = (list(vector), model)
+    return kept
+
+
+def reuse_embeddings(document: Document, kept: StoredEmbeddings) -> None:
+    """Give each new chunk the vector of an identical old chunk in the same file, if any.
+
+    Embedding is the slow, costly step of indexing; a one-line change to a file shouldn't
+    mean re-embedding every function in it.
+    """
+    for chunk in document.chunks:
+        previous = kept.get((document.path, chunk.text))
+        if previous is not None:
+            chunk.embedding, chunk.embedding_model = previous
 
 
 def update_index(
@@ -122,10 +150,10 @@ def update_index(
     changed: list[str],
     deleted: list[str],
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
-    chunk_lines: int = 40,
 ) -> IndexSummary:
     """Re-index only the files a commit changed (lesson 5.3); every other file is untouched."""
     repo = get_or_create_repo(session, repo_full_name)
+    kept = stored_embeddings(session, repo.id, paths=changed)
     session.execute(
         delete(Document).where(Document.repo_id == repo.id, Document.path.in_([*changed, *deleted]))
     )
@@ -138,10 +166,11 @@ def update_index(
         is_wanted = path.suffix in extensions and not is_in_skipped_folder(Path(relative))
         if not is_wanted:
             continue
-        document = read_document(repo, root, path, chunk_lines)
+        document = read_document(repo, root, path)
         if document is None:
             skipped += 1
             continue
+        reuse_embeddings(document, kept)
         session.add(document)
         document_count += 1
         chunk_count += len(document.chunks)
@@ -197,6 +226,138 @@ def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 
     """Full-text search: chunks matching the query's words, best match first."""
     statement = chunk_search_statement(repo_full_name, query, limit=limit)
     return [hit_from_row(row) for row in session.execute(statement)]
+
+
+# ---------- Semantic and hybrid search (lesson 6.6) ----------
+
+SearchMode = Literal["keyword", "semantic", "hybrid"]
+# Each ranking contributes this many candidates to the fusion: enough to cover the pages
+# people read, few enough to keep both queries fast.
+CANDIDATES = 50
+# The constant from the paper that introduced reciprocal rank fusion (Cormack, Clarke and
+# Buettcher, 2009); it damps the difference between the very top ranks.
+RRF_K = 60
+
+# (chunk id, score), best first
+Ranking = list[tuple[int, float]]
+
+
+def keyword_ranking(
+    session: Session, repo_full_name: str, query: str, kind: str | None, limit: int
+) -> Ranking:
+    ts_query = func.websearch_to_tsquery("english", query)
+    rank = func.ts_rank(Chunk.tsv, ts_query)
+    statement = (
+        select(Chunk.id, rank)
+        .join(Chunk.document)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name, Chunk.tsv.bool_op("@@")(ts_query))
+        .order_by(rank.desc(), Document.path, Chunk.start_line)
+        .limit(limit)
+    )
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+    return [(chunk_id, float(score)) for chunk_id, score in session.execute(statement)]
+
+
+def semantic_ranking(
+    session: Session,
+    repo_full_name: str,
+    query_vector: list[float],
+    model: str,
+    kind: str | None,
+    limit: int,
+) -> Ranking:
+    """The chunks whose vectors are nearest the query's, by cosine distance."""
+    # An HNSW search keeps at most hnsw.ef_search candidates (40 by default), so without
+    # this a request for 50 silently returns 40 (lesson 6.6). SET LOCAL lasts only until
+    # the end of this transaction. int() because SET can't take a bound parameter.
+    candidates = max(int(limit), 40)
+    session.execute(text(f"SET LOCAL hnsw.ef_search = {candidates}"))
+    distance = Chunk.embedding.cosine_distance(query_vector)
+    statement = (
+        select(Chunk.id, distance)
+        .join(Chunk.document)
+        .join(Document.repo)
+        # Vectors from another model live in another space: comparing them is meaningless.
+        .where(Repo.full_name == repo_full_name, Chunk.embedding_model == model)
+        .order_by(distance)
+        .limit(limit)
+    )
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+    # Reported as similarity (1 is identical), so that higher is better, as for keywords.
+    return [(chunk_id, 1 - float(dist)) for chunk_id, dist in session.execute(statement)]
+
+
+def reciprocal_rank_fusion(rankings: list[list[int]], k: int = RRF_K) -> Ranking:
+    """Merge rankings by position alone: each item scores 1 / (k + rank) in each list.
+
+    Keyword scores and cosine similarities are on unrelated scales, so adding them would
+    let one dominate by accident. Positions are comparable: first is first.
+    """
+    scores: dict[int, float] = {}
+    for ranking in rankings:
+        for position, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + 1 / (k + position)
+    # Ties (rare) are broken by id, so results are the same on every run.
+    return sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+
+
+def search_chunks(
+    session: Session,
+    repo_full_name: str,
+    query: str,
+    mode: SearchMode,
+    query_vector: list[float] | None = None,
+    *,
+    model: str | None = None,
+    kind: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[Hit]:
+    """Search one repository by words, by meaning, or both (hybrid), best first."""
+    wanted = max(CANDIDATES, offset + limit)
+    keyword: Ranking = []
+    semantic: Ranking = []
+    if mode in ("keyword", "hybrid"):
+        keyword = keyword_ranking(session, repo_full_name, query, kind, wanted)
+    can_use_vectors = query_vector is not None and model is not None
+    if mode in ("semantic", "hybrid") and can_use_vectors:
+        assert query_vector is not None and model is not None  # for mypy
+        semantic = semantic_ranking(session, repo_full_name, query_vector, model, kind, wanted)
+
+    if mode == "keyword":
+        ranked = keyword
+    elif mode == "semantic":
+        ranked = semantic
+    else:
+        ranked = reciprocal_rank_fusion([[i for i, _ in keyword], [i for i, _ in semantic]])
+    return load_hits(session, query, ranked[offset : offset + limit])
+
+
+def load_hits(session: Session, query: str, ranked: Ranking) -> list[Hit]:
+    """The chunks of a ranking, in its order, with a highlighted snippet each."""
+    if not ranked:
+        return []
+    ts_query = func.websearch_to_tsquery("english", query)
+    snippet = func.ts_headline(
+        "english",
+        Chunk.text,
+        ts_query,
+        "StartSel=[, StopSel=], MaxWords=14, MinWords=5, MaxFragments=1",
+    )
+    rows = session.execute(
+        select(Chunk.id, Document.path, Chunk.start_line, Chunk.end_line, Chunk.symbol, snippet)
+        .join(Chunk.document)
+        .where(Chunk.id.in_([chunk_id for chunk_id, _ in ranked]))
+    ).all()
+    by_id = {row[0]: row for row in rows}
+    hits = []
+    for chunk_id, score in ranked:
+        _, path, start, end, symbol, text = by_id[chunk_id]
+        hits.append(Hit(path, start, end, score, " ".join(text.split()), symbol))
+    return hits
 
 
 def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:

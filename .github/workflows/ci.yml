@@ -16,7 +16,7 @@ jobs:
     # A real Postgres for the database tests (lesson 3.11), same major version as compose.yml.
     services:
       postgres:
-        image: postgres:17
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: atlas
           POSTGRES_PASSWORD: atlas-test-password

@@ -42,6 +42,7 @@ from atlas.api.routes import (
 )
 from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
+from atlas.llm.calls import make_embeddings
 from atlas.logs import configure_logging, current_request_id
 from atlas.queue import RedisQueue
 from atlas.snapshots import SnapshotStore, make_s3_client
@@ -92,6 +93,8 @@ def create_app(
         # checked on every request, so they mustn't block the event loop (lesson 5.5).
         async_redis = redis.asyncio.Redis.from_url(settings.redis_url)
         app.state.limiter = RateLimiter(async_redis)
+        # Embeds search queries for semantic and hybrid search (lesson 6.6).
+        app.state.embedder = make_embeddings(settings)
         app.state.cache = ResponseCache(async_redis)
         yield
         # Runs once at shutdown: close pooled connections cleanly (lesson 2.1's graceful stop).

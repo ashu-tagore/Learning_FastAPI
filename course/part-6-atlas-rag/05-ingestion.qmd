@@ -1,0 +1,342 @@
+---
+title: "6.5 Ingestion: chunking Markdown by heading and Python by ast, incremental re-index"
+description: "Cut code and docs into chunks that are whole thoughts (a function, a method, a section) using Python's own parser and the documents' headings, measure how much better that is than fixed windows, and re-index a changed file without re-embedding the parts that didn't change."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 5 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers chunk size, overlap and other languages.
+:::
+
+::: {.callout-note title="Analogy: cutting a newspaper into clippings"}
+To file a newspaper for later, you could cut it into strips every 10 centimetres. Fast, and every strip is the same size, but half of them start mid-sentence and end in the next article. Or you cut along the articles: each clipping is one story, with its headline on top. That takes knowing where the articles start, which is easy if you can read the layout.
+
+Atlas's first chunker cut every file into 40-line strips. This lesson cuts along the layout: Python by its functions and classes, documents by their headings.
+:::
+
+## The problem
+
+Since lesson 3.6, Atlas has split every file into blocks of 40 lines. Search returns those blocks, and lesson 6.7 will hand them to a model as the evidence for an answer. A block that starts in the middle of one function and ends in the middle of the next is poor evidence: half of what the model needs is missing, and the other half is about something else.
+
+How often does that happen? Counted on Ignite at commit `0abbcab`, for every function and method (using Python's own parser to find where each one starts and ends):
+
+```text
+4397 functions and methods in Ignite's Python files
+windows     2437 chunks,  36.9 lines on average, functions whole in one chunk: 3026 (69%)
+```
+
+Almost one function in three is cut in two. And a block has no name: search can say "lines 361 to 400 of `engine.py`" but not "this is `Engine.run`".
+
+## Theory
+
+### Chunk along structure
+
+A **chunk** should be the smallest piece that makes sense on its own. Files already say where those pieces are:
+
+| File | Structure | A chunk is |
+|---|---|---|
+| Python | functions, classes, methods | one top-level function; a class header (class line, docstring, class attributes); each method |
+| Markdown | `#` headings (outside code blocks) | one section, named by its heading path (`Ignite > Installation`) |
+| reStructuredText | underlined headings | one section, the same way |
+| anything else | none Atlas understands | a 40-line window |
+
+Every chunk records its **symbol**: the function, method or heading path it belongs to. Search results become `ignite/engine/engine.py:Engine.run`, and the embedding of each chunk is headed by its file and symbol (lesson 6.4), so a question mentioning "Engine" finds `Engine.run` even if the method's body never says the word.
+
+Two practical rules:
+
+- **Very long pieces are still cut**, into windows of at most 60 lines that keep the symbol. A 300-line method isn't one thought anyway, and long chunks blur embeddings.
+- **Files that don't parse fall back to windows.** Half-written code, Python 2, templates: the chunker must never fail an index.
+
+### Python's own parser: `ast`
+
+Python ships with a parser for Python. `ast.parse(text)` turns source code into an **abstract syntax tree**: objects for each statement, with exact positions. A `def` becomes an `ast.FunctionDef` with `.name`, `.lineno` (its first line) and `.end_lineno` (its last). Decorators are separate (`.decorator_list`), and belong with their function, so a chunk starts at the first decorator.
+
+```python
+import ast
+
+tree = ast.parse("@cache\ndef f(x):\n    return x\n")
+node = tree.body[0]
+print(type(node).__name__, node.name, node.lineno, node.end_lineno, node.decorator_list[0].lineno)
+# FunctionDef f 2 3 1
+```
+
+Regular expressions can't do this reliably: a `def` inside a string, a multi-line signature, nested functions. The parser knows the language.
+
+### Incremental re-indexing, now with vectors
+
+Lesson 5.3 re-indexes only the files a commit changed. But a changed file is deleted and re-chunked whole, and every one of its chunks would then need a new embedding: at about 2 chunks a second on a CPU, a one-line change to a 100-chunk file costs most of a minute. Usually only one or two of its chunks actually changed. So before deleting a file's chunks, Atlas remembers their vectors by `(path, chunk text)`, and gives each new chunk the vector of an identical old one. Only genuinely new or edited chunks wait for the embed job.
+
+```{mermaid}
+flowchart TD
+    F[Changed file] --> R[Remember old chunks' vectors<br/>by path and text]
+    R --> D[Delete the file's old chunks]
+    D --> P{Parse}
+    P -->|.py| A[ast: functions, class headers, methods]
+    P -->|.md / .rst| H[Headings]
+    P -->|other, or a syntax error| W[40-line windows]
+    A --> L[Cut pieces over 60 lines]
+    H --> L
+    W --> N[New chunks with symbols]
+    L --> N
+    N --> M{Same text as an old chunk?}
+    M -->|yes| K[Keep its vector]
+    M -->|no| E[Embed later, embed_repo job]
+```
+
+## In the project
+
+### Red: what a chunker must do
+
+`tests/test_chunking.py` describes the behaviour on small, readable inputs:
+
+```python
+PYTHON = '''"""Tools for training loops."""
+
+import math
+
+LIMIT = 10
+
+
+@decorated
+def top_level(x):
+    """Double it."""
+    return x * 2
+
+
+class Engine:
+    """Runs the loop."""
+
+    retries = 3
+
+    def __init__(self):
+        self.state = None
+
+    def run(self, data):
+        for batch in data:
+            self.step(batch)
+        return self.state
+'''
+
+
+def test_python_is_split_at_functions_classes_and_methods() -> None:
+    pieces = chunk_file("ignite/engine.py", PYTHON)
+
+    assert spans(pieces) == [
+        (None, 1, 5),  # module docstring, imports and constants (blank edges trimmed)
+        ("top_level", 8, 11),  # the decorator belongs to the function
+        ("Engine", 14, 17),  # class line, docstring and class attributes
+        ("Engine.__init__", 19, 20),
+        ("Engine.run", 22, 25),
+    ]
+    assert pieces[1].text.startswith("@decorated\ndef top_level(x):")
+```
+
+More tests: every non-blank line is in exactly one chunk; a 151-line function becomes three windows all named `huge`; broken code falls back to windows; Markdown splits at headings but not at a `#` comment inside a code fence; reStructuredText splits at underlined headings; YAML gets windows.
+
+### Green: `atlas/chunking.py`
+
+The Python part walks the module's top-level statements, turning definitions into spans and the code between them into unnamed module spans:
+
+```python
+def python_spans(text: str) -> list[Span] | None:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None  # half-written or Python 2 code: line windows instead
+
+    spans: list[Span] = []
+    line_count = len(text.splitlines())
+    next_free = 1  # first line not yet in a span
+    for node in tree.body:
+        if not isinstance(node, DEFINITIONS):
+            continue
+        start = first_line(node)
+        if start > next_free:
+            spans.append((None, next_free, start - 1))  # module-level code before it
+        if isinstance(node, ast.ClassDef):
+            spans.extend(class_spans(node))
+        else:
+            spans.append((node.name, start, last_line(node)))
+        next_free = last_line(node) + 1
+    if next_free <= line_count:
+        spans.append((None, next_free, line_count))
+    return spans
+```
+
+`class_spans` produces the class header (from the class line to just before its first method), each method as `Class.method`, and any class-level code between methods under the class's name. `chunk_file` then trims blank lines off each span's edges and cuts anything over 60 lines into windows.
+
+For documents, both formats reduce to a list of headings, `(line, level, title)`, and one shared function turns them into sections named by their path:
+
+```python
+def sections(headings: list[tuple[int, int, str]], line_count: int) -> list[Span]:
+    spans: list[Span] = []
+    first_heading = headings[0][0] if headings else line_count + 1
+    if first_heading > 1:
+        spans.append((None, 1, first_heading - 1))
+    path: list[tuple[int, str]] = []  # (level, title) of the enclosing headings
+    for index, (line, level, title) in enumerate(headings):
+        path = [entry for entry in path if entry[0] < level]
+        path.append((level, title))
+        end = headings[index + 1][0] - 1 if index + 1 < len(headings) else line_count
+        spans.append((" > ".join(name for _, name in path), line, end))
+    return spans
+```
+
+Markdown headings are `#` to `######` at the start of a line, skipped inside ```` ``` ```` fences. reStructuredText marks a heading by underlining it with a repeated character, and the order in which underline characters first appear in a file sets the levels, so the first one seen (`=`, in all ten of Ignite's `.rst` files) is level 1.
+
+`storage.read_document` now builds chunks from `chunk_file`, storing each piece's `symbol` (migration `0010` added the column). The `chunk_lines` parameter is gone, along with lesson 3.6's `split_into_chunks`; two storage tests changed their expectations, deliberately: the sample `engine.py` now gives the chunks `Engine` and `Engine.run` instead of line pairs, and the search for "fire event" returns the whole `Engine.run` method (lines 2 to 3) instead of one line.
+
+### Measured on Ignite
+
+```text
+4397 functions and methods in Ignite's Python files
+windows     2437 chunks,  36.9 lines on average, functions whole in one chunk: 3026 (69%)
+structure   4631 chunks,  18.0 lines on average, functions whole in one chunk: 4202 (96%)
+```
+
+96% of functions now sit whole in one chunk; the rest are longer than 60 lines (or nested inside such a function), and are cut into named windows on purpose. The price: twice as many chunks, so twice as many embeddings to compute and store, and half the average size. Re-indexing Ignite with the new chunker:
+
+```text
+$ atlas index --path ~/code/ignite --repo pytorch/ignite
+indexed 403 files into 4631 chunks (0 skipped) as pytorch/ignite
+```
+
+### Red, then green: keeping unchanged vectors
+
+```python
+def test_reindexing_keeps_the_embeddings_of_unchanged_chunks(
+    session: Session, factory: sessionmaker[Session], sample_repo: Path
+) -> None:
+    storage.index_folder(session, "pytorch/ignite", sample_repo)
+    embed_pending(factory, FakeEmbeddings(), repo_id(session))
+    engine = sample_repo / "ignite" / "engine" / "engine.py"
+    # Change Engine.run; leave the class line, accuracy and the README alone.
+    engine.write_text(engine.read_text().replace("self.fire_event", "self.fire"))
+
+    storage.update_index(
+        session, "pytorch/ignite", sample_repo, changed=["ignite/engine/engine.py"], deleted=[]
+    )
+
+    still_missing = session.scalars(select(Chunk.symbol).where(Chunk.embedding.is_(None))).all()
+    assert still_missing == ["Engine.run"]
+```
+
+In `storage.py`, `update_index` (and `index_folder`, for full re-indexes) now remembers vectors before deleting:
+
+```python
+def stored_embeddings(session: Session, repo_id: int, paths: list[str] | None) -> StoredEmbeddings:
+    """The vectors of chunks about to be deleted, so unchanged ones can keep theirs (6.5)."""
+    ...
+
+
+def reuse_embeddings(document: Document, kept: StoredEmbeddings) -> None:
+    """Give each new chunk the vector of an identical old chunk in the same file, if any.
+
+    Embedding is the slow, costly step of indexing; a one-line change to a file shouldn't
+    mean re-embedding every function in it.
+    """
+    for chunk in document.chunks:
+        previous = kept.get((document.path, chunk.text))
+        if previous is not None:
+            chunk.embedding, chunk.embedding_model = previous
+```
+
+`chunk.embedding, chunk.embedding_model = previous` assigns both values of the pair at once (**tuple unpacking**). The vector keeps its model name, so a vector from an old model is reused as "pending" and the embed job replaces it.
+
+On Ignite, re-syncing from 30 commits back (lesson 5.3's experiment, now with vectors):
+
+```text
+index at ce87844: 4596 chunks, 0 without a vector
+sync to 0abbcab: 66 files re-indexed into 1026 chunks in 2.2 s
+after: 4631 chunks, 142 without a vector
+  1.7 min: 142 embedded, 0 remaining, 1.37 chunks/s
+```
+
+The 30 commits touched 66 files. Re-indexing them produced 1026 chunks, and 884 of those were identical to a chunk in the old version of their file, so they kept their vectors. Only 142 needed the model: 1.7 minutes instead of the 29 a full embed takes. Without `reuse_embeddings`, all 1026 would have been pending, about seven minutes at the same rate.
+
+## Trade-offs *(deep dive)*
+
+**Chunk size.** Smaller chunks match questions more precisely and give the model less noise; larger ones carry more context. Functions are a natural unit for code; 60 lines caps the long tail.
+
+**Overlap.** Window chunkers often overlap neighbouring windows by some lines, so a sentence cut at a boundary appears whole in one of them. Structural chunks rarely need it, because their boundaries are meaningful.
+
+**Context in the chunk.** Atlas adds the file and symbol to what's embedded. Some systems go further and add a model-written summary of the surrounding file to each chunk; better retrieval, at the cost of a model call per chunk.
+
+**Other languages.** `ast` only parses Python. Tools such as tree-sitter parse many languages with one interface; Atlas would add them as files of those languages appear in tracked repositories. Until then, they get windows.
+
+## Common mistakes
+
+- **Fixed-size windows for code.** Functions get cut in half; chunks have no names.
+- **Splitting on regular expressions.** A `def` in a string or a `#` in a code fence fools them; use a parser.
+- **Failing the whole index on one unparseable file.** Fall back to windows.
+- **Unlimited chunk sizes.** One 400-line method becomes one blurry vector; cut and keep the name.
+- **Re-embedding unchanged chunks.** Reuse vectors by content.
+- **Forgetting decorators.** They're part of the function.
+
+## Check yourself
+
+**1.** A chunk boundary falls between `@dataclass(frozen=True)` and `class Hit:`. What goes wrong, and how does the chunker avoid it?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The decorator would land in the previous chunk (or a module chunk) and `Hit`'s chunk wouldn't show that it's a frozen dataclass, which changes what the class does. The chunker starts each definition at its first decorator's line (`first_line` uses `decorator_list`), so decorators always travel with what they decorate.
+:::
+
+**2.** Why does a file that fails to parse get windows instead of being skipped?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Its text is still searchable and may hold the answer to a question (a half-finished example, a Python 2 script, a template). Skipping it would silently hide it from search; windows are worse chunks, but chunks.
+:::
+
+**3.** A commit changes one line in a file with 40 chunks. How many chunks does the embed job have to embed?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Usually one: the chunk containing the changed line gets new text and so no reused vector; the other 39 have the same `(path, text)` as before and keep theirs. More, if the change moves a boundary (a new function, a renamed heading) and so changes the text of neighbouring chunks.
+:::
+
+## Exercise
+
+Chunk Ignite's `ignite/engine/engine.py` with `chunk_file` and print its five longest chunks, with their symbols and line ranges. What do you notice about their sizes, and why?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from pathlib import Path
+from atlas.chunking import chunk_file
+
+pieces = chunk_file("ignite/engine/engine.py", Path("ignite/engine/engine.py").read_text())
+print(len(pieces), "chunks")
+for p in sorted(pieces, key=lambda p: p.end_line - p.start_line, reverse=True)[:5]:
+    print(f"{p.end_line - p.start_line + 1:>3} lines  {p.start_line:>4}-{p.end_line:<4} {p.symbol}")
+```
+```text
+53 chunks
+ 60 lines    20-79   Engine
+ 60 lines   166-225  Engine.register_events
+ 60 lines   279-338  Engine.add_event_handler
+ 60 lines   479-538  Engine.interrupt
+ 60 lines   562-621  Engine.terminate
+```
+All five are exactly 60 lines: each is the first window of a piece longer than `MAX_LINES`, cut and named after it. Even the `Engine` class header is, because its docstring (with usage examples) is longer than 60 lines. Long docstrings are common in well-documented libraries; that's where most of the cut pieces in the 4% come from. (At commit `0abbcab`.)
+:::
+
+## Stretch
+
+Methods can contain nested functions (helpers defined inside a method). Write a test showing what the chunker does with one, and decide whether that's the right behaviour.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_a_nested_function_stays_in_its_method() -> None:
+    source = "class A:\n    def m(self):\n        def helper():\n            return 1\n        return helper()\n"
+
+    pieces = chunk_file("a.py", source)
+
+    assert [(p.symbol, p.start_line, p.end_line) for p in pieces] == [("A", 1, 1), ("A.m", 2, 5)]
+```
+It passes against the reference code: `class_spans` only looks at a class's direct children, so `helper` stays inside `A.m`'s chunk. That's right: a nested helper only makes sense with the method that uses it, and splitting it out would separate the call from the definition. Not in the reference code.
+:::
+
+## What changed in the project
+
+New `atlas/chunking.py` (`chunk_file`: Python by `ast`, Markdown and reStructuredText by headings, windows otherwise); `chunks.symbol`; `read_document` uses it, `split_into_chunks` and `chunk_lines` removed; `stored_embeddings` and `reuse_embeddings` keep unchanged chunks' vectors on re-index; `tests/test_chunking.py`, and updated storage and API tests. Commit: `feat: Added structural chunking, embeddings in pgvector and a sliced embed_repo job`.

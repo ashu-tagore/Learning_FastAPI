@@ -42,7 +42,7 @@ from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
 from atlas.jobs import WorkerContext, create_job
 from atlas.llm import ChatProvider, ChatRequest, ChatResult, LLMError, TextDelta, user
-from atlas.llm.calls import cost_usd, make_chat, record
+from atlas.llm.calls import cost_usd, make_chat, make_embeddings, record
 from atlas.logs import configure_logging
 from atlas.models import Issue, IssueFit, Job, LlmCall, Repo, User
 from atlas.notifier import run_notifier as run_notifier_loop
@@ -106,10 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser.add_argument("--repo", default=DEFAULT_REPO, help="name to store it under")
     index_parser.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS))
 
-    find_parser = commands.add_parser("find", help="ranked full-text search in Postgres")
+    find_parser = commands.add_parser("find", help="search by keyword, meaning or both")
     find_parser.add_argument("query", help="words to look for")
     find_parser.add_argument("--repo", default=DEFAULT_REPO)
     find_parser.add_argument("--limit", type=int, default=10)
+    find_parser.add_argument(
+        "--mode", choices=["keyword", "semantic", "hybrid"], default="keyword", help="lesson 6.6"
+    )
 
     stats_db_parser = commands.add_parser("issue-stats", help="summarise stored issues")
     stats_db_parser.add_argument("--repo", default=DEFAULT_REPO)
@@ -354,11 +357,29 @@ def run_find(args: argparse.Namespace) -> int:
     if session is None:
         return 1
 
+    settings = Settings()
+    query_vector = None
+    if args.mode != "keyword":
+        embedder = make_embeddings(settings)
+        try:
+            query_vector = embedder.embed([args.query], "query")[0]
+        except LLMError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
     with session:
-        hits = storage.find_chunks(session, args.repo, args.query, limit=args.limit)
+        hits = storage.search_chunks(
+            session,
+            args.repo,
+            args.query,
+            args.mode,
+            query_vector,
+            model=settings.embedding_model,
+            limit=args.limit,
+        )
 
     for hit in hits:
-        print(f"{hit.path}:{hit.start_line}-{hit.end_line}  {hit.rank:.3f}  {hit.snippet}")
+        where = f"{hit.path}:{hit.start_line}-{hit.end_line}"
+        print(f"{where}  {hit.symbol or ''}  {hit.rank:.3f}  {hit.snippet[:80]}")
     noun = "chunk" if len(hits) == 1 else "chunks"
     print(f"{len(hits)} {noun}", file=sys.stderr)
     return 0
@@ -374,7 +395,8 @@ def worker_context() -> WorkerContext | None:
     redis_client = redis.Redis.from_url(settings.redis_url)
     snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
     events = EventStream(redis_client)
-    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events)
+    embedder = make_embeddings(settings)
+    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events, embedder)
 
 
 def run_worker() -> int:
