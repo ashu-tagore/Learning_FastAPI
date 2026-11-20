@@ -16,6 +16,7 @@ atlas notifier
 atlas digest --day 2026-11-19
 atlas llm "What is an event in a training loop?" --stream
 atlas llm-usage
+atlas fit --email ada@example.com --repo pytorch/ignite --limit 5
 """
 
 import argparse
@@ -34,7 +35,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from atlas import digest, issue_cache, storage, worker
+from atlas import digest, fit, issue_cache, storage, worker
 from atlas.config import Settings
 from atlas.events import EventStream
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
@@ -43,7 +44,7 @@ from atlas.jobs import WorkerContext, create_job
 from atlas.llm import ChatProvider, ChatRequest, ChatResult, LLMError, TextDelta, user
 from atlas.llm.calls import cost_usd, make_chat, record
 from atlas.logs import configure_logging
-from atlas.models import Job, LlmCall, Repo, User
+from atlas.models import Issue, IssueFit, Job, LlmCall, Repo, User
 from atlas.notifier import run_notifier as run_notifier_loop
 from atlas.queue import RedisQueue
 from atlas.search import DEFAULT_EXTENSIONS, search
@@ -122,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--system", default="", help="instructions for the model")
     llm_parser.add_argument("--max-tokens", type=int, default=1024)
     llm_parser.add_argument("--stream", action="store_true", help="print the answer as it comes")
+
+    fit_parser = commands.add_parser("fit", help="score open issues against a user's skills")
+    fit_parser.add_argument("--email", required=True)
+    fit_parser.add_argument("--repo", default=DEFAULT_REPO)
+    fit_parser.add_argument("--limit", type=int, default=None, help="score at most N issues")
 
     commands.add_parser("llm-usage", help="calls, tokens and cost per purpose, from the log")
 
@@ -440,6 +446,34 @@ def stream_to_stdout(chat: ChatProvider, request: ChatRequest) -> ChatResult:
     raise LLMError("the stream ended without a result")
 
 
+def run_fit(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+    chat = make_chat(Settings())
+    with session, session.begin():
+        learner = session.scalar(select(User).where(User.email == args.email.lower()))
+        if learner is None:
+            print(f"atlas: no user with email {args.email}", file=sys.stderr)
+            return 1
+        summary = fit.score_user_issues(session, chat, learner, args.repo, limit=args.limit)
+        ranked = session.execute(
+            select(IssueFit.score, Issue.number, Issue.title, IssueFit.reasons)
+            .join(Issue, IssueFit.issue_id == Issue.id)
+            .where(IssueFit.user_id == learner.id)
+            .order_by(IssueFit.score.desc(), Issue.number.desc())
+        ).all()
+
+    for score, number, title, reasons in ranked:
+        print(f"{score}/5  #{number:<5} {title[:60]}")
+        print(f"        {'; '.join(reasons)}")
+    print(
+        f"{summary.scored} scored, {summary.failed} failed, {summary.unchanged} unchanged",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def run_llm_usage() -> int:
     session = open_database()
     if session is None:
@@ -573,6 +607,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_scheduler()
     if args.command == "llm":
         return run_llm(args)
+    if args.command == "fit":
+        return run_fit(args)
     if args.command == "llm-usage":
         return run_llm_usage()
     if args.command == "digest":
