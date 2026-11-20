@@ -1,0 +1,302 @@
+---
+title: "6.3 Prompts and structured outputs validated with Pydantic"
+description: "Ask a model for data instead of prose: write a prompt with a rubric, constrain the reply to a JSON schema, validate it with Pydantic, send errors back once, and measure how consistent and how sensible the model's judgments really are."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 3 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Measuring it". The trade-offs section *(deep dive)* compares structured outputs, tool calls and plain parsing.
+:::
+
+::: {.callout-note title="Analogy: a form instead of a letter"}
+Ask a hundred people to describe their holiday in a letter and you get a hundred formats: some list dates, some don't mention the cost, one writes a poem. Hand them a form with boxes (dates, destination, cost, rating 1 to 5) and you can file every reply the same way. You still have to check the forms: a "rating" of 9 on a 1-to-5 scale, an empty box, a cost written in the dates field.
+
+**Structured outputs** are the form. **Validation** is checking each one before it goes in the filing cabinet.
+:::
+
+## The problem
+
+Atlas knows each learner's skills (the profile they write, lesson 4.11) and each open issue. Learners want to know which issues suit them. A model can judge that: it reads the profile and the issue and gives an opinion. But an opinion in prose ("This seems like a reasonably good fit, though you might...") can't be sorted, stored or shown in a ranked list. Atlas needs a number, a few reasons, and a first step, every time, in the same shape.
+
+The first attempt: ask for JSON in the prompt and parse the reply. Here's the local model asked to rate a beginner against an issue, with a JSON schema it was required to follow:
+
+```text
+{
+  "reasons": [
+    "The issue is a simple typo in a docstring, which is a common task for a Python beginner.",
+    "The task is straightforward and doesn't require deep knowledge of Python or documentation practices.",
+    "A beginner would likely notice and fix the typo, as it's a simple correction.",
+    "The task is not complex and can be completed with basic attention to detail.",
+    "The beginner would understand the context of the docstring and the purpose of the code."
+  ],
+  "score": 3
+}
+```
+
+Valid JSON, matching the requested shape (that schema didn't limit the number of reasons). Also: five reasons, where Atlas will want at most three, and a score of 3 ("doable with some learning") while every reason says the task is easy. Parsing succeeded; the data is still wrong in one way that code can check (too many reasons) and one that it can't (the score contradicts the reasons).
+
+Both kinds of problem shape this lesson: catch everything that can be checked, and measure what can't.
+
+## Theory
+
+### Prompts
+
+A **prompt** is everything the model reads: a **system prompt** (standing instructions: the role, the rules, the output format) and the **user message** (this particular case). Atlas's fit prompt follows a few habits that work across models:
+
+- **Say what the task is for.** "You help newcomers to open source choose an issue" gives the model a purpose to judge by.
+- **Define the scale.** "5 = they could start today with what they already know; 3 = doable, with some learning; 1 = needs skills they haven't mentioned." Without anchors, one model's 4 is another's 2.
+- **Limit what it may use.** "Judge only from what they wrote and what the issue shows. Do not assume skills." Lesson 6.1's made-up function is what happens when a model fills gaps.
+- **Show the output format,** including the JSON schema itself.
+
+### Structured outputs
+
+**Structured outputs** constrain the model's generation so the reply always matches a JSON schema: at each step, tokens that would break the schema are simply not allowed. Ollama supports it through a `format` field holding the schema; Claude through `output_config.format` (the Anthropic SDK's `messages.parse` builds it from a Pydantic model). The reply is then guaranteed to parse and to have the required fields and types.
+
+Two limits. First, providers support different parts of JSON Schema. Claude's structured outputs don't accept numeric limits like `minimum` and `maximum` or array-length limits; the SDK removes them from what it sends and checks them on the client instead. Ollama's grammar may or may not enforce them. Second, and more important: a schema constrains *shape*, not *sense*. "score": 3 with five reasons for "easy" matched the shape perfectly.
+
+### Validation: parse, don't trust
+
+So Atlas validates every reply with Pydantic, the same "parse, don't validate" idea as lesson 4.3's request bodies: the model's output is input from outside, and it's parsed into a type that can only hold valid values.
+
+```python
+class FitScore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(ge=1, le=5)
+    reasons: list[str] = Field(min_length=1, max_length=3)
+    first_step: str = Field(min_length=1, max_length=300)
+```
+
+`ge` and `le` are "greater or equal" and "less or equal"; on a list, `min_length` and `max_length` count items. `extra="forbid"` rejects unexpected fields, as Atlas's request bodies do.
+
+### Repair: send the error back, once
+
+When validation fails, the cheapest fix is to show the model what was wrong: append its reply and the validation error to the conversation and ask again. Small models often fix a specific complaint ("List should have at most 3 items") they couldn't avoid unprompted. But only once: a model that fails twice on the same input is unlikely to succeed on the third try, and each attempt costs time (and money, with hosted models). After that, Atlas gives up on that issue and moves on, recording what it cost.
+
+Not every failure is worth a repair. A reply cut off at `max_tokens` would be cut off again; a refusal would be refused again. Those stop immediately.
+
+```{mermaid}
+flowchart TD
+    P[Prompt: rubric + profile + issue + schema] --> M[Model, output constrained to the schema]
+    M --> S{stop reason}
+    S -->|max_tokens or refusal| X[FitError, no retry]
+    S -->|end| V{Pydantic validates?}
+    V -->|yes| OK[FitScore stored]
+    V -->|no, first time| R[Append reply + error, ask again]
+    R --> M
+    V -->|no, second time| X
+```
+
+## In the project
+
+### Red: the rules for scoring
+
+`tests/test_fit.py` uses the fake Ollama from lesson 6.2, queueing exactly the replies each test needs:
+
+```python
+def test_an_invalid_reply_is_retried_with_the_error(chat: OllamaChat, ollama: FakeOllama) -> None:
+    # Valid JSON, wrong content: a score of 9 on a 1 to 5 scale, and no first step.
+    ollama.replies.append('{"score": 9, "reasons": ["Easy"]}')
+    ollama.replies.append(GOOD)
+
+    fit, calls = score_issue(chat, PROFILE, an_issue())
+
+    assert fit.score == 4
+    assert len(calls) == 2
+    retry = ollama.requests[1]["messages"]
+    assert retry[-2] == {"role": "assistant", "content": '{"score": 9, "reasons": ["Easy"]}'}
+    assert "less than or equal to 5" in retry[-1]["content"]
+    assert "first_step" in retry[-1]["content"]
+
+
+def test_a_cut_off_reply_is_not_retried_as_if_it_were_wrong(
+    chat: OllamaChat, ollama: FakeOllama
+) -> None:
+    ollama.replies.append('{"score": 4, "reasons": ["Docs')
+    ollama.done_reason = "length"
+
+    with pytest.raises(FitError, match="cut off"):
+        score_issue(chat, PROFILE, an_issue())
+    assert len(ollama.requests) == 1
+```
+
+Others: a valid reply becomes a `FitScore`; two invalid replies raise `FitError("no valid fit score after 2 attempts")`; stored scores are redone only when the profile changes; one failed issue doesn't stop the rest; an empty profile scores nothing; and `GET /users/me/fits` returns the user's scores, best first.
+
+### Green: `atlas/fit.py`
+
+```python
+def score_issue(
+    chat: ChatProvider, profile: str, issue: github.Issue
+) -> tuple[FitScore, list[ChatResult]]:
+    """Score one issue for one profile; return the score and every call it took."""
+    schema = json.dumps(FitScore.model_json_schema())
+    prompt = (
+        f"The learner's skills:\n{profile}\n\n{describe(issue)}\n\n"
+        f"Reply with JSON matching this schema:\n{schema}"
+    )
+    messages = [user(prompt)]
+    calls: list[ChatResult] = []
+
+    for _ in range(ATTEMPTS):
+        result = chat.complete(
+            ChatRequest(
+                messages=messages,
+                system=SYSTEM,
+                max_tokens=400,
+                output_schema=FitScore,
+                purpose="fit_score",
+            )
+        )
+        calls.append(result)
+        # A cut-off or refused reply isn't the model being wrong; asking again for the
+        # same thing with the same limit would just fail the same way.
+        if result.stop_reason != "end":
+            raise FitError(f"the reply was cut off or refused ({result.stop_reason})", calls)
+        try:
+            return FitScore.model_validate_json(result.text), calls
+        except ValidationError as error:
+            messages = [
+                *messages,
+                Message("assistant", result.text),
+                user(f"That reply was not valid:\n{error}\nReply again with only the JSON object."),
+            ]
+
+    raise FitError(f"no valid fit score after {ATTEMPTS} attempts", calls)
+```
+
+`ChatRequest` gains its `output_schema` field in this lesson (lesson 6.2's interface was built to grow one field at a time). `model_validate_json` parses and validates in one step. Pydantic's error text is precise ("Input should be less than or equal to 5", "Field required" for `first_step`), which is exactly what the model needs to fix its reply. `FitError` carries the calls made, because a failed scoring still used tokens, and the cost log should say so.
+
+`score_user_issues` runs it over a repository's open issues for one learner, stores each result in a new `issue_fits` table (migration `0009`, one row per user and issue, with a `CHECK` that the score is 1 to 5 as a last line of defence), and records every call in `llm_calls`. A score remembers which version of the profile it judged, as a SHA-256 **hash** of the profile text: when the learner edits their profile, the hash changes and their scores are redone; otherwise they're kept. `atlas fit --email ... --repo ...` runs it, and `GET /users/me/fits` lists the results, best first.
+
+Scoring runs ahead of time, from the command line, not inside a request: at several seconds per issue on the local model, a learner can't wait for it. (Part 7 can schedule it, as lesson 5.2 schedules syncs.)
+
+## Measuring it
+
+Validation catches what can be checked. Whether the scores make *sense* needs measuring. Five issues written for this lesson in the style of Ignite's (this course can't fetch Ignite's real issues: GitHub's API is blocked on the machine it was written on), two very different learners, each issue scored three times through `score_issue`:
+
+```python
+ISSUES = [
+    (101, "Fix typo in the docstring of Engine.run", ("good first issue", "docs")),
+    (102, "Add an example notebook for the Precision metric", ("good first issue", "examples")),
+    (103, "Support torch.compile in create_supervised_trainer", ("help wanted", "module: engine")),
+    (104, "Flaky test: test_distrib_nccl hangs on 2 GPUs", ("bug", "distributed")),
+    (105, "Add type hints to ignite/handlers/checkpoint.py", ("good first issue", "typing")),
+]
+PROFILES = {
+    "docs-writer": "I write clear English and know basic Python. I have never used PyTorch.",
+    "gpu-engineer": "Five years of PyTorch, CUDA and NCCL; I debug distributed training for a living.",
+}
+```
+
+```text
+docs-writer: I write clear English and know basic Python. I have never used PyTorch.
+  #101 Fix typo in the docstring of Engine.run              scores 3 3 3
+  #102 Add an example notebook for the Precision metric     scores 3 5 3
+  #103 Support torch.compile in create_supervised_trainer   scores 3 3 3
+  #104 Flaky test: test_distrib_nccl hangs on 2 GPUs        scores 3 3 3
+  #105 Add type hints to ignite/handlers/checkpoint.py      scores 5 5 5
+  last reasons for #105: ['The issue is simple and focuses on adding type hints, which is a straightforward task for someone with basic Python skills and clear English writing.', 'The codebase is relatively small, so the learning curve is minimal.', "The issue is labeled as a good first issue, indicating it's suitable for someone with basic skills and no prior experience with PyTorch."]; first step: Read the code in ignite/handlers/checkpoint.py and understand the purpose of each function.
+
+gpu-engineer: Five years of PyTorch, CUDA and NCCL; I debug distributed training for a living.
+  #101 Fix typo in the docstring of Engine.run              scores 5 5 5
+  #102 Add an example notebook for the Precision metric     scores 5 5 5
+  #103 Support torch.compile in create_supervised_trainer   scores 5 5 5
+  #104 Flaky test: test_distrib_nccl hangs on 2 GPUs        scores 5 5 5
+  #105 Add type hints to ignite/handlers/checkpoint.py      scores 5 5 5
+  last reasons for #105: ['The issue is a good first step for someone with PyTorch and distributed training experience.', 'Adding type hints is a straightforward task that can be done with basic Python knowledge.', "The issue is labeled as 'good first issue', indicating it's suitable for newcomers with experience in distributed training."]; first step: Start by adding type hints to the relevant functions in ignite/handlers/checkpoint.py.
+
+attempts needed: {1: 30}
+```
+
+Each call took about 8 seconds.
+
+Three things stand out.
+
+**The plumbing is solid.** All 30 replies passed validation on the first attempt (`attempts needed: {1: 30}`): with the schema constraining generation, the repair step never had to run. Structured outputs did exactly their job.
+
+**The scores are fairly stable.** Of ten issue-and-profile pairs, nine got the same score three times; one (#102 for the docs writer) wobbled between 3 and 5. Stable enough to store.
+
+**The judgment is poor.** A person who has never used PyTorch gets the same 3 for a docstring typo (which they could fix today) as for a distributed-training hang on two GPUs (which they couldn't). The GPU engineer gets 5 for everything, so their ranked list says nothing. And one reason claims "the codebase is relatively small", an assumption the prompt explicitly forbids. Consistent isn't the same as correct: a stable wrong answer is still wrong.
+
+That's what a 1.7-billion-parameter model does with a judgment task; a stronger model (Claude, with `LLM_PROVIDER=anthropic`) would very likely discriminate better, but this course can't show that run. Could a better prompt help the small one? One common idea: the model generates the fields in order, so with `score` first it commits to a number before writing any reasons. Moving `reasons` and `first_step` before `score` lets it "think" before scoring. One run per pair, through the same code with only the field order changed:
+
+```text
+schema field order: ['reasons', 'first_step', 'score']
+docs-writer   #101:5 #102:5 #103:4 #104:3 #105:5
+gpu-engineer  #101:5 #102:5 #103:5 #104:5 #105:5
+```
+
+Better for the typo (5, as it should be), worse for `torch.compile` support (4, for someone who has never used PyTorch). With one run each, a handful of cases and no agreed right answers, there's no way to say whether the change helped. So the reference code keeps its field order, and that question is lesson 6.8's job: a set of cases with expected answers, scored automatically, so prompt changes are measured instead of eyeballed.
+
+## Trade-offs *(deep dive)*
+
+**Structured outputs vs a tool call.** Another way to get JSON is to define a tool whose input schema is the shape you want and ask the model to call it (with `strict: true` on Claude, the input is guaranteed to match). That's designed for actions, not answers; when there's no action, structured outputs say what you mean.
+
+**Structured outputs vs parsing prose.** Asking for JSON in words and parsing it works more often than not with strong models, and fails in all the ways above with small ones. Constraining generation removes a whole class of failures for free.
+
+**Ratings vs comparisons.** Models are often more consistent at comparing two items ("which of these fits better?") than at absolute scores, at the cost of more calls. For a ranked list of 20 issues, absolute scores need 20 calls; pairwise comparisons need many more.
+
+**Bigger model vs better prompt.** A stronger model fixes many of the inconsistencies a small one has; a sharper rubric fixes some. Lesson 6.8 builds the measurements that tell you which change helped.
+
+## Common mistakes
+
+- **Trusting the schema to guarantee sense.** Shape is checked; meaning isn't.
+- **Validating nothing.** A score of 9, an empty step, a missing field reach the database.
+- **Retrying forever.** One repair attempt, then give up on that item and move on.
+- **Retrying a cut-off reply.** It will be cut off again.
+- **Forgetting failed calls in the cost log.** They cost tokens too.
+- **Scoring inside a request.** Seconds per item; do it ahead of time.
+- **A scale without anchors.** "Rate 1 to 5" means something different every time.
+
+## Check yourself
+
+**1.** The schema already says `score` is an integer. Why does Atlas validate it again with Pydantic?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Providers don't enforce every schema rule: Claude's structured outputs drop `minimum`/`maximum` and list-length limits (the SDK checks them on the client), and Ollama's grammar may not enforce them either. Pydantic is the one place every rule is checked, whichever provider answered, before anything reaches the database.
+:::
+
+**2.** Why is a reply that stopped at `max_tokens` not sent back for repair?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Nothing about the reply's content was wrong; it ran out of room. Repairing makes the conversation longer and asks for the same output with the same limit, so it would be cut off again. The fix is a higher `max_tokens` or a shorter requested output, which is a code change, not a retry.
+:::
+
+**3.** A learner edits their profile. Which scores are redone, and how does Atlas know?
+
+::: {.callout-tip collapse="true" title="Answer"}
+All of that learner's scores in the repository. Each stored score keeps the SHA-256 hash of the profile it judged; `score_user_issues` treats scores with a different hash as stale and rescores those issues. Other learners' scores are untouched.
+:::
+
+## Exercise
+
+Write the test for a reply with four reasons: queue that reply and then a valid one on the fake, and check that the repair message tells the model what was wrong.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def test_too_many_reasons_are_sent_back(chat: OllamaChat, ollama: FakeOllama) -> None:
+    four = '{"score": 4, "reasons": ["a", "b", "c", "d"], "first_step": "Open engine.py"}'
+    ollama.replies.extend([four, GOOD])
+
+    fit, calls = score_issue(chat, PROFILE, an_issue())
+
+    assert len(calls) == 2
+    assert "at most 3 items" in ollama.requests[1]["messages"][-1]["content"]
+```
+Pydantic's message is `List should have at most 3 items after validation, not 4`, and the repair message begins `That reply was not valid:` followed by `1 validation error for FitScore`. Checked against the reference code. Not in the reference code.
+:::
+
+## Stretch
+
+Before reading the solution, write down the score *you* would give each of the ten pairs in "Measuring it". Then count how many of the model's typical (median, middle of three) scores are within 1 of yours. That number is a first, rough measure of agreement.
+
+::: {.callout-tip collapse="true" title="Solution"}
+The author's answers, as one person's judgment: docs writer 5, 4, 1, 1, 3 for issues 101 to 105 (a typo and an example notebook suit them; `torch.compile` and NCCL don't; type hints are doable with some learning); GPU engineer 5 for all five (each is within their skills, though the typo is beneath them). The model's medians were 3, 3, 3, 3, 5 and 5, 5, 5, 5, 5. Within 1 of the author's: for the docs writer only #102 (3 against 4); for the GPU engineer all five. **6 of 10.** Two lessons hide in that number: the model agrees most where agreement is easy (everything suits an expert), and a single number blends very different failures (#103 and #104 are off by 2, #105 by 2 in the other direction). Lesson 6.8 turns this into a proper evaluation, with agreed expected answers written down in advance.
+:::
+
+## What changed in the project
+
+`ChatRequest.output_schema`; new `atlas/fit.py` (`FitScore`, `score_issue` with one repair attempt, `score_user_issues`, `profile_hash`); `issue_fits` table (migration `0009`); `atlas fit`; `GET /users/me/fits`; `tests/test_fit.py`. Commit: `feat: Added issue fit scoring with validated structured outputs`.
