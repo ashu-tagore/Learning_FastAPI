@@ -1,0 +1,246 @@
+---
+title: "6.9 Review and practice"
+description: "Pull Part 6 together, practise across it, review three planted bugs in the answering code (one that no test catches), and build \"explain this file\" on your own from a spec and acceptance tests."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 9 · About 4 hours
+:::
+
+## Recap
+
+Atlas now answers questions about a codebase, with citations, and its quality is measured. Start the services and the local models:
+
+```bash
+cd atlas && docker compose up -d
+```
+
+```bash
+docker compose exec ollama ollama pull qwen3:1.7b
+```
+
+```bash
+docker compose exec ollama ollama pull nomic-embed-text
+```
+
+Then the API, the worker and the scheduler as in lesson 5.7. The worker's `embed_repo` job fills in vectors after each sync; for a first setup, `uv run atlas embed --repo pytorch/ignite` does it directly (about half an hour for Ignite on a laptop CPU). Open `http://localhost:8000/app/`, sign in, and ask.
+
+| Idea | One line | Lesson |
+|---|---|---|
+| Language models | Tokens in, tokens out; stop reasons; streaming; cost per token | [6.1](01-llms-for-engineers.qmd) |
+| One interface | Neutral types at the boundary; a fake provider for tests; every call in the cost log | [6.2](02-the-provider-interface.qmd) |
+| Structured output | A schema constrains; Pydantic validates; one repair, then give up | [6.3](03-structured-outputs.qmd) |
+| Embeddings | Nearby vectors mean similar text; pgvector and an HNSW index; embed in slices | [6.4](04-embeddings-and-pgvector.qmd) |
+| Ingestion | Chunk along structure; re-index only what changed; reuse unchanged vectors | [6.5](05-ingestion.qmd) |
+| Hybrid search | Keywords and meaning, fused by rank; fall back when a model is down | [6.6](06-hybrid-search.qmd) |
+| RAG | Retrieve, number, cite; no relevant source, no model; stream over SSE | [6.7](07-rag-answers.qmd) |
+| Evaluation | Cases with known answers; recall@k and MRR; a judge checked against people | [6.8](08-evaluating-rag.qmd) |
+
+Part 6 found real problems by measuring, each now in a test or a number: HNSW quietly returning 40 rows for `LIMIT 50` (6.6), a small model forgetting the citation rule after a long prompt (6.7), technical questions slipping past the similarity gate (6.8), and a judge that EVAL_JUDGE_RECAP (6.8).
+
+## Mixed practice
+
+No step-by-step hints; each relates to several lessons.
+
+1. **Cost per answer.** Add `cost_usd` to the `done` event of `POST /ask`, from the `llm_calls` row the answer created (lesson 6.2). What should it be for a "couldn't find" answer, and why not 0.0?
+2. **Answers per file.** Write `atlas cited-files`, which lists the files cited most often in stored answers over the last week. Which index serves it once `citations` is large?
+3. **A stale citation.** An answer cites `engine.py:279-338` at commit `0abbcab`. After a sync, that function moved to lines 301-360. Does the stored link still show the right code? Does `GET /conversations/{id}` need to change?
+4. **A second embedding model.** Switch `EMBEDDING_MODEL` to another model with 768 dimensions. Which chunks does `embed_repo` re-embed, which searches return nothing meanwhile, and what must you measure again before trusting `MIN_SIMILARITY`?
+5. **Evaluate a change.** Set `SOURCES = 3` in `answer.py` and run `atlas eval`. Which scores move, by how much, and is the change worth the faster answers? (Compare with lesson 6.8's numbers, not with your memory of them.)
+
+## Review: three planted bugs
+
+Three changes someone might propose to the answering code, each looking reasonable. For each: what goes wrong, who would notice, and does any test catch it? Answer before opening the solutions. The answers about tests come from planting each change in the reference code and running the suite.
+
+**Change 1**, in `routes/ask.py`, "one less layer: do the checks in the route itself":
+
+```python
+async def ask(
+    body: AskIn,
+    user: CurrentUser,
+    session: SessionDep,
+    embedder: EmbedderDep,
+    chat: ChatDep,
+) -> AsyncIterator[ServerSentEvent]:
+    target = await ask_target(body, user, session)
+    ...
+```
+
+::: {.callout-tip collapse="true" title="Solution"}
+The route is a generator streamed as SSE, so its body runs only after the response has started: the 200 status and headers are already sent when `ask_target` raises. The `ApiError` can't become a 404 any more; it escapes the stream as an unhandled exception and the connection breaks. Two tests catch it:
+
+```text
+FAILED tests/test_ask.py::test_another_users_conversation_cant_be_continued
+  ApiError('No such conversation') [single exception in ExceptionGroup]
+FAILED tests/test_ask.py::test_a_repository_that_isnt_indexed_is_a_404_before_any_streaming
+  ApiError("pytorch/vision isn't indexed") [single exception in ExceptionGroup]
+```
+
+A browser would see a request that "succeeded" and then stopped, with no error message. The dependency is there because of when it runs, not to add a layer.
+:::
+
+**Change 2**, in `answer.py`, "the prompt already tells the model to say it couldn't find the answer; the threshold is a magic number":
+
+```python
+nothing_close = not semantic
+```
+
+::: {.callout-tip collapse="true" title="Solution"}
+Every question now reaches the model, with the five least irrelevant chunks: "bake bread" gets Ignite's code as sources. Whether the model then declines depends on the model, the prompt and luck; lesson 6.8 measured the prompt rule alone on the two technical questions that pass the gate: EVAL_PROMPT_RULE. And every off-topic question now costs a model call. Two tests catch it: `test_nothing_is_a_source_when_even_the_nearest_chunk_is_far` (`assert [Source(...)] == []`), and the API test, where the fake model was called with no reply queued (`IndexError: pop from empty list`). The number is measured, not magic: lesson 6.8 shows where it came from and where it fails.
+:::
+
+**Change 3**, in `web/app.js`, "build the links with a regular expression instead of all that DOM code":
+
+```javascript
+const urls = new Map(sources.map((source) => [source.number, source.url]));
+answer.innerHTML = text.replace(/\[(\d+)\]/g, (match, n) => `<a href="${urls.get(Number(n))}">${match}</a>`);
+```
+
+::: {.callout-tip collapse="true" title="Solution"}
+`innerHTML` parses the model's text as HTML. The model's output is untrusted: it repeats text from the indexed code and documentation, which anyone can contribute to, and from the question, which anyone can type. An answer containing `<img src="x" onerror="...">` runs that script on the page, where it can read the tokens in `sessionStorage` (lesson 4.10).
+
+No test catches it: the Python tests check the API, and the page has no tests of its own. Checked in a real browser by feeding the Ask tab a canned stream whose answer contains that `<img>` tag (Playwright's `page.route` replaces the `/ask` response):
+
+```text
+reference code: title: "Atlas"       | <img> elements in the answer: 0
+planted:        title: "script ran"  | <img> elements in the answer: 1
+```
+
+With the reference code the tag stays visible text. The lesson: anything a model writes is user input, and the shortest code that "works" for normal answers is the one that fails for hostile ones.
+:::
+
+## Build it alone: explain this file
+
+Newcomers asked for a button next to each search result: "explain this file to me". Build it.
+
+### Spec
+
+- `POST /explain` with `{"repo": "pytorch/ignite", "path": "ignite/handlers/early_stopping.py"}` (`repo` defaults to `pytorch/ignite`) streams an explanation of that file as Server-Sent Events, with the same `sources`, `delta` and `error` events as `/ask`.
+- The sources are the file's own chunks, in line order, numbered from 1: at most six. If the file has more, the explanation covers its start, the model is told so, and the `done` event says `"truncated": true`.
+- The explanation cites sources as `[n]`, checked like an answer's: `done` carries `cited`, `invalid_citations`, `stop_reason` and `truncated`.
+- A path that isn't indexed is a 404 with code `file_not_found`, before any streaming. Signing in is required.
+- Explanations aren't stored in conversations, but the model call is in the cost log, with purpose `explain`.
+
+### Acceptance tests
+
+Your implementation is done when these pass (they're `tests/test_explain.py` in the reference code; `sse_events` is from lesson 6.7's tests, and `index_sample` indexes a folder as `pytorch/ignite` and commits, two lines in `tests/test_api_resources.py`):
+
+```python
+@pytest.mark.anyio
+async def test_a_file_is_explained_from_its_own_chunks_in_line_order(
+    client: httpx.AsyncClient,
+    async_session: AsyncSession,
+    fake_ollama: FakeOllama,
+    sample_repo: Path,
+) -> None:
+    await index_sample(async_session, sample_repo)
+    headers = await sign_up(client, "ada@example.com")
+    fake_ollama.replies.append("Engine runs the loop [2] and is a class [1].")
+
+    response = await explain(client, headers, "ignite/engine/engine.py")
+
+    assert response.status_code == 200
+    events = sse_events(response.text)
+    sources = events[0][1]
+    assert [(s["number"], s["symbol"]) for s in sources] == [(1, "Engine"), (2, "Engine.run")]
+    assert events[-1] == (
+        "done",
+        {"cited": [2, 1], "invalid_citations": [], "stop_reason": "end", "truncated": False},
+    )
+    prompt = fake_ollama.requests[0]["messages"][-1]["content"]
+    assert "Explain what ignite/engine/engine.py does" in prompt
+    call = await async_session.scalar(select(LlmCall))
+    assert call is not None
+    assert call.purpose == "explain"
+
+
+@pytest.mark.anyio
+async def test_a_file_that_isnt_indexed_is_a_404_before_any_streaming(
+    client: httpx.AsyncClient, async_session: AsyncSession, sample_repo: Path
+) -> None:
+    await index_sample(async_session, sample_repo)
+    headers = await sign_up(client, "ada@example.com")
+
+    response = await explain(client, headers, "ignite/nowhere.py")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "file_not_found"
+
+
+@pytest.mark.anyio
+async def test_a_long_file_is_explained_from_its_start_and_says_so(
+    client: httpx.AsyncClient,
+    async_session: AsyncSession,
+    fake_ollama: FakeOllama,
+    tmp_path: Path,
+) -> None:
+    functions = "\n\n".join(f"def step_{n}():\n    return {n}" for n in range(8))
+    (tmp_path / "steps.py").write_text(functions + "\n")
+    await index_sample(async_session, tmp_path)
+    headers = await sign_up(client, "ada@example.com")
+    fake_ollama.replies.append("The first steps return numbers [1].")
+
+    response = await explain(client, headers, "steps.py")
+
+    events = sse_events(response.text)
+    assert len(events[0][1]) == 6
+    assert events[-1][1]["truncated"] is True
+    prompt = fake_ollama.requests[0]["messages"][-1]["content"]
+    assert "The sources cover only the start of the file" in prompt
+
+
+@pytest.mark.anyio
+async def test_explaining_needs_a_signed_in_user(client: httpx.AsyncClient) -> None:
+    response = await client.post("/explain", json={"path": "ignite/engine/engine.py"})
+
+    assert response.status_code == 401
+```
+
+with `explain` a two-line helper that posts `{"path": path}` with the headers. The prompt's exact wording is yours to choose, as long as it contains the two phrases the tests look for.
+
+::: {.callout-tip collapse="true" title="Hints, if you're stuck"}
+- Which existing function already builds a prompt from numbered sources and a question? What would the "question" be here?
+- Where must the 404 happen, given lesson 6.7's rule about streams? What can that step return so the route doesn't query twice?
+- `.limit(limit + 1)` tells you whether there was more, the same trick as lesson 4.12's pagination.
+:::
+
+::: {.callout-tip collapse="true" title="The reference solution"}
+EXPLAIN_SOLUTION
+:::
+
+## From earlier parts
+
+**1.** (Part 5) `embed_repo` stops after about three minutes and re-queues itself (lesson 6.4). Which Part 5 mechanism would take the job away from a worker that ran for twenty minutes, and what would happen then?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The lease (lesson 5.1): a running job whose `started_at` is older than ten minutes counts as abandoned, and another worker's claim succeeds. Two workers would then embed the same chunks at once, doubling the model work, and the first would later mark a job "succeeded" that the second is still running. Slicing keeps every run well inside the lease.
+:::
+
+**2.** (Part 4) `POST /answers/{id}/feedback` uses `INSERT ... ON CONFLICT DO UPDATE`. Which earlier endpoint used the same idea for a different purpose, and what was the conflict there?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The idempotency keys of lesson 4.16 (and the one-pending-job rule of lesson 5.2): a unique constraint decides, in the database, what "the same request" means, so two concurrent requests can't both insert. For feedback, the unique `message_id` makes "rate again" replace the rating instead of adding a second one.
+:::
+
+**3.** (Part 3) Citations store a copy of the path and lines instead of a foreign key to `chunks`. Which normal form does that break, and why is it right here?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It duplicates data that also lives in `documents` and `chunks`, which normalisation (lesson 3.4) would avoid. But it isn't the same fact: a citation records what the answer was based on *at the time*, and re-indexing deletes and recreates chunks. A foreign key would either block re-indexing or, with a cascade, delete the citation. A snapshot of history is a different fact from the current state.
+:::
+
+## Self-check
+
+Without notes, you should be able to:
+
+- Explain tokens, context windows, stop reasons and why streaming matters to a user.
+- Put a model behind an interface, test code that uses it with a fake, and log every call's cost.
+- Ask for structured output, validate it, and decide when to retry.
+- Explain embeddings and cosine similarity, and store and search vectors in Postgres.
+- Chunk code along its structure and keep an index current without re-embedding everything.
+- Combine keyword and semantic search, and say why fusing by rank beats adding scores.
+- Build a RAG endpoint that cites, declines when it has nothing, and streams over SSE.
+- Measure retrieval and answers, and say how far to trust a model that grades another.
+
+## What changed in the project
+
+Checkpoint 6: Atlas answers questions about PyTorch-Ignite with `file:line` citations at the indexed commit, streamed over SSE to the web page's Ask tab, and its retrieval and answers are measured on every pull request. New in this lesson: `POST /explain` (`answer.file_sources`, `explain_question`), `tests/test_explain.py`. Commit: `feat: Added explain this file`.

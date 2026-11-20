@@ -1,0 +1,495 @@
+---
+title: "6.7 RAG answers with citations, streamed over SSE"
+description: "Answer questions from the indexed code: retrieve the right chunks, ask the model to answer only from them and cite each one, refuse when nothing relevant exists, stream the answer as Server-Sent Events, and keep the conversation."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 7 · About 3 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers how many sources to send, rewriting follow-up questions, and SSE against WebSockets.
+:::
+
+::: {.callout-note title="Analogy: an open-book exam with footnotes"}
+A student answering from memory may write something confident and wrong, and nobody can check where it came from. Give them the right pages, tell them to answer only from those pages, and require a footnote on every sentence: now a wrong answer can be caught by following the footnote, and "the pages don't say" becomes an acceptable answer.
+
+**Retrieval-augmented generation** is that exam. Search finds the pages; the model writes the answer with footnotes; Atlas turns each footnote into a link to the exact lines.
+:::
+
+## The problem
+
+Lesson 6.6 finds the right chunks. A newcomer still has to read five chunks of code and work out the answer. A language model can do that reading, but asked directly, it answers from whatever it learned in training: maybe an older version of Ignite, maybe another library, maybe nothing real. Nobody can tell which, because the answer doesn't say where it came from.
+
+Atlas's product rule (`02-product.md`) is "no citation, no claim": every statement in an answer points at the lines it came from, and when the indexed code doesn't contain the answer, Atlas says so instead of guessing. This lesson builds `POST /ask`, which does that, and streams the answer as it is written, because a small local model takes 10 to 30 seconds to finish one.
+
+## Theory
+
+### Retrieval-augmented generation
+
+**Retrieval-augmented generation** (RAG) is three steps:
+
+1. **Retrieve**: search the indexed code for the question (lesson 6.6's hybrid search) and keep the best few chunks.
+2. **Augment**: put those chunks into the prompt, numbered, with the question.
+3. **Generate**: the model answers from the chunks, citing them by number.
+
+The model never sees the whole codebase, only what retrieval hands it. That makes retrieval the ceiling on quality: if the right chunk isn't among the five, no model can cite it. Lesson 6.8 measures both halves separately for that reason.
+
+### Asking for citations, and checking them
+
+The prompt numbers each chunk (`[1] ignite/handlers/early_stopping.py lines 13-72 (EarlyStopping)`, then the code) and asks for a bracketed number after every sentence that uses one. Atlas then reads the answer's citations back with a regular expression and checks each one:
+
+- **Cited**: the number matches a source, so it becomes a link to those lines on GitHub, at the commit that was indexed.
+- **Made up**: the number matches no source (a model given five sources citing `[7]`). Atlas reports it rather than dropping it silently, and the page shows a warning.
+
+A citation proves only that the answer *points* at something real. Whether the cited lines actually *say* what the sentence claims is a harder question, and lesson 6.8 answers it.
+
+### Where instructions go in the prompt
+
+Real output from Atlas's model, `qwen3:1.7b`, answering "How do I stop training early when the validation score stops improving?" from five Ignite chunks, with the citation rule only in the system prompt:
+
+```text
+--- 64.8s, 1278 in / 241 out, end
+To stop training early when the validation score stops improving, you can use the `EarlyStopping`
+handler provided by PyTorch-Ignite. This handler monitors the validation score and stops the training
+if no improvement is observed for a specified number of epochs.
+...
+```
+
+A correct answer, and not one citation. After 1,278 tokens of code, the small model had lost track of an instruction it read at the very start. The same request with the rule repeated *after* the sources and question, the last thing the model reads before writing:
+
+```text
+--- 11.6s, 1321 in / 110 out, end
+The validation score stops improving when the validation loss or metric stops improving for a specified
+number of epochs [1]. The `EarlyStopping` handler is configured with a `patience` parameter that
+determines how many epochs to wait for no improvement before stopping training [1]. ...
+```
+
+Citations on every sentence, and shorter (the rule also asks for at most 150 words), so it finished in a fifth of the time. Models attend most reliably to the start and the end of a long prompt; put the rules that matter at the end too.
+
+### No relevant sources, no model
+
+Hybrid search always returns *something*: ask it about the capital of France and it ranks the five least irrelevant chunks of Ignite. Handed those, a model may answer from its own knowledge anyway. So Atlas checks before asking. Semantic search reports a cosine similarity (lesson 6.4) for its best match, and below a threshold the question isn't about this code:
+
+```text
+$ How do I stop training early when the validation score stops improving?
+top semantic similarity: 0.745
+$ What is the capital of France?
+top semantic similarity: 0.548
+```
+
+Atlas's threshold is 0.6. Below it, Atlas answers "I couldn't find this in the indexed code." *without calling a model at all*: the cheapest and only certain way to make a model not guess is not to ask it. Above it, the prompt still tells the model to reply with exactly that sentence when the sources don't answer, as a second line of defence. Lesson 6.8 measures the threshold on thirty questions and finds where it fails.
+
+### Server-Sent Events
+
+A model writes an answer a few words at a time (lesson 6.1's streaming). **Server-Sent Events** (SSE) is the simplest way to pass those words to a browser as they arrive: one HTTP response that stays open, with media type `text/event-stream`, made of small text blocks separated by blank lines:
+
+```text
+event: delta
+data: {"text": " is"}
+
+```
+
+Each block is an **event** with an optional name (`event:`) and a payload (`data:`). The server writes blocks whenever it has something; the client reads them as they come. Unlike a WebSocket (lesson 4.18), it's plain HTTP in one direction, so it works through proxies and load balancers that understand HTTP, and there's no second protocol to secure.
+
+`POST /ask` sends four kinds of event: `sources` (the numbered chunks, before the model starts), `delta` (each piece of text), `done` (where the answer was stored and what it cited), and `error`.
+
+One consequence shapes the code: once the first event is sent, the response's status code (200) and headers have already gone. An error discovered later can't become a 404. Checks that should fail the request (does this conversation exist? is it yours? is the repository indexed?) must happen *before* the stream starts.
+
+### Conversations
+
+A follow-up like "What are its arguments?" means nothing alone. Two things fix that:
+
+- **The model sees earlier turns.** The last three questions and answers go before the new prompt, *without* their sources: resending every turn's code would make each question costlier than the last.
+- **Retrieval sees the previous question.** "What are its arguments?" names nothing to search for; the question before it ("What does EarlyStopping do?") does. Atlas searches the two together.
+
+```{mermaid}
+sequenceDiagram
+    participant B as Browser
+    participant A as POST /ask
+    participant E as Embedding model
+    participant P as Postgres
+    participant M as Chat model
+    B->>A: question, conversation id, bearer token
+    A->>P: conversation exists and is mine? repository indexed?
+    Note over A: 404 here, or never: the stream hasn't started
+    A->>E: embed previous question + this one
+    A->>P: hybrid search, nearest similarity
+    A-->>B: event: sources
+    alt nearest similarity below 0.6
+        A-->>B: event: delta "I couldn't find this..."
+    else
+        A->>M: earlier turns + numbered sources + question + rules
+        M-->>A: text, piece by piece
+        A-->>B: event: delta (many)
+    end
+    A->>P: question, answer, citations, cost (one transaction)
+    A-->>B: event: done
+```
+
+## In the project
+
+### Red: what answering must do
+
+The pieces first, without a database (`tests/test_ask.py`):
+
+```python
+def test_citations_are_listed_once_in_order_and_made_up_numbers_reported() -> None:
+    sources = [source(1), source(2, "ignite/engine/engine.py")]
+
+    cited, invalid = check_citations("It returns 1.0 [2]. Always [2][1]. See also [7].", sources)
+
+    assert [s.number for s in cited] == [2, 1]
+    assert invalid == [7]
+
+
+def test_the_request_numbers_sources_and_repeats_the_rule_after_them() -> None:
+    request = answer_request("How is accuracy computed?", [source(1)], history=[])
+
+    prompt = request.messages[-1].content
+    assert prompt.startswith("Sources:\n\n[1] ignite/metrics.py lines 1-2 (accuracy)\n")
+    # The rule comes last, after the code, where a small model still remembers it.
+    assert prompt.endswith(f"Question: How is accuracy computed?\n\n{CITATION_RULE}")
+```
+
+Then the whole endpoint, against the test app with a fake chat model (`FakeOllama` from lesson 6.2) and fake embeddings (lesson 6.4). Two questions are chosen for the fake embedder: `"def accuracy return"` shares words with `metrics.py`'s chunk (similarity 0.70), `"bake bread"` shares none (0.0).
+
+```python
+@pytest.mark.anyio
+async def test_an_answer_streams_its_sources_then_its_text_then_where_it_was_stored(
+    client: httpx.AsyncClient,
+    async_session: AsyncSession,
+    fake_ollama: FakeOllama,
+    indexed: None,
+) -> None:
+    headers = await sign_up(client, "ada@example.com")
+    fake_ollama.replies.append("It always returns 1.0 [1].")
+
+    events = await ask(client, headers, ON_TOPIC)
+
+    names = [name for name, _ in events]
+    assert names[0] == "sources"
+    assert set(names[1:-1]) == {"delta"}
+    assert names[-1] == "done"
+    ...
+    done = events[-1][1]
+    assert done["cited"] == [1]
+    assert done["invalid_citations"] == []
+
+
+@pytest.mark.anyio
+async def test_with_nothing_relevant_atlas_says_so_without_asking_a_model(
+    client: httpx.AsyncClient,
+    async_session: AsyncSession,
+    fake_ollama: FakeOllama,
+    indexed: None,
+) -> None:
+    headers = await sign_up(client, "ada@example.com")
+
+    events = await ask(client, headers, OFF_TOPIC)
+
+    assert events[0] == ("sources", [])
+    assert events[1] == ("delta", {"text": NOT_FOUND})
+    assert events[-1][1]["stop_reason"] == "not_found"
+    assert fake_ollama.requests == []
+```
+
+`ask` posts the question and parses the `text/event-stream` body into `(event, data)` pairs. Others check that a made-up `[9]` is reported, that a follow-up sends the earlier turn, that another user's conversation is a 404 before any streaming, and that a model failing mid-answer ends with an `error` event and stores nothing.
+
+The follow-up test was itself checked: with the route searching the new question alone, it fails (`assert 1 == 2`: the follow-up "Does accuracy return a float?" scores 0.40 alone, below the threshold, so it never reached the model); searching it together with the previous question (0.61), it passes.
+
+### Green: `atlas/answer.py`
+
+Finding sources is lesson 6.6's hybrid search with the threshold in front:
+
+```python
+def find_sources(
+    session: Session,
+    repo_full_name: str,
+    question: str,
+    query_vector: list[float],
+    model: str,
+    limit: int = SOURCES,
+) -> list[Source]:
+    """The chunks most likely to answer the question, best first; none if nothing is close."""
+    semantic = semantic_ranking(session, repo_full_name, query_vector, model, None, CANDIDATES)
+    nothing_close = not semantic or semantic[0][1] < MIN_SIMILARITY
+    if nothing_close:
+        return []
+
+    keyword = keyword_ranking(session, repo_full_name, question, None, CANDIDATES)
+    fused = reciprocal_rank_fusion([[i for i, _ in keyword], [i for i, _ in semantic]])
+    chunk_ids = [chunk_id for chunk_id, _ in fused[:limit]]
+    ...  # load each chunk's path, lines, symbol and text, numbered from 1
+```
+
+`Source` carries the repository's `indexed_commit`, so a citation links to the lines as they were when the answer was written: `https://github.com/pytorch/ignite/blob/<commit>/<path>#L13-L72`. A link to the default branch would drift as the file changes.
+
+The prompt:
+
+```python
+def answer_request(question: str, sources: list[Source], history: list[Turn]) -> ChatRequest:
+    """The model's input: earlier turns, then the sources, the question and the rules."""
+    messages: list[Message] = []
+    for turn in history[-HISTORY_TURNS:]:
+        # Earlier answers without their sources: resending every turn's code would make
+        # each question costlier than the last.
+        messages.append(Message("user", turn.question))
+        messages.append(Message("assistant", turn.answer))
+
+    blocks = []
+    for source in sources:
+        heading = f"[{source.number}] {source.path} lines {source.start_line}-{source.end_line}"
+        if source.symbol:
+            heading += f" ({source.symbol})"
+        blocks.append(f"{heading}\n{source.text}")
+    prompt = "Sources:\n\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}\n\n{CITATION_RULE}"
+    messages.append(user(prompt))
+    return ChatRequest(messages=messages, system=SYSTEM, max_tokens=600, purpose="answer")
+```
+
+And checking citations, with `CITATION = re.compile(r"\[(\d+)\]")`: `\[` and `\]` are literal brackets, `(\d+)` captures one or more digits.
+
+```python
+def check_citations(text: str, sources: list[Source]) -> tuple[list[Source], list[int]]:
+    """The sources the answer cites, in order of first mention, and any numbers it made up."""
+    by_number = {source.number: source for source in sources}
+    cited: list[Source] = []
+    invalid: list[int] = []
+    for match in CITATION.finditer(text):
+        number = int(match.group(1))
+        source = by_number.get(number)
+        if source is None:
+            if number not in invalid:
+                invalid.append(number)
+            continue
+        if source not in cited:
+            cited.append(source)
+    return cited, invalid
+```
+
+### Green: `POST /ask`
+
+FastAPI 0.163 streams SSE itself: declare `response_class=EventSourceResponse`, make the route a generator, and `yield` a `ServerSentEvent` for each event. A **generator** is a function containing `yield`: each `yield` hands one value to whoever is reading and pauses there until the next value is asked for. An `async def` with `yield` is an **async generator**, read with `async for`.
+
+```python
+@router.post(
+    "/ask",
+    response_class=EventSourceResponse,
+    dependencies=[Depends(limit_per_user("ask", ASKS_PER_MINUTE))],
+    responses={404: {"description": "No such conversation, or the repository isn't indexed"}},
+)
+async def ask(
+    body: AskIn,
+    target: Annotated[AskTarget, Depends(ask_target)],
+    session: SessionDep,
+    embedder: EmbedderDep,
+    chat: ChatDep,
+) -> AsyncIterator[ServerSentEvent]:
+    """Answer a question from the indexed code, streaming the answer as it is written."""
+    search_text = retrieval_text(body.question, target.history)
+    try:
+        # Both model clients are synchronous: threads keep them off the event loop.
+        query_vector = (await run_in_threadpool(embedder.embed, [search_text], "query"))[0]
+    except LLMError:
+        yield model_unavailable()
+        return
+
+    sources = await session.run_sync(
+        lambda sync: find_sources(sync, target.repo, body.question, query_vector, embedder.model)
+    )
+    yield ServerSentEvent(
+        event="sources", data=[source_out(target.repo, source) for source in sources]
+    )
+
+    parts: list[str] = []
+    result: ChatResult | None = None
+    if not sources:
+        # No citation, no claim: nothing relevant was found, so no model is asked to guess.
+        parts.append(NOT_FOUND)
+        yield ServerSentEvent(event="delta", data={"text": NOT_FOUND})
+    else:
+        request = answer_request(body.question, sources, target.history)
+        try:
+            async for event in iterate_in_threadpool(chat.stream(request)):
+                if isinstance(event, TextDelta):
+                    parts.append(event.text)
+                    yield ServerSentEvent(event="delta", data={"text": event.text})
+                else:
+                    result = event
+        except LLMError:
+            # The client has seen part of an answer; the error event tells it to discard it.
+            yield model_unavailable()
+            return
+
+    text = "".join(parts)
+    cited, invalid = check_citations(text, sources)
+    done = await save_exchange(session, target, body.question, text, cited, invalid, result)
+    yield ServerSentEvent(event="done", data=done)
+```
+
+Three details:
+
+- **`ask_target` is a dependency** that loads the conversation (only if it's the caller's), its history, and checks the repository is indexed, raising 404s. Dependencies run before the route body, so before the stream starts.
+- **`iterate_in_threadpool`** (from Starlette) runs each step of the provider's *synchronous* stream in a worker thread and hands the results to `async for`. The event loop stays free to serve other requests while the model thinks.
+- **Nothing is stored until the answer is complete.** `save_exchange` writes the question, the answer, its citations and the model call's cost (lesson 6.2) in one transaction. Citations are copied (path, lines, symbol, commit), not linked to chunk rows, because re-indexing replaces chunks and an old answer must keep pointing where it pointed. Migration `0012` adds `conversations`, `messages`, `citations` and `feedback`.
+
+`GET /conversations`, `GET /conversations/{id}` (with citations and ratings) and `POST /answers/{id}/feedback` (thumbs up or down with a note; rating again replaces it, through `INSERT ... ON CONFLICT DO UPDATE`) complete the API.
+
+### Running it
+
+The real stream, `curl -N` against the running API (`-N` turns off curl's buffering), with each line timed on arrival:
+
+```text
+  0.07s  event: sources
+  0.07s  data: [{"number": 1, "path": "ignite/handlers/early_stopping.py", "start_line": 13, "end_line": 72, "symbol": "EarlyStopping", "url": "https://github.com/pytorch/ignite/blob/0abbcab445634b98efcdc6e2d19e3235c0e13e3d/ignite/handlers/early_stopping.py#L13-L72"}, ...]
+ 11.96s  event: delta
+ 11.96s  data: {"text": "Early"}
+ 12.05s  event: delta
+ 12.05s  data: {"text": "Stopping"}
+ 12.14s  event: delta
+ 12.14s  data: {"text": " is"}
+...
+ 22.96s  event: done
+ 22.96s  data: {"conversation_id":1,"message_id":2,"cited":[1],"invalid_citations":[],"stop_reason":"end"}
+```
+
+The sources arrive in 70 ms. Then 12 seconds of silence: the model reading 1,300 tokens of prompt on a CPU before writing its first word. After that, a word every 90 ms. Without streaming, the reader would stare at nothing for 23 seconds; with it, they see which files Atlas is reading at once, and words from 12 seconds. (If a gap lasts 15 seconds, FastAPI sends a `: ping` comment line on its own, so proxies don't close a connection that looks idle.)
+
+The stored answer, from `GET /conversations/1`:
+
+```text
+EarlyStopping is a handler that stops the training process if no improvement is observed after a
+certain number of events [1]. It monitors a score function and checks for improvements based on the
+specified mode (max or min). If no improvement is detected, the training is halted [1]. ...
+```
+
+### The ask page
+
+The web interface (`web/`) gains an Ask tab. The browser's built-in SSE client, `EventSource`, can only make GET requests without custom headers; `/ask` needs a POST with a JSON body and a bearer token. So the page reads the stream with `fetch` and splits it into events itself:
+
+```javascript
+async function* serverSentEvents(response) {
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += value;
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop(); // the last piece may be an event that hasn't fully arrived
+    ...
+  }
+}
+```
+
+A network chunk can end in the middle of an event, so the last piece after splitting is kept for the next read. Once `done` arrives, each `[n]` in the answer becomes a link to its source, built from text nodes, never from HTML: the model's output is untrusted input, like anything a user types, and inserted as HTML it could run a script on the page (cross-site scripting, lesson 4.10).
+
+![The Ask tab after a real answer: the question, the answer with its citation [4] as a link, the five sources with their lines and symbols, and the rating buttons.](images/6-7-ask-page.png){fig-alt="The Atlas web page on its Ask tab. The question reads 'How do I save a checkpoint of the model every few epochs?'. Below it, an answer ends with a linked [4]. A list of five sources follows, each a link such as '[4] ignite/handlers/checkpoint.py:205-264 Checkpoint'. Two buttons read Helpful and Not helpful."}
+
+In this run the sources arrived after 0.25 seconds, the first words after 15, and the whole answer after 22. Read it closely, though: "attaching a Checkpoint handler to the EPOCH_COMPLETED event with a `every` parameter". In source [4], `every` is an argument to the *event* (`Events.ITERATION_COMPLETED(every=1000)`), not to `Checkpoint`. The citation is real and the answer is half right. Lesson 6.8 is about catching exactly this.
+
+## Trade-offs *(deep dive)*
+
+**How many sources.** More sources give the model more chances to find the answer and make every answer slower and costlier: a small CPU model reads roughly 100 tokens a second, so five 60-line chunks cost about 12 seconds before the first word. Hosted models read far faster, which is why hosted RAG systems often send 10 to 20.
+
+**Rewriting follow-ups.** Atlas searches the previous question with the new one: cheap, and enough for "what are its arguments?". A common alternative asks the chat model to rewrite the follow-up into a standalone question first ("What are the arguments of EarlyStopping?"). It handles longer conversations better and costs one more model call, several seconds on a CPU, per question.
+
+**SSE or WebSockets.** SSE is one-directional, plain HTTP, and reconnects by itself in `EventSource`. WebSockets (lesson 4.18) carry messages both ways. An answer flows one way; SSE is enough, and simpler to run behind a load balancer.
+
+**Storing partial answers.** Atlas stores nothing if the stream breaks: simpler, and a half-answer with half its citations would be misleading. The cost is that a model call that was paid for (with a hosted model) leaves no record. Recording the call separately, before saving the exchange, would fix that.
+
+**The threshold is per model.** 0.6 was measured for `nomic-embed-text`. Similarities from another embedding model sit on a different scale; switching models means measuring again (lesson 6.8 shows how).
+
+## Common mistakes
+
+- **Trusting a citation as proof.** It proves the answer points at real lines, not that the lines say what the answer claims.
+- **Putting every instruction in the system prompt.** After thousands of tokens of code, a small model forgets it; repeat what matters at the end.
+- **Calling the model when nothing relevant was found.** It will answer anyway, from memory.
+- **Raising an HTTP error inside the stream.** The status has already been sent; check before streaming, and send an `error` event after.
+- **Linking citations to the default branch.** The lines move; link to the commit that was indexed.
+- **Rendering model output as HTML.** It's untrusted input; build text nodes.
+
+## Check yourself
+
+**1.** The model is given sources [1] to [5] and its answer cites [2] and [6]. What does the `done` event say, and what does the reader see?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`"cited": [2]` and `"invalid_citations": [6]`. The page turns `[2]` into a link to its lines, leaves `[6]` as plain text, and shows a warning that the answer cites a source that doesn't exist. Only `[2]` is stored as a citation.
+:::
+
+**2.** Why is `ask_target` a dependency instead of the first lines of the route?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The route is a generator streamed as SSE: its code runs only once the response has started, after the 200 status and headers have been sent. A missing conversation must be a 404, so the check has to run before streaming starts, and dependencies run before the route body.
+:::
+
+**3.** A user asks "What is the capital of France?". Which components run, and which don't?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The dependency checks, the embedding model (to embed the question), and semantic search, whose best match (0.548) is below 0.6. Then no keyword search, no chat model, no cost: Atlas streams `sources` (empty), the "couldn't find" sentence, and `done` with `stop_reason: "not_found"`, and stores the exchange.
+:::
+
+## Exercise
+
+Add `DELETE /conversations/{conversation_id}`: 204 for your own conversation (its messages, citations and feedback go with it), 404 for one that doesn't exist or isn't yours. Write the tests first.
+
+::: {.callout-tip collapse="true" title="Solution"}
+The tests:
+
+```python
+@pytest.mark.anyio
+async def test_deleting_my_conversation_removes_everything_in_it(
+    client: httpx.AsyncClient, async_session: AsyncSession, fake_ollama: FakeOllama, indexed: None
+) -> None:
+    headers = await sign_up(client, "ada@example.com")
+    fake_ollama.replies.append("It returns 1.0 [1].")
+    done = (await ask(client, headers, ON_TOPIC))[-1][1]
+    await client.post(f"/answers/{done['message_id']}/feedback", json={"rating": "up"}, headers=headers)
+
+    response = await client.delete(f"/conversations/{done['conversation_id']}", headers=headers)
+
+    assert response.status_code == 204
+    assert await async_session.scalar(select(func.count()).select_from(Message)) == 0
+    assert await async_session.scalar(select(func.count()).select_from(Citation)) == 0
+```
+
+plus one for another user's conversation and a missing one (both 404). The obvious implementation, loading the conversation and calling `await session.delete(conversation)`, fails the first test:
+
+```text
+psycopg.errors.NotNullViolation: null value in column "conversation_id" of relation "messages" violates not-null constraint
+[SQL: UPDATE messages SET conversation_id=%(conversation_id)s::INTEGER WHERE messages.id = %(messages_id)s::INTEGER]
+```
+
+The ORM doesn't know the database will cascade: before deleting the conversation, it "detaches" the messages it knows about by setting their `conversation_id` to NULL, which the column refuses. A `DELETE` statement leaves the cascade to the database:
+
+```python
+@router.delete(
+    "/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"description": "No such conversation"}},
+)
+async def delete_conversation(conversation_id: int, user: CurrentUser, session: SessionDep) -> None:
+    # A DELETE statement, not session.delete(): the database's ON DELETE CASCADE removes
+    # the messages, citations and feedback. session.delete() would first load the messages
+    # and set their conversation_id to NULL, which the NOT NULL column refuses.
+    deleted = await session.scalar(
+        delete(Conversation)
+        .where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+        .returning(Conversation.id)
+    )
+    if deleted is None:
+        raise ApiError(status.HTTP_404_NOT_FOUND, "conversation_not_found", "No such conversation")
+    await session.commit()
+```
+
+`RETURNING` (lesson 3.2) says whether a row matched, so "doesn't exist" and "isn't yours" are the same 404 in one statement. Both tests pass. Not in the reference code.
+:::
+
+## Stretch
+
+STRETCH_67
+
+## What changed in the project
+
+`atlas/answer.py` (`find_sources`, `answer_request`, `check_citations`, `retrieval_text`, `github_url`, the 0.6 similarity threshold); `atlas/api/routes/ask.py` with `POST /ask` (SSE, 10 a minute per user), `GET /conversations`, `GET /conversations/{id}` and `POST /answers/{id}/feedback`; tables `conversations`, `messages`, `citations`, `feedback` (migration `0012`); the chat provider in the app's lifespan and a `get_chat` dependency; `atlas ask` and `atlas embed`; the Ask tab in `web/`; `tests/test_ask.py`; `FakeOllama` now streams words with their spaces, as Ollama does. Commit: `feat: Added answers with citations over SSE, conversations and feedback`.
