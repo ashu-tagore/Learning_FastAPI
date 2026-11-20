@@ -110,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     find_parser.add_argument("query", help="words to look for")
     find_parser.add_argument("--repo", default=DEFAULT_REPO)
     find_parser.add_argument("--limit", type=int, default=10)
+    find_parser.add_argument(
+        "--mode", choices=["keyword", "semantic", "hybrid"], default="keyword", help="lesson 6.6"
+    )
 
     stats_db_parser = commands.add_parser("issue-stats", help="summarise stored issues")
     stats_db_parser.add_argument("--repo", default=DEFAULT_REPO)
@@ -354,11 +357,29 @@ def run_find(args: argparse.Namespace) -> int:
     if session is None:
         return 1
 
+    settings = Settings()
+    query_vector = None
+    if args.mode != "keyword":
+        embedder = make_embeddings(settings)
+        try:
+            query_vector = embedder.embed([args.query], "query")[0]
+        except LLMError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
     with session:
-        hits = storage.find_chunks(session, args.repo, args.query, limit=args.limit)
+        hits = storage.search_chunks(
+            session,
+            args.repo,
+            args.query,
+            args.mode,
+            query_vector,
+            model=settings.embedding_model,
+            limit=args.limit,
+        )
 
     for hit in hits:
-        print(f"{hit.path}:{hit.start_line}-{hit.end_line}  {hit.rank:.3f}  {hit.snippet}")
+        where = f"{hit.path}:{hit.start_line}-{hit.end_line}"
+        print(f"{where}  {hit.symbol or ''}  {hit.rank:.3f}  {hit.snippet[:80]}")
     noun = "chunk" if len(hits) == 1 else "chunks"
     print(f"{len(hits)} {noun}", file=sys.stderr)
     return 0
