@@ -352,7 +352,27 @@ Otherwise a run could stop before embedding anything, report that work remains, 
 
 ## Exercise
 
-EXERCISE_64
+Write one SQL query that shows, for Ignite, how many chunks of each kind (`code`, `doc`) exist, how many are embedded, and how many are pending. Run it while the embed job is working.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```sql
+SELECT d.kind, count(*) AS chunks, count(c.embedding) AS embedded,
+       count(*) - count(c.embedding) AS pending
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+JOIN repos r ON r.id = d.repo_id
+WHERE r.full_name = 'pytorch/ignite'
+GROUP BY d.kind ORDER BY d.kind;
+```
+`count(column)` counts only rows where the column isn't null, which is exactly "embedded". Eight minutes into the real run:
+```text
+ kind | chunks | embedded | pending
+------+--------+----------+---------
+ code |   4372 |      941 |    3431
+ doc  |    259 |      259 |       0
+```
+The docs were already done: they come first in chunk-id order, which is the order `embed_pending` works in. (To count "embedded by the current model" exactly, add `AND c.embedding_model = 'nomic-embed-text'` inside a `count(*) FILTER (WHERE ...)`.)
+:::
 
 ## Stretch
 
