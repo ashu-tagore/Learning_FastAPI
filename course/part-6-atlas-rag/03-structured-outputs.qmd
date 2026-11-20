@@ -19,7 +19,7 @@ Ask a hundred people to describe their holiday in a letter and you get a hundred
 
 ## The problem
 
-Atlas knows each learner's skills (the profile they write, lesson 4.11) and each open issue. Learners want to know which issues suit them. A model can judge that: it reads the profile and the issue and gives an opinion. But an opinion in prose ("This seems like a reasonably good fit, though you might...") can't be sorted, stored or shown in a ranked list. Atlas needs a number, a few reasons, and a first step, every time, in the same shape.
+Atlas knows each learner's skills (the profile they write with `PATCH /users/me`, lesson 4.3) and each open issue. Learners want to know which issues suit them. A model can judge that: it reads the profile and the issue and gives an opinion. But an opinion in prose ("This seems like a reasonably good fit, though you might...") can't be sorted, stored or shown in a ranked list. Atlas needs a number, a few reasons, and a first step, every time, in the same shape.
 
 The first attempt: ask for JSON in the prompt and parse the reply. Here's the local model asked to rate a beginner against an issue, with a JSON schema it was required to follow:
 

@@ -109,7 +109,7 @@ Two numbers matter. **Time to first token**: how long until the reply starts. **
 first token after 0.19 s; 105 tokens; all done after 6.7 s
 ```
 
-The local model writes about 16 tokens a second. Reading is faster but slows as prompts grow: a 1,909-token prompt (part of `engine.py` plus a question) was read at 135 tokens a second and answered in 19 seconds in all, while the 13,385-token one was read at 73 a second. Total time is roughly: prompt tokens ÷ reading speed + reply tokens ÷ writing speed. Two consequences. **Stream** replies (show them as they're written) so people see progress after 0.2 seconds instead of staring at a spinner for 7. And keep prompts short: on this machine, reading is what made the long-file question take three minutes.
+The local model writes about 16 tokens a second. Reading is faster but slows as prompts grow (the stretch measures by how much): a 1,909-token prompt (part of `engine.py` plus a question) was read at 135 tokens a second and answered in 19 seconds in all, while the 13,385-token one was read at 73 a second. Total time is roughly: prompt tokens ÷ reading speed + reply tokens ÷ writing speed. Two consequences. **Stream** replies (show them as they're written) so people see progress after 0.2 seconds instead of staring at a spinner for 7. And keep prompts short: on this machine, reading is what made the long-file question take three minutes.
 
 ```{mermaid}
 flowchart LR
@@ -243,7 +243,18 @@ About 2,000 ÷ 135 ≈ 15 seconds to read plus 300 ÷ 16 ≈ 19 seconds to write
 How many tokens is Ignite's `README.md` for the local model, and would it fit in Ollama's default window together with a 500-token answer? Measure it with the `chat` function above: the prompt's `prompt_eval_count`, minus that of an empty prompt.
 
 ::: {.callout-tip collapse="true" title="Solution"}
-SOLUTION_README
+```python
+from pathlib import Path
+
+empty = chat("", num_predict=1)["prompt_eval_count"]
+readme = Path("ignite/README.md").read_text()  # in a clone of pytorch/ignite
+reply = chat(readme, num_predict=1, num_ctx=16384)
+print(len(readme), "chars,", reply["prompt_eval_count"] - empty, "tokens")
+```
+```text
+README.md: 27822 chars, 7123 tokens (empty prompt: 12)
+```
+About 3.9 characters a token: it's mostly English with some code. No, it doesn't fit: 7,123 tokens is already more than the default 4,096-token window before any answer. It needs `num_ctx` of at least about 7,700 (7,123 plus the 500-token answer, plus a little for the chat template's own tokens). `num_predict=1` keeps each measurement quick: the model reads everything but writes one token. (At the commit this course used; the README changes over time, so your numbers may differ slightly.)
 :::
 
 ## Stretch
@@ -251,7 +262,24 @@ SOLUTION_README
 Measure how reading speed changes with prompt length: send the first 1,000, 4,000 and 12,000 characters of `engine.py` (raise `num_ctx` to 16,384) with `num_predict` set to 1, and compute `prompt_eval_count / (prompt_eval_duration / 1e9)` for each. What does the trend mean for long prompts?
 
 ::: {.callout-tip collapse="true" title="Solution"}
-SOLUTION_SPEED
+```python
+import uuid
+
+engine = Path("ignite/engine/engine.py").read_text()
+for n in (1000, 4000, 12000, 40000):
+    # A unique first line, so Ollama can't reuse a cached copy of an earlier prompt's start.
+    reply = chat(f"Request {uuid.uuid4().hex}.\n" + engine[:n], num_predict=1, num_ctx=16384)
+    tokens = reply["prompt_eval_count"]
+    seconds = reply["prompt_eval_duration"] / 1e9
+    print(f"{n:>6} chars: {tokens:>5} tokens read in {seconds:5.1f} s = {tokens / seconds:4.0f} tokens/s")
+```
+```text
+  1000 chars:   242 tokens read in   1.2 s =  197 tokens/s
+  4000 chars:   910 tokens read in   4.9 s =  187 tokens/s
+ 12000 chars:  2550 tokens read in  15.2 s =  167 tokens/s
+ 40000 chars:  8570 tokens read in  87.4 s =   98 tokens/s
+```
+Reading gets *slower per token* as the prompt grows: 35 times the tokens took 73 times as long. Each new token is compared with every token before it, so the work grows faster than the length. Doubling a prompt more than doubles its reading time, one more reason to send only the relevant passages. The unique first line matters: a first run without it reported speeds up to 233 tokens a second, because Ollama reuses the start of a prompt it has already read (`prompt_eval_cached_count` in the reply says how many tokens it skipped).
 :::
 
 ## What changed in the project

@@ -275,11 +275,73 @@ def test_claude_request_carries_effort_and_refusal_fallbacks() -> None:
     assert (sent["fallbacks"], sent["beta"]) == ("default", "server-side-fallback-2026-07-01")
 ```
 
-Others check that a refusal is reported as `refusal`, that an overloaded API (529) becomes an `LLMError`, that Ollama's busy server is retried and a dead one gives a clear error, that streaming yields pieces then totals, and that costs are computed and recorded: 1,200 input and 300 output tokens on Claude Opus 5.5 is `Decimal("0.010800")`.
+Others check that a refusal is reported as `refusal`, that missing credentials give a clear message (below), that an overloaded API (529) becomes an `LLMError`, that Ollama's busy server is retried and a dead one gives a clear error, that streaming yields pieces then totals, and that costs are computed and recorded: 1,200 input and 300 output tokens on Claude Opus 5.5 is `Decimal("0.010800")`.
 
 ### Using it: `atlas llm` and `atlas llm-usage`
 
-DEMO_LLM
+`atlas llm` sends one prompt through whichever provider the settings choose, prints the reply (as it arrives, with `--stream`), a summary line on stderr, and records the call:
+
+```text
+$ atlas llm "What does a learning rate scheduler do? Two sentences." --stream
+A learning rate scheduler adjusts the learning rate during training to optimize convergence and performance. It helps improve model accuracy by dynamically modifying the learning rate based on training progress.
+qwen3:1.7b via ollama: 23 tokens in, 33 out, 5.0 s, $0, stopped: end
+$ atlas llm-usage
+purpose      model              calls       in     out  avg s       cost
+cli          qwen3:1.7b             3       72      96    3.1    $0.0000
+```
+
+`llm-usage` is one `GROUP BY purpose, model` over `llm_calls`. With Ollama stopped (`docker compose stop ollama`), the three attempts and their waits, then a clear error and exit code 1:
+
+```text
+$ atlas llm "Hello"
+atlas: cannot reach Ollama: [Errno 111] Connection refused
+exit 1 after 3.95 s
+```
+
+Four seconds: attempts at 0, 1 and 3 seconds (waits of 1 then 2), each refused at once.
+
+### A bug: a missing key
+
+Choosing Claude without a key, in a clean environment (`env -i` starts a command with no inherited variables):
+
+```text
+$ LLM_PROVIDER=anthropic atlas llm "Hello"
+...
+TypeError: "Could not resolve authentication method. Expected one of api_key, auth_token, or credentials to be set. Or for the `Authorization` header to be explicitly omitted"
+```
+
+A traceback, not a message. The SDK (2.11.0) reports missing credentials with a plain `TypeError` when the request is sent, not with one of its `APIError` classes, so `ClaudeChat`'s `except anthropic.APIError` didn't catch it. The regression test removes every credential source and expects an `LLMError` naming the fix:
+
+```python
+def test_claude_without_credentials_says_how_to_fix_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (lesson 6.2): the SDK raised a bare TypeError at request time, and
+    # `atlas llm` printed a traceback instead of a message.
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", "/nonexistent")  # no `ant auth login` profile either
+    ...
+    with pytest.raises(LLMError, match="ANTHROPIC_API_KEY"):
+        ClaudeChat(client=client).complete(request())
+```
+
+Red: `TypeError: "Could not resolve authentication method..."`. Green with a narrow translation, recognising that one error by its message and leaving any other `TypeError` alone, because a `TypeError` is usually a bug that should surface:
+
+```python
+def raise_if_no_credentials(error: TypeError) -> None:
+    is_missing_credentials = "Could not resolve authentication method" in str(error)
+    if is_missing_credentials:
+        raise LLMError(
+            "no Claude credentials: set ANTHROPIC_API_KEY, or run `ant auth login`"
+        ) from error
+```
+
+```text
+$ LLM_PROVIDER=anthropic atlas llm "Hello"
+atlas: no Claude credentials: set ANTHROPIC_API_KEY, or run `ant auth login`
+exit 1
+```
+
+Matching an exception's message is fragile: a future SDK could reword it, and the test above would then fail, which is the point of having it.
 
 ## Trade-offs *(deep dive)*
 
@@ -320,12 +382,31 @@ Zero is a claim (the call was free), and sums would silently under-report spend.
 
 ## Exercise
 
-EXERCISE_62
+Add `--since YYYY-MM-DD` to `atlas llm-usage`, so it reports only calls from that date on.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Give the subparser `usage_parser.add_argument("--since", type=date.fromisoformat, default=None)`, pass `args` to `run_llm_usage`, and add a `where` before the `group_by`:
+```python
+.where(LlmCall.created_at >= (args.since or date.min))
+```
+`date.min` (the year 1) makes "no `--since`" mean "everything" without a second branch. Checked against the reference code, with two rows inserted by hand as if Claude had answered (one yesterday, one today; no real Claude call was made): `--since 2026-11-20` listed only today's, `answer  claude-opus-5-5  1  100000  20000  4.0  $0.8000`. Not in the reference code.
+:::
 
 ## Stretch
 
-STRETCH_62
+A cost log is only useful if someone looks at it. Add `--limit-usd AMOUNT` to `atlas llm-usage`: after printing, exit with code 1 and a message if the total cost is over the limit, so a scheduled job (lesson 5.2) or CI can raise the alarm.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+total = sum((row[6] or Decimal(0) for row in rows), Decimal(0))
+over_limit = args.limit_usd is not None and total > args.limit_usd
+if over_limit:
+    print(f"atlas: spent ${total:.4f}, over the ${args.limit_usd} limit", file=sys.stderr)
+    return 1
+```
+with `usage_parser.add_argument("--limit-usd", type=Decimal, default=None)`. `row[6] or Decimal(0)` treats unpriced (null) costs as zero for the sum; a stricter version would refuse to judge while any cost is unknown. With the same two hand-inserted rows: `atlas: spent $1.6000, over the $1.00 limit`, exit code 1. Part 7 turns this kind of check into an alert. Not in the reference code.
+:::
 
 ## What changed in the project
 
-New `atlas/llm/` package: `__init__.py` (neutral types, `ChatProvider`, `LLMError`), `ollama.py` (`OllamaChat`), `claude.py` (`ClaudeChat`), `calls.py` (`make_chat`, prices, `cost_usd`, `record`); `llm_calls` table (migration `0008`); settings `LLM_PROVIDER`, `CHAT_MODEL`, `OLLAMA_URL`, `LLM_EFFORT`; `atlas llm` and `atlas llm-usage`; `anthropic` 2.11.0; `tests/fake_llm.py` and `tests/test_llm.py`. Commit: `feat: Added the llm package with Ollama and Claude providers and a cost log`.
+New `atlas/llm/` package: `__init__.py` (neutral types, `ChatProvider`, `LLMError`), `ollama.py` (`OllamaChat`), `claude.py` (`ClaudeChat`), `calls.py` (`make_chat`, prices, `cost_usd`, `record`); `llm_calls` table (migration `0008`); settings `LLM_PROVIDER`, `CHAT_MODEL`, `OLLAMA_URL`, `LLM_EFFORT`; `atlas llm` and `atlas llm-usage`; `anthropic` 2.11.0; `tests/fake_llm.py` and `tests/test_llm.py`. Commits: `feat: Added the llm package with Ollama and Claude providers and a cost log`, `fix: Turned missing Claude credentials into a clear error`.
