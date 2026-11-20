@@ -77,3 +77,15 @@ class ChatProvider(Protocol):
 
 class LLMError(Exception):
     """The model couldn't be reached or answered with an error, after retries."""
+
+
+# What a text is embedded for. Some models embed a question differently from a passage
+# that might answer it (lesson 6.4).
+EmbeddingPurpose = Literal["document", "query"]
+
+
+class EmbeddingProvider(Protocol):
+    model: str
+    dimensions: int
+
+    def embed(self, texts: list[str], purpose: EmbeddingPurpose) -> list[list[float]]: ...

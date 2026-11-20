@@ -6,7 +6,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from atlas.config import Settings
-from atlas.llm import ChatProvider, ChatResult
+from atlas.llm import ChatProvider, ChatResult, EmbeddingProvider
 from atlas.models import LlmCall
 
 logger = logging.getLogger("atlas.llm")
@@ -33,6 +33,12 @@ def make_chat(settings: Settings) -> ChatProvider:
     from atlas.llm.ollama import OllamaChat
 
     return OllamaChat(model=model, base_url=settings.ollama_url)
+
+
+def make_embeddings(settings: Settings) -> EmbeddingProvider:
+    from atlas.llm.ollama import OllamaEmbeddings
+
+    return OllamaEmbeddings(model=settings.embedding_model, base_url=settings.ollama_url)
 
 
 def cost_usd(result: ChatResult) -> Decimal | None:

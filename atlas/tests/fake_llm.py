@@ -5,6 +5,7 @@ retries, validation, logging), never the quality of the answers themselves. Qual
 measured against real models, in lesson 6.8's evaluations.
 """
 
+import hashlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -70,3 +71,30 @@ def claude_transport(
         return respond(json.loads(request.content), request)
 
     return httpx2.MockTransport(handle)
+
+
+class FakeEmbeddings:
+    """Deterministic stand-in for an embedding model: texts sharing words get similar vectors.
+
+    Each word adds 1 to one of 768 positions chosen by its hash, then the vector is scaled
+    to length 1. It has no idea what words mean, which is the point: tests check Atlas's
+    plumbing (batching, storage, ranking arithmetic), not a model's understanding.
+    """
+
+    model = "fake-embed"
+    dimensions = 768
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str]] = []  # (batch size, purpose)
+
+    def embed(self, texts: list[str], purpose: str) -> list[list[float]]:
+        self.calls.append((len(texts), purpose))
+        return [self.vector(text) for text in texts]
+
+    def vector(self, text: str) -> list[float]:
+        values = [0.0] * self.dimensions
+        for word in text.lower().replace(".", " ").replace("(", " ").split():
+            digest = hashlib.sha256(word.encode()).digest()
+            values[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
+        length = sum(v * v for v in values) ** 0.5 or 1.0
+        return [v / length for v in values]

@@ -29,7 +29,7 @@ def sample_repo(tmp_path: Path) -> Path:
 import os  # noqa: E402
 from collections.abc import Iterator  # noqa: E402
 
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Engine  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -46,6 +46,10 @@ def engine() -> Iterator[Engine]:
     engine = create_engine(url)
     # Start from empty tables every run, whatever a previous run left behind.
     Base.metadata.drop_all(engine)
+    with engine.begin() as connection:
+        # The vector type comes from the pgvector extension (lesson 6.4); migration 0010
+        # creates it in real databases.
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
@@ -280,6 +284,7 @@ from atlas.events import EventStream  # noqa: E402
 from atlas.jobs import WorkerContext  # noqa: E402
 from atlas.snapshots import S3_CONFIG, SnapshotStore  # noqa: E402
 from tests.fake_github import FakeIssueTracker  # noqa: E402
+from tests.fake_llm import FakeEmbeddings  # noqa: E402
 
 
 def git_commit(path: Path, message: str) -> str:
@@ -356,7 +361,13 @@ def worker(
         factory = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
         events = EventStream(queue.client, name=f"test-events-{uuid.uuid4().hex}")
         context = WorkerContext(
-            factory, queue, settings, snapshot_store, events, issue_tracker.transport()
+            factory,
+            queue,
+            settings,
+            snapshot_store,
+            events,
+            FakeEmbeddings(),
+            issue_tracker.transport(),
         )
         yield context
         events.client.delete(events.name)

@@ -148,7 +148,7 @@ class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    kind: Literal["sync_repo", "sync_issues", "snapshot_repo"]
+    kind: Literal["sync_repo", "sync_issues", "snapshot_repo", "embed_repo"]
     repo_id: int
     status: Literal["queued", "running", "succeeded", "dead"]
     attempts: int

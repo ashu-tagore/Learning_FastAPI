@@ -17,13 +17,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select, text, update
+from sqlalchemy import Update, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from atlas import github, gitrepo, storage
 from atlas.config import Settings
+from atlas.embedding import EmbedSummary, embed_pending
 from atlas.events import EventStream
+from atlas.llm import EmbeddingProvider
 from atlas.models import Job, Repo
 from atlas.queue import JobQueue
 from atlas.snapshots import SnapshotStore
@@ -47,6 +49,7 @@ class WorkerContext:
     settings: Settings
     snapshots: SnapshotStore
     events: EventStream
+    embedder: EmbeddingProvider
     github_transport: httpx.AsyncBaseTransport | None = None
 
 
@@ -99,6 +102,7 @@ def run_job(ctx: WorkerContext, job_id: int) -> str:
     "succeeded": done.
     "retrying": failed; queued again after a backoff delay.
     "deferred": GitHub's rate limit is used up; queued again for when it resets.
+    "continued": did part of its work and is queued again at once (lesson 6.4).
     "dead": failed MAX_ATTEMPTS times; a person needs to look at last_error.
     """
     job = _claim(ctx, job_id)
@@ -106,19 +110,28 @@ def run_job(ctx: WorkerContext, job_id: int) -> str:
         return "skipped"
 
     try:
-        with ctx.session_factory() as session, session.begin():
-            _run_handler(ctx, session, job)
-            # Same transaction as the handler's writes: either both happen or neither does.
-            # If the worker dies before this commits, the next delivery redoes the work.
-            session.execute(
-                update(Job)
-                .where(Job.id == job.id)
-                .values(status="succeeded", finished_at=datetime.now(UTC), last_error=None)
-            )
+        if job.kind == "embed_repo":
+            # Minutes of work that commits batch by batch: it must not run inside one
+            # long transaction, which would hold a connection idle for minutes and, if
+            # the slice ends early, undo the batches it finished (lesson 6.4).
+            embed_repo(ctx, job.repo_id)
+            with ctx.session_factory() as session, session.begin():
+                session.execute(mark_succeeded(job))
+        else:
+            with ctx.session_factory() as session, session.begin():
+                _run_handler(ctx, session, job)
+                # Same transaction as the handler's writes: either both happen or neither
+                # does. If the worker dies before this commits, the next delivery redoes it.
+                session.execute(mark_succeeded(job))
     except github.RateLimited as error:
         delay = (error.retry_at - datetime.now(UTC)).total_seconds() + 1
         _requeue(ctx, job, str(error), delay, undo_attempt=True)
         return "deferred"
+    except MoreWorkRemains as progress:
+        # Not a failure: the job did a slice of its work (already committed) and stopped
+        # inside its lease. Queue it again at once, without counting an attempt.
+        _requeue(ctx, job, str(progress), 0, undo_attempt=True)
+        return "continued"
     except Exception as error:
         logger.exception("job failed", extra={"job_id": job.id, "kind": job.kind})
         if job.attempts >= MAX_ATTEMPTS:
@@ -127,6 +140,14 @@ def run_job(ctx: WorkerContext, job_id: int) -> str:
         _requeue(ctx, job, describe(error), backoff_seconds(job.attempts))
         return "retrying"
     return "succeeded"
+
+
+def mark_succeeded(job: Job) -> Update:
+    return (
+        update(Job)
+        .where(Job.id == job.id)
+        .values(status="succeeded", finished_at=datetime.now(UTC), last_error=None)
+    )
 
 
 def describe(error: Exception) -> str:
@@ -186,6 +207,22 @@ def _run_handler(ctx: WorkerContext, session: Session, job: Job) -> None:
         snapshot_repo(repo, ctx.settings, ctx.snapshots)
         return
     sync_issues(session, repo, ctx.settings, ctx.events, ctx.github_transport)
+
+
+class MoreWorkRemains(Exception):
+    """A job made progress and stopped early, on purpose, to stay inside its lease."""
+
+
+def embed_repo(ctx: WorkerContext, repo_id: int) -> EmbedSummary:
+    """Embed the repository's chunks that need it (lesson 6.4), one time-limited slice.
+
+    embed_pending opens its own sessions and commits each batch: a slice can take
+    minutes, and the batches it finished should survive whatever happens next.
+    """
+    summary = embed_pending(ctx.session_factory, ctx.embedder, repo_id)
+    if summary.remaining:
+        raise MoreWorkRemains(f"embedded {summary.embedded}; {summary.remaining} chunks remain")
+    return summary
 
 
 def sync_repo(session: Session, repo: Repo, settings: Settings) -> storage.IndexSummary:

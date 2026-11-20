@@ -11,7 +11,15 @@ from typing import Any
 
 import httpx
 
-from atlas.llm import ChatEvent, ChatRequest, ChatResult, LLMError, StopReason, TextDelta
+from atlas.llm import (
+    ChatEvent,
+    ChatRequest,
+    ChatResult,
+    EmbeddingPurpose,
+    LLMError,
+    StopReason,
+    TextDelta,
+)
 
 # Ollama's done_reason values, in Atlas's words.
 STOP_REASONS: dict[str, StopReason] = {"stop": "end", "length": "max_tokens"}
@@ -112,3 +120,44 @@ class OllamaChat:
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             purpose=request.purpose,
         )
+
+
+# nomic-embed-text was trained with these prefixes, and works best when given them: the
+# same words embed differently as a question and as a passage (lesson 6.4).
+NOMIC_PREFIXES: dict[EmbeddingPurpose, str] = {
+    "document": "search_document: ",
+    "query": "search_query: ",
+}
+
+
+class OllamaEmbeddings:
+    def __init__(
+        self,
+        model: str = "nomic-embed-text",
+        dimensions: int = 768,
+        base_url: str = "http://localhost:11434",
+        timeout: float = 300.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.model = model
+        self.dimensions = dimensions
+        self.client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport)
+
+    def embed(self, texts: list[str], purpose: EmbeddingPurpose) -> list[list[float]]:
+        uses_prefixes = self.model.startswith("nomic-embed")
+        prefix = NOMIC_PREFIXES[purpose] if uses_prefixes else ""
+        body = {"model": self.model, "input": [prefix + text for text in texts]}
+        try:
+            response = self.client.post("/api/embed", json=body)
+        except httpx.TransportError as error:
+            raise LLMError(f"cannot reach Ollama: {error}") from error
+        if response.status_code != 200:
+            raise LLMError(f"Ollama answered {response.status_code}: {response.text[:200]}")
+        vectors: list[list[float]] = response.json()["embeddings"]
+        wrong_size = [len(vector) for vector in vectors if len(vector) != self.dimensions]
+        if wrong_size:
+            # The column has a fixed size; a different model needs a migration (6.4).
+            raise LLMError(
+                f"{self.model} returned {wrong_size[0]} dimensions, expected {self.dimensions}"
+            )
+        return vectors

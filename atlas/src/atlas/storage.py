@@ -5,7 +5,6 @@ starts and ends, so several operations can succeed or fail together.
 """
 
 import hashlib
-from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +13,7 @@ from sqlalchemy import Row, Select, case, delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from atlas import github
+from atlas.chunking import chunk_file
 from atlas.events import IssueEvent
 from atlas.models import Chunk, Document, Issue, Label, Repo, issue_labels, saved_issues
 from atlas.search import DEFAULT_EXTENSIONS, is_in_skipped_folder, iter_source_files
@@ -47,17 +47,7 @@ def get_or_create_repo(session: Session, full_name: str) -> Repo:
     return repo
 
 
-def split_into_chunks(lines: list[str], size: int) -> Iterator[tuple[int, int, str]]:
-    """Yield (start_line, end_line, text) for consecutive blocks of `size` lines.
-
-    Fixed-size blocks are deliberately naive; lesson 6.5 splits by structure instead.
-    """
-    for start in range(0, len(lines), size):
-        block = lines[start : start + size]
-        yield start + 1, start + len(block), "\n".join(block)
-
-
-def read_document(repo: Repo, root: Path, path: Path, chunk_lines: int) -> Document | None:
+def read_document(repo: Repo, root: Path, path: Path) -> Document | None:
     """A Document with its chunks for one file, or None if it can't be stored as text."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -68,16 +58,18 @@ def read_document(repo: Repo, root: Path, path: Path, chunk_lines: int) -> Docum
         return None
 
     lines = text.splitlines()
+    relative = path.relative_to(root).as_posix()
     document = Document(
         repo=repo,
-        path=str(path.relative_to(root)),
+        path=relative,
         kind="doc" if path.suffix in DOC_EXTENSIONS else "code",
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         line_count=len(lines),
     )
+    # By structure: functions, methods, sections (lesson 6.5).
     document.chunks = [
-        Chunk(start_line=start, end_line=end, text=block)
-        for start, end, block in split_into_chunks(lines, chunk_lines)
+        Chunk(start_line=p.start_line, end_line=p.end_line, symbol=p.symbol, text=p.text)
+        for p in chunk_file(relative, text)
     ]
     return document
 
@@ -88,23 +80,24 @@ def index_folder(
     root: Path,
     *,
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
-    chunk_lines: int = 40,
 ) -> IndexSummary:
     """Replace the stored copy of a codebase with the files under root."""
     repo = get_or_create_repo(session, repo_full_name)
 
     # Delete-then-insert inside the caller's transaction: other sessions keep seeing
     # the old index until the commit, then the whole new one at once.
+    kept = stored_embeddings(session, repo.id, paths=None)
     session.execute(delete(Document).where(Document.repo_id == repo.id))
 
     document_count = 0
     chunk_count = 0
     skipped = 0
     for path in iter_source_files(root, extensions):
-        document = read_document(repo, root, path, chunk_lines)
+        document = read_document(repo, root, path)
         if document is None:
             skipped += 1
             continue
+        reuse_embeddings(document, kept)
         session.add(document)
         document_count += 1
         chunk_count += len(document.chunks)
@@ -112,6 +105,39 @@ def index_folder(
     repo.indexed_at = datetime.now(UTC)
     session.flush()
     return IndexSummary(documents=document_count, chunks=chunk_count, skipped=skipped)
+
+
+# (path, chunk text) -> (vector, model that made it)
+StoredEmbeddings = dict[tuple[str, str], tuple[list[float], str]]
+
+
+def stored_embeddings(session: Session, repo_id: int, paths: list[str] | None) -> StoredEmbeddings:
+    """The vectors of chunks about to be deleted, so unchanged ones can keep theirs (6.5)."""
+    statement = (
+        select(Document.path, Chunk.text, Chunk.embedding, Chunk.embedding_model)
+        .join(Chunk.document)
+        .where(Document.repo_id == repo_id, Chunk.embedding.is_not(None))
+    )
+    if paths is not None:
+        statement = statement.where(Document.path.in_(paths))
+    kept: StoredEmbeddings = {}
+    for path, text, vector, model in session.execute(statement):
+        if vector is None or model is None:
+            continue
+        kept[(path, text)] = (list(vector), model)
+    return kept
+
+
+def reuse_embeddings(document: Document, kept: StoredEmbeddings) -> None:
+    """Give each new chunk the vector of an identical old chunk in the same file, if any.
+
+    Embedding is the slow, costly step of indexing; a one-line change to a file shouldn't
+    mean re-embedding every function in it.
+    """
+    for chunk in document.chunks:
+        previous = kept.get((document.path, chunk.text))
+        if previous is not None:
+            chunk.embedding, chunk.embedding_model = previous
 
 
 def update_index(
@@ -122,10 +148,10 @@ def update_index(
     changed: list[str],
     deleted: list[str],
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
-    chunk_lines: int = 40,
 ) -> IndexSummary:
     """Re-index only the files a commit changed (lesson 5.3); every other file is untouched."""
     repo = get_or_create_repo(session, repo_full_name)
+    kept = stored_embeddings(session, repo.id, paths=changed)
     session.execute(
         delete(Document).where(Document.repo_id == repo.id, Document.path.in_([*changed, *deleted]))
     )
@@ -138,10 +164,11 @@ def update_index(
         is_wanted = path.suffix in extensions and not is_in_skipped_folder(Path(relative))
         if not is_wanted:
             continue
-        document = read_document(repo, root, path, chunk_lines)
+        document = read_document(repo, root, path)
         if document is None:
             skipped += 1
             continue
+        reuse_embeddings(document, kept)
         session.add(document)
         document_count += 1
         chunk_count += len(document.chunks)

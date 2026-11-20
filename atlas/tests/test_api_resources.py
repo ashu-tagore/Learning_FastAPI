@@ -41,10 +41,8 @@ async def store_numbers(session: AsyncSession, numbers: list[int]) -> dict[int, 
     return await store_issues(session, [make_issue(number) for number in numbers])
 
 
-async def index_sample(session: AsyncSession, root: Path, chunk_lines: int = 40) -> None:
-    await session.run_sync(
-        lambda sync: storage.index_folder(sync, "pytorch/ignite", root, chunk_lines=chunk_lines)
-    )
+async def index_sample(session: AsyncSession, root: Path) -> None:
+    await session.run_sync(lambda sync: storage.index_folder(sync, "pytorch/ignite", root))
     await session.commit()
 
 
@@ -216,7 +214,7 @@ async def test_saving_needs_a_login(client: httpx.AsyncClient, async_session: As
 async def test_search_finds_and_pages(
     client: httpx.AsyncClient, async_session: AsyncSession, sample_repo: Path
 ) -> None:
-    await index_sample(async_session, sample_repo, chunk_lines=1)
+    await index_sample(async_session, sample_repo)
 
     first = (await client.get("/search", params={"q": "event", "limit": 1})).json()
     second = (await client.get("/search", params={"q": "event", "limit": 1, "offset": 1})).json()

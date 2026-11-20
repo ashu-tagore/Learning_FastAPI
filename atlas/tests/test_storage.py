@@ -20,21 +20,15 @@ def make_issue(number: int, labels: tuple[str, ...], days_old: int = 1) -> githu
     )
 
 
-def test_split_into_chunks_covers_every_line_once() -> None:
-    lines = [f"line {n}" for n in range(1, 6)]
-
-    chunks = list(storage.split_into_chunks(lines, size=2))
-
-    assert [(start, end) for start, end, _ in chunks] == [(1, 2), (3, 4), (5, 5)]
-    assert chunks[2][2] == "line 5"
-
-
 def test_index_stores_documents_and_chunks(session: Session, sample_repo: Path) -> None:
-    summary = storage.index_folder(session, "pytorch/ignite", sample_repo, chunk_lines=2)
+    summary = storage.index_folder(session, "pytorch/ignite", sample_repo)
 
     paths = set(session.scalars(select(Document.path)))
     assert paths == {"README.md", "ignite/engine/engine.py", "ignite/metrics.py"}
-    assert summary == storage.IndexSummary(documents=3, chunks=5, skipped=1)
+    # engine.py: the Engine class line, then Engine.run; metrics.py: accuracy; README: 1.
+    assert summary == storage.IndexSummary(documents=3, chunks=4, skipped=1)
+    symbols = set(session.scalars(select(Chunk.symbol)))
+    assert symbols == {"Engine", "Engine.run", "accuracy", "Ignite"}
 
 
 def test_reindexing_replaces_instead_of_duplicating(session: Session, sample_repo: Path) -> None:
@@ -55,12 +49,12 @@ def test_documents_are_classified_as_code_or_doc(session: Session, sample_repo: 
 
 
 def test_find_ranks_matching_chunks_with_line_ranges(session: Session, sample_repo: Path) -> None:
-    storage.index_folder(session, "pytorch/ignite", sample_repo, chunk_lines=2)
+    storage.index_folder(session, "pytorch/ignite", sample_repo)
 
     hits = storage.find_chunks(session, "pytorch/ignite", "fire event")
 
     assert [(hit.path, hit.start_line, hit.end_line) for hit in hits] == [
-        ("ignite/engine/engine.py", 3, 3)
+        ("ignite/engine/engine.py", 2, 3)  # the whole Engine.run method
     ]
     # The snippet highlights words as Postgres's parser sees the original text.
     assert "[event]" in hits[0].snippet

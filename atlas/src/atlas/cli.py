@@ -42,7 +42,7 @@ from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
 from atlas.jobs import WorkerContext, create_job
 from atlas.llm import ChatProvider, ChatRequest, ChatResult, LLMError, TextDelta, user
-from atlas.llm.calls import cost_usd, make_chat, record
+from atlas.llm.calls import cost_usd, make_chat, make_embeddings, record
 from atlas.logs import configure_logging
 from atlas.models import Issue, IssueFit, Job, LlmCall, Repo, User
 from atlas.notifier import run_notifier as run_notifier_loop
@@ -374,7 +374,8 @@ def worker_context() -> WorkerContext | None:
     redis_client = redis.Redis.from_url(settings.redis_url)
     snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
     events = EventStream(redis_client)
-    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events)
+    embedder = make_embeddings(settings)
+    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events, embedder)
 
 
 def run_worker() -> int:

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select, update
 
-from atlas import jobs
+from atlas import embedding, jobs
 from atlas.jobs import WorkerContext, backoff_seconds, create_job, run_job
 from atlas.models import Document, Issue, Job, Repo
 from tests.conftest import FakeClock, git_commit
@@ -214,3 +214,26 @@ def test_create_job_keeps_working_once_the_driver_prepares_it(worker: WorkerCont
         results = [create_job(session, "sync_repo", repo_id) for _ in range(20)]
 
     assert len({job_id for job_id, _ in results}) == 1
+
+
+def test_a_long_embedding_job_continues_in_slices(
+    worker: WorkerContext, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_id = add_repo(worker)
+    run_job(worker, queue_job(worker, "sync_repo", repo_id))
+    # No time budget at all: each run may embed only its one guaranteed batch of 1 chunk.
+    original = embedding.embed_pending
+    monkeypatch.setattr(
+        "atlas.jobs.embed_pending",
+        lambda factory, embedder, repo: original(
+            factory, embedder, repo, batch_size=1, seconds=0.0
+        ),
+    )
+    job_id = queue_job(worker, "embed_repo", repo_id)
+
+    outcomes = [run_job(worker, job_id) for _ in range(3)]
+
+    # Three chunks upstream (README, the Engine class line, Engine.run): even with a zero
+    # budget, each run embeds one batch before stopping, so the job always progresses.
+    assert outcomes == ["continued", "continued", "succeeded"]
+    assert load_job(worker, job_id).attempts == 1  # continuing didn't use attempts
