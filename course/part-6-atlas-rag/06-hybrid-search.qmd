@@ -19,11 +19,25 @@ Two judges score the same dancers on different scales: one out of 10 for techniq
 
 ## The problem
 
-Each search Atlas now has is good at different questions. Keyword search found nothing for "stop training when the validation loss stops improving" (lesson 6.4), because Ignite never uses those words. Semantic search ranked a decoy built from the question's own words above the real answer (also lesson 6.4). And some questions are just names: someone asking about `add_event_handler` wants the exact identifier, which keyword search finds perfectly and an embedding may blur into "something about events".
+Each search Atlas now has is good at different questions. Keyword search found nothing for "stop training when the validation loss stops improving" (lesson 6.4), because Ignite never uses those words. Semantic search ranked a decoy built from the question's own words above the real answer (also lesson 6.4). And some questions are just names: someone asking about `add_event_handler` wants the exact identifier, which keyword search should find and an embedding might blur into "something about events".
 
 Here is each on ten questions about Ignite whose answer lives in a known file, counting whether that file appears in the top five results:
 
-MODES_TABLE
+| Question | Keyword | Semantic |
+|---|---|---|
+| save the model every few epochs | #1 | - |
+| stop training when the validation loss stops improving | - | - |
+| change the learning rate while training | - | - |
+| how often are the predictions correct | - | #3 |
+| run the same script on several GPUs or machines | #1 | - |
+| show a progress bar during training | - | #1 |
+| send metrics to TensorBoard | - | #5 |
+| find a good starting learning rate | - | #2 |
+| EarlyStopping | #2 | #1 |
+| add_event_handler | - | #1 |
+| **Found in the top 5** | **3/10** | **6/10** |
+
+"#2" means the expected file's best chunk came second; "-" that it wasn't in the top five. The surprise is the last row: keyword search *does* match `add_event_handler`, but ranks the definition seventh, behind six test functions that use the name over and over.
 
 Neither search wins everywhere. The obvious next step, running both and keeping the better result, needs a way to decide which result is better, and the two searches' scores aren't comparable: keyword scores (`ts_rank`) are small numbers that depend on how often words occur, while cosine similarities sit between about 0.5 and 0.9 for anything vaguely related.
 
@@ -186,7 +200,93 @@ The mode is part of the key, after any fallback, so a keyword fallback is never 
 
 The ten questions in "The problem" come with the file a good answer must come from. Ignite at commit `0abbcab`, 4,631 structural chunks, all embedded with `nomic-embed-text`; "#2" means the expected file's best chunk was second, "-" that it wasn't in the top five:
 
-MEASUREMENT_DISCUSSION
+| Question | Keyword | Semantic | Hybrid |
+|---|---|---|---|
+| save the model every few epochs | #1 | - | #1 |
+| stop training when the validation loss stops improving | - | - | - |
+| change the learning rate while training | - | - | - |
+| how often are the predictions correct | - | #3 | #3 |
+| run the same script on several GPUs or machines | #1 | - | #2 |
+| show a progress bar during training | - | #1 | #2 |
+| send metrics to TensorBoard | - | #5 | #5 |
+| find a good starting learning rate | - | #2 | #2 |
+| EarlyStopping | #2 | #1 | #1 |
+| add_event_handler | - | #1 | #2 |
+| **Found in the top 5** | **3/10** | **6/10** | **8/10** |
+
+```text
+median embed time: 48 ms
+median keyword time: 5 ms
+median semantic time: 7 ms
+median hybrid time: 7 ms
+```
+
+Hybrid found every answer either search found, and two that only one of them found ("save the model", "GPUs"). The price is visible in rows like "progress bar": first place for semantic alone becomes second, because a chunk the other search also liked overtook it. RRF rewards agreement, which usually helps and sometimes costs a place.
+
+Time is dominated by embedding the question (48 ms on a CPU); the searches themselves take single-digit milliseconds, and hybrid, which runs both, costs about as much as the slower one.
+
+**The two misses** are worth reading, not just counting:
+
+```text
+== stop training when the validation loss stops improving
+  keyword  expected at #None; 0 results
+  semantic expected at #13; top 3: examples/cifar10/main.py:training,
+           engine/engine.py:Engine._check_and_set_termination_param,
+           tests/ignite/handlers/test_early_stopping.py:test_simple_early_stopping_on_plateau
+== change the learning rate while training
+  keyword  expected at #None; 0 results
+  semantic expected at #None; top 3: metrics/fairness/demographic_parity.py:SelectionRate,
+           metrics/fairness/demographic_parity.py:SelectionRate.compute, metrics/nlp/bleu.py:Bleu
+```
+
+Keyword search returns *nothing* for both: `websearch_to_tsquery` requires every word, and no chunk contains all of them. The first semantic miss is a near miss: the third result is the early-stopping *test*, a perfectly useful answer, and the handler itself is 13th. The second is a real failure: a small embedding model matched "rate" to `SelectionRate` and BLEU scores, and never reached `param_scheduler.py` in the top 50. No fusion can recover a chunk that neither search returns. Lesson 6.8 turns this table into an evaluation set, so changes to chunking, models or fusion can be judged by numbers rather than by a few memorable queries.
+
+### A bug the measurement found
+
+While checking the semantic query's plan with `EXPLAIN ANALYZE`, one line didn't add up: the query asked for 50 rows and got 40.
+
+```text
+Limit  (cost=1014.31..1447.99 rows=50 width=12) (actual time=2.301..2.700 rows=40 loops=1)
+  ->  Nested Loop  ...  (actual time=2.299..2.695 rows=40 loops=1)
+        ...
+              ->  Index Scan using ix_chunks_embedding on chunks  ...
+```
+
+pgvector's HNSW search keeps a list of at most `hnsw.ef_search` candidates, 40 by default, and an index scan returns no more than that. Nothing fails; hybrid search just fuses 50 keyword candidates with 40 semantic ones. The test that failed before the fix (red) and passed after it (green):
+
+```python
+def test_semantic_search_returns_as_many_candidates_as_asked(
+    session: Session, tmp_path: Path
+) -> None:
+    # Regression (lesson 6.6): pgvector's HNSW search keeps at most hnsw.ef_search
+    # candidates (40 by default), so a request for 50 silently came back with 40.
+    for number in range(60):
+        source = f"def function_{number}():\n    return {number}\n"
+        (tmp_path / f"module_{number}.py").write_text(source)
+    storage.index_folder(session, "pytorch/ignite", tmp_path)
+    embedder = FakeEmbeddings()
+    embed_sample(session, embedder)
+    query = embedder.embed(["def return module"], "query")[0]
+    # With only 60 rows Postgres would rather scan and sort; make it use the HNSW index,
+    # as it does on a real-sized table.
+    session.execute(text("SET LOCAL enable_seqscan = off"))
+
+    ranking = storage.semantic_ranking(session, "pytorch/ignite", query, "fake-embed", None, 50)
+
+    assert len(ranking) == 50
+```
+
+`enable_seqscan = off` matters: on a 60-row table Postgres would skip the index, and the test would pass without the fix. The fix, at the top of `semantic_ranking`:
+
+```python
+# An HNSW search keeps at most hnsw.ef_search candidates (40 by default), so without
+# this a request for 50 silently returns 40 (lesson 6.6). SET LOCAL lasts only until
+# the end of this transaction. int() because SET can't take a bound parameter.
+candidates = max(int(limit), 40)
+session.execute(text(f"SET LOCAL hnsw.ef_search = {candidates}"))
+```
+
+`SET LOCAL` changes a setting for the current transaction only, so it can't leak into other requests sharing the connection pool. `SET` doesn't accept bound parameters, which is why the number is put in the SQL text, and `int()` guarantees it is a number and nothing else. Commit: `fix: Raised hnsw.ef_search so semantic search returns every candidate asked for`. (The table above is measured with the fix.)
 
 ## Trade-offs *(deep dive)*
 
@@ -246,8 +346,24 @@ With `[[1, 2, 3], [3, 1]]` and weights `[1.0, 0.0]` the result is `[(1, 0.01639.
 
 ## Stretch
 
-STRETCH_66
+Test the deep-dive claim about fusion by score. Write `min_max_fusion(rankings)` that scales each list's scores to 0..1 (`(score - lowest) / (highest - lowest)`) and adds them, then run the ten questions through both fusions with the same candidates. Our run:
+
+```text
+save the model every few epochs                           #1       #2
+stop training when the validation loss stops improving     -        -
+change the learning rate while training                    -        -
+how often are the predictions correct                     #3       #3
+run the same script on several GPUs or machines           #2       #2
+show a progress bar during training                       #2       #2
+send metrics to TensorBoard                               #5       #5
+find a good starting learning rate                        #2       #2
+EarlyStopping                                             #1       #1
+add_event_handler                                         #2       #1
+found in the top 5                                       8/10     8/10
+```
+
+(RRF first, min-max second.) A tie: each wins one question by a place. On ten questions, that is no evidence either way, which is the point. RRF stays in Atlas because it needs no scores at all and has no scale to get wrong when a model or ranking function changes; whether score fusion is better for Atlas is a question for lesson 6.8's larger evaluation set.
 
 ## What changed in the project
 
-`storage.py`: `keyword_ranking`, `semantic_ranking`, `reciprocal_rank_fusion`, `search_chunks`, `load_hits`, `Hit.symbol`; `GET /search` gains `mode` (default `hybrid`), `symbol` in results, an `X-Search-Mode` header and a fallback to keywords; the embedder in the app's lifespan and a `get_embedder` dependency; `repos.embedded_at` (migration `0011`) in the cache version; `atlas find --mode`; `tests/test_hybrid.py`. Commit: `feat: Added semantic and hybrid search with reciprocal rank fusion`.
+`storage.py`: `keyword_ranking`, `semantic_ranking`, `reciprocal_rank_fusion`, `search_chunks`, `load_hits`, `Hit.symbol`; `GET /search` gains `mode` (default `hybrid`), `symbol` in results, an `X-Search-Mode` header and a fallback to keywords; the embedder in the app's lifespan and a `get_embedder` dependency; `repos.embedded_at` (migration `0011`) in the cache version; `atlas find --mode`; `tests/test_hybrid.py`. Commits: `feat: Added semantic and hybrid search with reciprocal rank fusion`, `fix: Raised hnsw.ef_search so semantic search returns every candidate asked for`.

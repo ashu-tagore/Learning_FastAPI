@@ -106,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser.add_argument("--repo", default=DEFAULT_REPO, help="name to store it under")
     index_parser.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS))
 
-    find_parser = commands.add_parser("find", help="ranked full-text search in Postgres")
+    find_parser = commands.add_parser("find", help="search by keyword, meaning or both")
     find_parser.add_argument("query", help="words to look for")
     find_parser.add_argument("--repo", default=DEFAULT_REPO)
     find_parser.add_argument("--limit", type=int, default=10)

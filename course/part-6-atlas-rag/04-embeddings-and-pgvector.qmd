@@ -289,7 +289,15 @@ if job.kind == "embed_repo":
 
 The scheduler queues `embed_repo` with the other jobs (migration `0010` adds it to the CHECK constraint). The real run on Ignite, through the same `embed_pending`:
 
-EMBED_RUN
+```text
+  3.2 min: 448 embedded, 4183 remaining, 2.35 chunks/s
+  6.3 min: 912 embedded, 3719 remaining, 2.41 chunks/s
+  9.4 min: 1376 embedded, 3255 remaining, 2.45 chunks/s
+  ...
+ 28.9 min: 4631 embedded, 0 remaining, 2.67 chunks/s
+```
+
+Each line is one slice: about three minutes (`SECONDS_PER_RUN`), then a "continued" job in production. Ten slices and 29 minutes for the whole repository, on a CPU, with a model running locally. That is a one-time cost: lesson 6.5 makes later syncs re-embed only what changed.
 
 ### Searching by vector
 
@@ -307,13 +315,25 @@ statement = (
 
 `cosine_distance` is pgvector's `<=>`. Lesson 6.6 puts this next to keyword search. Does Postgres use the index?
 
-EXPLAIN_HNSW
+```sql
+EXPLAIN ANALYZE
+SELECT c.id FROM chunks c
+ORDER BY c.embedding <=> '[0.012, -0.034, ...]'   -- the question's 768 numbers
+LIMIT 10;
+```
+```text
+Limit  (cost=1014.16..1056.92 rows=10 width=12) (actual time=1.435..1.515 rows=10 loops=1)
+  ->  Index Scan using ix_chunks_embedding on chunks c  (cost=1014.16..20816.62 rows=4631 width=12) (actual time=1.434..1.512 rows=10 loops=1)
+Execution Time: 1.545 ms
+```
+
+`Index Scan using ix_chunks_embedding`: yes. Postgres uses an HNSW index only for `ORDER BY embedding <=> ... LIMIT n`, with the same operator the index was built for (`vector_cosine_ops` goes with `<=>`). Order by `<->` (Euclidean distance) and it would read every row.
 
 ## Trade-offs *(deep dive)*
 
 **Exact or approximate.** Without the index, Postgres compares the query with every vector: exact, and at Atlas's size (thousands of chunks) quick enough. HNSW makes millions of vectors searchable in milliseconds at the cost of occasional misses, more memory, and slower inserts (each new vector is linked into the graph). Its knobs, `m` and `ef_construction` at build time and `hnsw.ef_search` at query time, trade accuracy against speed.
 
-**Filters and approximate indexes.** An HNSW search finds the nearest vectors first and applies `WHERE` filters after. With a filter that matches a small fraction of rows, it can return fewer results than asked. pgvector 0.8 can keep searching until it has enough (`hnsw.iterative_scan`); at Atlas's size, with one repository, it doesn't arise.
+**Filters and approximate indexes.** An HNSW search finds the nearest vectors first and applies `WHERE` filters after. With a filter that matches a small fraction of rows, it can return fewer results than asked. pgvector 0.8 can keep searching until it has enough (`hnsw.iterative_scan`). A related limit does bite Atlas: an HNSW scan returns at most `hnsw.ef_search` rows (40 by default), whatever the `LIMIT`; lesson 6.6 finds it by measuring.
 
 **Dimensions.** More dimensions can hold finer distinctions and cost proportionally more storage and time: 768 numbers of 4 bytes is 3 KB per chunk, 14 MB for Ignite. Some models offer shorter vectors at a small accuracy cost.
 
@@ -376,7 +396,15 @@ The docs were already done: they come first in chunk-id order, which is the orde
 
 ## Stretch
 
-STRETCH_64
+Measure what "approximate" costs. In a session, run `SET enable_indexscan = off` and the vector query reads every row, giving the exact answer. For three questions, compare the top 10 with and without the index, and time both. Our run:
+
+```text
+stop training when the validation loss stops imp same top 10: 10/10; hnsw 1.4 ms, exact 20.0 ms
+show a progress bar during training              same top 10: 10/10; hnsw 1.7 ms, exact 17.5 ms
+save the model every few epochs                  same top 10: 10/10; hnsw 2.1 ms, exact 22.9 ms
+```
+
+At 4631 chunks the index found exactly the right answers, about ten times faster. Both are fast enough here; the gap grows with the number of rows, because the exact scan grows with them and the index barely does.
 
 ## What changed in the project
 

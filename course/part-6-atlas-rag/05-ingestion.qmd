@@ -248,7 +248,14 @@ def reuse_embeddings(document: Document, kept: StoredEmbeddings) -> None:
 
 On Ignite, re-syncing from 30 commits back (lesson 5.3's experiment, now with vectors):
 
-INCREMENTAL_RUN
+```text
+index at ce87844: 4596 chunks, 0 without a vector
+sync to 0abbcab: 66 files re-indexed into 1026 chunks in 2.2 s
+after: 4631 chunks, 142 without a vector
+  1.7 min: 142 embedded, 0 remaining, 1.37 chunks/s
+```
+
+The 30 commits touched 66 files. Re-indexing them produced 1026 chunks, and 884 of those were identical to a chunk in the old version of their file, so they kept their vectors. Only 142 needed the model: 1.7 minutes instead of the 29 a full embed takes. Without `reuse_embeddings`, all 1026 would have been pending, about seven minutes at the same rate.
 
 ## Trade-offs *(deep dive)*
 
