@@ -53,9 +53,9 @@ class EmbeddingProvider(Protocol):
 
 | Implementation | Used for | Notes |
 |---|---|---|
-| `AnthropicChat` | Hosted chat, tool use, structured output | Official `anthropic` Python SDK only. Default model `claude-opus-5-5`, configurable. Streaming for long outputs, adaptive thinking, `tool_choice: auto` with `strict: true` tools (forced tool choice is not supported on current models), refusal stop reason handled. |
-| `OllamaChat` | Free local chat | Ollama's HTTP API via `httpx`. Model name configurable. |
-| `OllamaEmbeddings` | Default embeddings | Local, free. Model configurable (a small text embedding model). |
+| `ClaudeChat` | Hosted chat, tool use, structured output | Optional (`LLM_PROVIDER=anthropic`, decision D28). Official `anthropic` Python SDK only. Default model `claude-opus-5-5`, configurable. Streaming for long outputs, adaptive thinking, `tool_choice: auto` with `strict: true` tools (forced tool choice is not supported on current models), refusal stop reason handled. |
+| `OllamaChat` | Default chat (decision D28) | Ollama's HTTP API via `httpx`. Default model `qwen3:1.7b`, configurable. |
+| `OllamaEmbeddings` | Default embeddings | Local, free. `nomic-embed-text` (768 dimensions), configurable. |
 
 Every call is logged to `llm_calls` (provider, model, purpose, input and output tokens, cost, latency, run id). Cost and rate limits are enforced from that table.
 

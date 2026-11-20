@@ -80,7 +80,8 @@ All JSON unless noted. Auth is a bearer JWT except where marked public.
 | Repositories | `GET /repos`, `POST /repos` (admin), `GET /repos/{id}`, `POST /repos/{id}/sync` (admin), `GET /repos/{id}/snapshot` (presigned download link) |
 | Jobs | `GET /jobs/{id}` |
 | Notifications | `GET /notifications` (changes to saved issues), `GET /digests/latest` (daily digest) |
-| Issues | `GET /issues?repo=&label=&state=&sort=fit`, `GET /issues/{id}`, `PUT /issues/{id}/saved`, `DELETE /issues/{id}/saved` |
+| Fit | `GET /users/me/fits` (issues ranked by a model's fit score for my skills profile, scored ahead of time by `atlas fit`) |
+| Issues | `GET /issues?repo=&label=` (newest first; fit ranking is `GET /users/me/fits`), `GET /issues/{id}`, `PUT /issues/{id}/saved`, `DELETE /issues/{id}/saved` |
 | Search | `GET /search?q=&repo=&mode=keyword\|semantic\|hybrid&limit=` |
 | Ask | `POST /ask` (Server-Sent Events stream), `GET /conversations`, `GET /conversations/{id}`, `POST /answers/{id}/feedback` |
 | Runs | `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events` (SSE), `POST /runs/{id}/approve`, `POST /runs/{id}/reject`, `POST /runs/{id}/cancel` |
