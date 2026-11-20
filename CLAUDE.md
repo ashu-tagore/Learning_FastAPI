@@ -34,6 +34,9 @@ cd atlas && uv run alembic revision --autogenerate -m "..."  # new migration; re
 cd atlas && SECRET_KEY=dev-only-key-at-least-32-characters-long WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload --no-access-log  # API + web UI at /app; JSON request logs (lesson 4.15)
 cd atlas && S3_ENDPOINT_URL=http://localhost:8333 AWS_ACCESS_KEY_ID=atlas AWS_SECRET_ACCESS_KEY=atlas-dev-secret-key uv run atlas worker  # background jobs (5.1, snapshots 5.4)
 cd atlas && uv run atlas scheduler                         # queues syncs and snapshots (5.2); `atlas notifier` (5.6); `atlas digest` (5.7)
+cd atlas && docker compose exec ollama ollama pull qwen3:1.7b      # local chat model (Part 6); also nomic-embed-text
+cd atlas && uv run atlas llm "question" --stream             # ask the configured model (6.2); `atlas llm-usage` sums the cost log
+cd atlas && uv run atlas fit --email ada@example.com --limit 5  # score issues against a skills profile (6.3)
 cd atlas && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 python3 course/_tools/generate_part_pages.py               # after editing 04-curriculum.md or adding a lesson
 quarto preview course                                      # course site locally (Quarto 1.6.42, as in CI)

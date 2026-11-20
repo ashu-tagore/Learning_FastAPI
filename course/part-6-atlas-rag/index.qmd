@@ -8,9 +8,9 @@ title: "Part 6: AI engineering: Atlas"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 6.1 | LLMs for engineers: tokens, context windows, effort, cost, latency, failure modes *(coming soon)* |  |
-| 6.2 | The provider interface: Claude via the Anthropic SDK, local models via Ollama, streaming, retries, cost logging *(coming soon)* | `llm/` package |
-| 6.3 | Prompts and structured outputs validated with Pydantic *(coming soon)* | Issue fit scoring |
+| 6.1 | [LLMs for engineers: tokens, context windows, effort, cost, latency, failure modes](01-llms-for-engineers.qmd) |  |
+| 6.2 | [The provider interface: Claude via the Anthropic SDK, local models via Ollama, streaming, retries, cost logging](02-the-provider-interface.qmd) | `llm/` package |
+| 6.3 | [Prompts and structured outputs validated with Pydantic](03-structured-outputs.qmd) | Issue fit scoring |
 | 6.4 | Embeddings and vector search with pgvector *(coming soon)* | Vector column, HNSW index |
 | 6.5 | Ingestion: chunking Markdown by heading and Python by `ast`, incremental re-index *(coming soon)* | Ingest pipeline |
 | 6.6 | Retrieval: hybrid search, reciprocal rank fusion, filters *(coming soon)* | `/search?mode=hybrid` |
