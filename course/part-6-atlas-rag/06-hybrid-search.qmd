@@ -1,0 +1,253 @@
+---
+title: "6.6 Retrieval: hybrid search, reciprocal rank fusion, filters"
+description: "Combine keyword and semantic search into one ranking with reciprocal rank fusion, measure all three on real questions about Ignite, keep the search cache honest as embeddings arrive, and fall back to keywords when the embedding model is down."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 6 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Measuring it". The trade-offs section *(deep dive)* covers weighting, rerankers and why scores from different searches can't be added.
+:::
+
+::: {.callout-note title="Analogy: two judges at a competition"}
+Two judges score the same dancers on different scales: one out of 10 for technique, one out of 100 for artistry. Adding their scores would let the out-of-100 judge decide everything. Comparing *places* is fairer: a dancer placed first by one judge and third by the other beats one placed fifth and fourth.
+
+**Hybrid search** asks two judges, keyword search and semantic search, and **reciprocal rank fusion** combines their places, not their scores.
+:::
+
+## The problem
+
+Each search Atlas now has is good at different questions. Keyword search found nothing for "stop training when the validation loss stops improving" (lesson 6.4), because Ignite never uses those words. Semantic search ranked a decoy built from the question's own words above the real answer (also lesson 6.4). And some questions are just names: someone asking about `add_event_handler` wants the exact identifier, which keyword search finds perfectly and an embedding may blur into "something about events".
+
+Here is each on ten questions about Ignite whose answer lives in a known file, counting whether that file appears in the top five results:
+
+MODES_TABLE
+
+Neither search wins everywhere. The obvious next step, running both and keeping the better result, needs a way to decide which result is better, and the two searches' scores aren't comparable: keyword scores (`ts_rank`) are small numbers that depend on how often words occur, while cosine similarities sit between about 0.5 and 0.9 for anything vaguely related.
+
+## Theory
+
+### Hybrid search
+
+**Hybrid search** runs both searches and merges their results into one list. Two questions decide how: which candidates to merge, and how to order them. Atlas takes the top 50 from each search as candidates (enough to cover the pages people read) and orders them with **reciprocal rank fusion**.
+
+### Reciprocal rank fusion
+
+**Reciprocal rank fusion** (RRF; Cormack, Clarke and Büttcher, 2009) ignores scores entirely. Each list gives each item a score based on its position, and the scores add up:
+
+```text
+fused(item) = sum over the lists it appears in of   1 / (k + position in that list)
+```
+
+with positions counted from 1 and `k = 60`, the paper's constant. An item first in one list and absent from the other scores 1/61 ≈ 0.0164. An item third in both scores 2/63 ≈ 0.0317: agreement between the two searches beats a single strong opinion. `k` damps the difference between the very top places (1/61 and 1/62 are close), so one list's first place doesn't dominate.
+
+A worked example, the same one as the test below. Keyword ranks chunks `[1, 2, 3]`, semantic ranks `[3, 1]`:
+
+| Chunk | Keyword | Semantic | Fused |
+|---|---|---|---|
+| 1 | 1st: 1/61 | 2nd: 1/62 | 0.03252 |
+| 3 | 3rd: 1/63 | 1st: 1/61 | 0.03227 |
+| 2 | 2nd: 1/62 | absent | 0.01613 |
+
+Chunk 1 wins: both searches liked it. Chunk 2, which only keyword search found, comes last.
+
+### Filters
+
+Atlas filters both searches the same way before fusing: by repository, by kind (`code` or `doc`), and, for the semantic search, by embedding model (lesson 6.4: vectors from different models can't be compared). Filtering before fusion matters: filtering after would fuse rankings full of chunks that are then thrown away, and leave fewer results than asked for.
+
+```{mermaid}
+flowchart LR
+    Q[Question] --> K[Keyword search<br/>full text, top 50]
+    Q --> E[Embed query<br/>search_query: ...]
+    E --> S[Semantic search<br/>cosine distance, top 50]
+    F[Filters: repo, kind, model] --> K
+    F --> S
+    K --> R[Reciprocal rank fusion<br/>1 / 60 + position]
+    S --> R
+    R --> P[One ranked page<br/>with snippets and symbols]
+```
+
+## In the project
+
+### Red
+
+```python
+def test_fusion_rewards_agreement_between_rankings() -> None:
+    fused = reciprocal_rank_fusion([[1, 2, 3], [3, 1]], k=60)
+
+    # 1: 1/61 + 1/62; 3: 1/63 + 1/61; 2: 1/62 only.
+    assert [item for item, _ in fused] == [1, 3, 2]
+    assert fused[0][1] == pytest.approx(1 / 61 + 1 / 62)
+
+
+def test_hybrid_returns_what_either_ranking_found(
+    session: Session, embedded: FakeEmbeddings
+) -> None:
+    # "STARTED" is a keyword match in engine.py only; "accuracy" is near metrics.py.
+    query = embedded.embed(["accuracy"], "query")[0]
+
+    keyword = search_chunks(session, "pytorch/ignite", "STARTED", "keyword")
+    hybrid = search_chunks(session, "pytorch/ignite", "STARTED", "hybrid", query, model="fake-embed")
+
+    assert paths(keyword) == ["ignite/engine/engine.py"]
+    assert {"ignite/engine/engine.py", "ignite/metrics.py"} <= set(paths(hybrid))
+    assert all(hit.symbol is not None for hit in hybrid)
+```
+
+`pytest.approx` compares floating-point numbers with a small tolerance, since `1 / 61 + 1 / 62` may differ from the computed sum in the last digit. The second test deliberately gives the two searches different signals (the words "STARTED" for keywords, a vector near "accuracy" for meaning) to show the fused list contains what either found. Others check that semantic search ignores vectors from another model, and that the API falls back to keywords when embeddings are down.
+
+### Green: `storage.search_chunks`
+
+```python
+def reciprocal_rank_fusion(rankings: list[list[int]], k: int = RRF_K) -> Ranking:
+    """Merge rankings by position alone: each item scores 1 / (k + rank) in each list.
+
+    Keyword scores and cosine similarities are on unrelated scales, so adding them would
+    let one dominate by accident. Positions are comparable: first is first.
+    """
+    scores: dict[int, float] = {}
+    for ranking in rankings:
+        for position, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + 1 / (k + position)
+    # Ties (rare) are broken by id, so results are the same on every run.
+    return sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+
+
+def search_chunks(session, repo_full_name, query, mode, query_vector=None, *, model=None, kind=None, limit=10, offset=0):
+    """Search one repository by words, by meaning, or both (hybrid), best first."""
+    wanted = max(CANDIDATES, offset + limit)
+    keyword: Ranking = []
+    semantic: Ranking = []
+    if mode in ("keyword", "hybrid"):
+        keyword = keyword_ranking(session, repo_full_name, query, kind, wanted)
+    can_use_vectors = query_vector is not None and model is not None
+    if mode in ("semantic", "hybrid") and can_use_vectors:
+        semantic = semantic_ranking(session, repo_full_name, query_vector, model, kind, wanted)
+
+    if mode == "keyword":
+        ranked = keyword
+    elif mode == "semantic":
+        ranked = semantic
+    else:
+        ranked = reciprocal_rank_fusion([[i for i, _ in keyword], [i for i, _ in semantic]])
+    return load_hits(session, query, ranked[offset : offset + limit])
+```
+
+(Type hints and an `assert` for mypy are trimmed here.) Each ranking returns only chunk ids and scores; `load_hits` then fetches the page's chunks in one query, with a highlighted snippet and the chunk's symbol. `enumerate(ranking, start=1)` numbers positions from 1, as the formula expects. The `key` sorts by fused score, highest first (hence the minus), then by id.
+
+The keyword ranking is lesson 3.6's full-text query, returning ids; the semantic ranking is lesson 6.4's cosine-distance query.
+
+### The API: `GET /search?mode=`
+
+`GET /search` gains `mode` (`keyword`, `semantic` or `hybrid`, default `hybrid`) and results gain `symbol`. The route embeds the query, through the embedding client in a thread (it's synchronous), and falls back to keywords if that fails:
+
+```python
+query_vector: list[float] | None = None
+if mode != "keyword":
+    try:
+        # The embedding client is synchronous; a thread keeps it off the event loop.
+        query_vector = (await run_in_threadpool(embedder.embed, [q], "query"))[0]
+    except LLMError:
+        logger.warning("embeddings unavailable; searching by keyword", exc_info=True)
+        mode = "keyword"
+response.headers["X-Search-Mode"] = mode
+```
+
+**Degrading** like this keeps search working when Ollama is down, and the `X-Search-Mode` header tells clients which search actually answered. The test:
+
+```python
+async def test_hybrid_falls_back_to_keyword_when_embeddings_are_down(
+    api_app: FastAPI, client: httpx.AsyncClient, async_session: AsyncSession, sample_repo: Path
+) -> None:
+    api_app.dependency_overrides[get_embedder] = lambda: DownEmbeddings()
+    await index_sample(async_session, sample_repo)
+
+    response = await client.get("/search", params={"q": "accuracy"})
+
+    assert response.status_code == 200
+    assert response.headers["X-Search-Mode"] == "keyword"
+    assert response.json()["items"][0]["path"] == "ignite/metrics.py"
+```
+
+### Keeping the cache honest
+
+Lesson 5.5's cache keys searches by the repository's `indexed_at`. But semantic results also change as the embed job (lesson 6.4) fills in vectors, without any re-index. A cached semantic search from before the embeddings existed would keep being served. So repositories gain `embedded_at` (migration `0011`), which `embed_pending` updates with each batch, and the cache key's version names both:
+
+```python
+version = f"{repo}@{versions.indexed_at.isoformat()}/{versions.embedded_at}"
+params = {"q": q, "mode": mode, "kind": kind, "limit": limit, "offset": offset}
+```
+
+The mode is part of the key, after any fallback, so a keyword fallback is never served later as a hybrid result.
+
+## Measuring it
+
+The ten questions in "The problem" come with the file a good answer must come from. Ignite at commit `0abbcab`, 4,631 structural chunks, all embedded with `nomic-embed-text`; "#2" means the expected file's best chunk was second, "-" that it wasn't in the top five:
+
+MEASUREMENT_DISCUSSION
+
+## Trade-offs *(deep dive)*
+
+**Fusion by score.** Normalising each list's scores to 0..1 and adding them (perhaps weighted) is the other common approach. It uses more information than ranks, and is fragile: a query where every keyword score is tiny gets normalised to look as confident as one with a perfect match.
+
+**Weighted RRF.** Multiplying each list's terms by a weight (say 1.0 for keywords and 0.7 for semantic) tilts the fusion. Without an evaluation set (lesson 6.8), the weights are guesses.
+
+**Rerankers.** A **reranker** is a model that reads the question and each candidate together and scores how well the candidate answers it. Much better than either search alone, and much slower: one model call per candidate. A common design is hybrid search for the top 50, then a reranker for the final 10.
+
+**Query rewriting.** A chat model can rewrite a newcomer's question into the project's vocabulary ("stops improving" into "early stopping, patience") before searching. It costs a model call per search, and adds a chance to misread the question.
+
+## Common mistakes
+
+- **Adding scores from different searches.** They're on unrelated scales; fuse by rank.
+- **Filtering after fusing.** Pages come back short, and fusion wasted its candidates.
+- **Failing the whole search when one half fails.** Degrade to what still works, and say so.
+- **Caching semantic results by the text index's version alone.** Embeddings change without a re-index.
+- **Judging search by one query.** Each mode wins some questions and loses others; measure on a set.
+
+## Check yourself
+
+**1.** A chunk is 1st in the keyword list and missing from the semantic list. Another is 4th in both. Which ranks higher after fusion with k = 60?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The second: 2 / 64 ≈ 0.0313 against 1 / 61 ≈ 0.0164. Two searches agreeing that a chunk is fairly good outweighs one search's strong opinion.
+:::
+
+**2.** Why does a search fall back to keywords instead of answering 503 when Ollama is down?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Keyword search doesn't need the embedding model, and a slightly worse result is better than no result for someone searching. The fallback is visible (`X-Search-Mode: keyword`) and logged, so it isn't silent; a client that needs semantic results specifically can check the header.
+:::
+
+**3.** Why are the candidates limited to 50 per search instead of every matching chunk?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Fusion only needs enough candidates to fill the pages people read; a chunk ranked 300th by both searches won't make the first page. Fetching thousands of candidates would make both queries slower for no change in the visible results.
+:::
+
+## Exercise
+
+Write `weighted_rank_fusion(rankings, weights, k=60)`, where each list's terms are multiplied by its weight. Test that a weight of 0 for the second list gives back the first list's order, and that doubling the second list's weight puts its favourite first.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+def weighted_rank_fusion(
+    rankings: list[list[int]], weights: list[float], k: int = 60
+) -> list[tuple[int, float]]:
+    scores: dict[int, float] = {}
+    for ranking, weight in zip(rankings, weights, strict=True):
+        for position, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + weight / (k + position)
+    return sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+```
+With `[[1, 2, 3], [3, 1]]` and weights `[1.0, 0.0]` the result is `[(1, 0.01639...), (2, 0.01613...), (3, 0.01587...)]`: the keyword order, with chunk 3 kept only for its keyword place. With `[1.0, 2.0]`, chunk 3 comes first. Both checked. `strict=True` makes a mismatch between the number of lists and of weights an error instead of a silent drop. Not in the reference code: without lesson 6.8's measurements, any weight other than 1 would be a guess.
+:::
+
+## Stretch
+
+STRETCH_66
+
+## What changed in the project
+
+`storage.py`: `keyword_ranking`, `semantic_ranking`, `reciprocal_rank_fusion`, `search_chunks`, `load_hits`, `Hit.symbol`; `GET /search` gains `mode` (default `hybrid`), `symbol` in results, an `X-Search-Mode` header and a fallback to keywords; the embedder in the app's lifespan and a `get_embedder` dependency; `repos.embedded_at` (migration `0011`) in the cache version; `atlas find --mode`; `tests/test_hybrid.py`. Commit: `feat: Added semantic and hybrid search with reciprocal rank fusion`.
