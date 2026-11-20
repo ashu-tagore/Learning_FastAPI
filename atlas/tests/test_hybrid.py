@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -131,3 +131,26 @@ async def test_hybrid_falls_back_to_keyword_when_embeddings_are_down(
     assert response.status_code == 200
     assert response.headers["X-Search-Mode"] == "keyword"
     assert response.json()["items"][0]["path"] == "ignite/metrics.py"
+
+
+def test_semantic_search_returns_as_many_candidates_as_asked(
+    session: Session, tmp_path: Path
+) -> None:
+    # Regression (lesson 6.6): pgvector's HNSW search keeps at most hnsw.ef_search
+    # candidates (40 by default), so a request for 50 silently came back with 40.
+    for number in range(60):
+        source = f"def function_{number}():\n    return {number}\n"
+        (tmp_path / f"module_{number}.py").write_text(source)
+    storage.index_folder(session, "pytorch/ignite", tmp_path)
+    embedder = FakeEmbeddings()
+    embed_sample(session, embedder)
+    # Words every chunk shares, so the distances differ and the index has a real ranking
+    # to walk (with nothing in common, every chunk is equally far and HNSW finds few).
+    query = embedder.embed(["def return module"], "query")[0]
+    # With only 60 rows Postgres would rather scan and sort; make it use the HNSW index,
+    # as it does on a real-sized table.
+    session.execute(text("SET LOCAL enable_seqscan = off"))
+
+    ranking = storage.semantic_ranking(session, "pytorch/ignite", query, "fake-embed", None, 50)
+
+    assert len(ranking) == 50

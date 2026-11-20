@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from sqlalchemy import Row, Select, case, delete, func, select
+from sqlalchemy import Row, Select, case, delete, func, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from atlas import github
@@ -123,10 +123,10 @@ def stored_embeddings(session: Session, repo_id: int, paths: list[str] | None) -
     if paths is not None:
         statement = statement.where(Document.path.in_(paths))
     kept: StoredEmbeddings = {}
-    for path, text, vector, model in session.execute(statement):
+    for path, chunk_text, vector, model in session.execute(statement):
         if vector is None or model is None:
             continue
-        kept[(path, text)] = (list(vector), model)
+        kept[(path, chunk_text)] = (list(vector), model)
     return kept
 
 
@@ -269,6 +269,11 @@ def semantic_ranking(
     limit: int,
 ) -> Ranking:
     """The chunks whose vectors are nearest the query's, by cosine distance."""
+    # An HNSW search keeps at most hnsw.ef_search candidates (40 by default), so without
+    # this a request for 50 silently returns 40 (lesson 6.6). SET LOCAL lasts only until
+    # the end of this transaction. int() because SET can't take a bound parameter.
+    candidates = max(int(limit), 40)
+    session.execute(text(f"SET LOCAL hnsw.ef_search = {candidates}"))
     distance = Chunk.embedding.cosine_distance(query_vector)
     statement = (
         select(Chunk.id, distance)
