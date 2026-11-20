@@ -85,7 +85,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E4
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
-from atlas.api.deps import get_queue, get_session  # noqa: E402
+from atlas.api.deps import get_embedder, get_queue, get_session  # noqa: E402
+from tests.fake_llm import FakeEmbeddings  # noqa: E402
 from atlas.api.limits import RateLimiter, ResponseCache, get_cache, get_limiter  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
@@ -221,6 +222,9 @@ def api_app(
     limiter, cache = api_redis
     app.dependency_overrides[get_limiter] = lambda: limiter
     app.dependency_overrides[get_cache] = lambda: cache
+    # Semantic and hybrid search embed the query: a deterministic fake, no Ollama needed.
+    embedder = FakeEmbeddings()
+    app.dependency_overrides[get_embedder] = lambda: embedder
     return app
 
 
@@ -284,7 +288,6 @@ from atlas.events import EventStream  # noqa: E402
 from atlas.jobs import WorkerContext  # noqa: E402
 from atlas.snapshots import S3_CONFIG, SnapshotStore  # noqa: E402
 from tests.fake_github import FakeIssueTracker  # noqa: E402
-from tests.fake_llm import FakeEmbeddings  # noqa: E402
 
 
 def git_commit(path: Path, message: str) -> str:

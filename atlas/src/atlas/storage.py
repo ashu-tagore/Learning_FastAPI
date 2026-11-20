@@ -8,6 +8,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import Row, Select, case, delete, func, select
 from sqlalchemy.orm import Session, selectinload
@@ -35,6 +36,7 @@ class Hit:
     end_line: int
     rank: float
     snippet: str
+    symbol: str | None = None
 
 
 def get_or_create_repo(session: Session, full_name: str) -> Repo:
@@ -224,6 +226,133 @@ def find_chunks(session: Session, repo_full_name: str, query: str, limit: int = 
     """Full-text search: chunks matching the query's words, best match first."""
     statement = chunk_search_statement(repo_full_name, query, limit=limit)
     return [hit_from_row(row) for row in session.execute(statement)]
+
+
+# ---------- Semantic and hybrid search (lesson 6.6) ----------
+
+SearchMode = Literal["keyword", "semantic", "hybrid"]
+# Each ranking contributes this many candidates to the fusion: enough to cover the pages
+# people read, few enough to keep both queries fast.
+CANDIDATES = 50
+# The constant from the paper that introduced reciprocal rank fusion (Cormack, Clarke and
+# Buettcher, 2009); it damps the difference between the very top ranks.
+RRF_K = 60
+
+# (chunk id, score), best first
+Ranking = list[tuple[int, float]]
+
+
+def keyword_ranking(
+    session: Session, repo_full_name: str, query: str, kind: str | None, limit: int
+) -> Ranking:
+    ts_query = func.websearch_to_tsquery("english", query)
+    rank = func.ts_rank(Chunk.tsv, ts_query)
+    statement = (
+        select(Chunk.id, rank)
+        .join(Chunk.document)
+        .join(Document.repo)
+        .where(Repo.full_name == repo_full_name, Chunk.tsv.bool_op("@@")(ts_query))
+        .order_by(rank.desc(), Document.path, Chunk.start_line)
+        .limit(limit)
+    )
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+    return [(chunk_id, float(score)) for chunk_id, score in session.execute(statement)]
+
+
+def semantic_ranking(
+    session: Session,
+    repo_full_name: str,
+    query_vector: list[float],
+    model: str,
+    kind: str | None,
+    limit: int,
+) -> Ranking:
+    """The chunks whose vectors are nearest the query's, by cosine distance."""
+    distance = Chunk.embedding.cosine_distance(query_vector)
+    statement = (
+        select(Chunk.id, distance)
+        .join(Chunk.document)
+        .join(Document.repo)
+        # Vectors from another model live in another space: comparing them is meaningless.
+        .where(Repo.full_name == repo_full_name, Chunk.embedding_model == model)
+        .order_by(distance)
+        .limit(limit)
+    )
+    if kind is not None:
+        statement = statement.where(Document.kind == kind)
+    # Reported as similarity (1 is identical), so that higher is better, as for keywords.
+    return [(chunk_id, 1 - float(dist)) for chunk_id, dist in session.execute(statement)]
+
+
+def reciprocal_rank_fusion(rankings: list[list[int]], k: int = RRF_K) -> Ranking:
+    """Merge rankings by position alone: each item scores 1 / (k + rank) in each list.
+
+    Keyword scores and cosine similarities are on unrelated scales, so adding them would
+    let one dominate by accident. Positions are comparable: first is first.
+    """
+    scores: dict[int, float] = {}
+    for ranking in rankings:
+        for position, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + 1 / (k + position)
+    # Ties (rare) are broken by id, so results are the same on every run.
+    return sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+
+
+def search_chunks(
+    session: Session,
+    repo_full_name: str,
+    query: str,
+    mode: SearchMode,
+    query_vector: list[float] | None = None,
+    *,
+    model: str | None = None,
+    kind: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[Hit]:
+    """Search one repository by words, by meaning, or both (hybrid), best first."""
+    wanted = max(CANDIDATES, offset + limit)
+    keyword: Ranking = []
+    semantic: Ranking = []
+    if mode in ("keyword", "hybrid"):
+        keyword = keyword_ranking(session, repo_full_name, query, kind, wanted)
+    can_use_vectors = query_vector is not None and model is not None
+    if mode in ("semantic", "hybrid") and can_use_vectors:
+        assert query_vector is not None and model is not None  # for mypy
+        semantic = semantic_ranking(session, repo_full_name, query_vector, model, kind, wanted)
+
+    if mode == "keyword":
+        ranked = keyword
+    elif mode == "semantic":
+        ranked = semantic
+    else:
+        ranked = reciprocal_rank_fusion([[i for i, _ in keyword], [i for i, _ in semantic]])
+    return load_hits(session, query, ranked[offset : offset + limit])
+
+
+def load_hits(session: Session, query: str, ranked: Ranking) -> list[Hit]:
+    """The chunks of a ranking, in its order, with a highlighted snippet each."""
+    if not ranked:
+        return []
+    ts_query = func.websearch_to_tsquery("english", query)
+    snippet = func.ts_headline(
+        "english",
+        Chunk.text,
+        ts_query,
+        "StartSel=[, StopSel=], MaxWords=14, MinWords=5, MaxFragments=1",
+    )
+    rows = session.execute(
+        select(Chunk.id, Document.path, Chunk.start_line, Chunk.end_line, Chunk.symbol, snippet)
+        .join(Chunk.document)
+        .where(Chunk.id.in_([chunk_id for chunk_id, _ in ranked]))
+    ).all()
+    by_id = {row[0]: row for row in rows}
+    hits = []
+    for chunk_id, score in ranked:
+        _, path, start, end, symbol, text = by_id[chunk_id]
+        hits.append(Hit(path, start, end, score, " ".join(text.split()), symbol))
+    return hits
 
 
 def save_issues(session: Session, repo_full_name: str, issues: list[github.Issue]) -> int:

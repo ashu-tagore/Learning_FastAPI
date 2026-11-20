@@ -10,12 +10,13 @@ Embedding is slow on a CPU (about 1.6 chunks a second for nomic-embed-text here)
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from atlas.llm import EmbeddingProvider
-from atlas.models import Chunk, Document
+from atlas.models import Chunk, Document, Repo
 
 # Well under the queue's 5-minute visibility timeout, with room for one slow batch.
 SECONDS_PER_RUN = 180
@@ -72,6 +73,9 @@ def embed_pending(
             for (chunk, _), vector in zip(batch, vectors, strict=True):
                 chunk.embedding = vector
                 chunk.embedding_model = embedder.model
+            session.execute(
+                update(Repo).where(Repo.id == repo_id).values(embedded_at=datetime.now(UTC))
+            )
         embedded += len(batch)
 
     with session_factory() as session:

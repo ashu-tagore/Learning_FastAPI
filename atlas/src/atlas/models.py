@@ -51,6 +51,9 @@ class Repo(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     full_name: Mapped[str] = mapped_column(String(200), unique=True)  # "pytorch/ignite"
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When chunks were last embedded (lesson 6.4): semantic results change with it, so it
+    # is part of the search cache's version, like indexed_at.
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The commit the stored index reflects; the next sync indexes only what changed since.
     indexed_commit: Mapped[str | None] = mapped_column(String(40))
     # Conditional requests (lesson 5.3): GitHub's etag for the last issues poll, and the

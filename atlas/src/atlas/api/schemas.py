@@ -220,8 +220,11 @@ class SearchHit(BaseModel):
     path: str
     start_line: int
     end_line: int
+    # Keyword: text rank. Semantic: cosine similarity. Hybrid: fused score (lesson 6.6).
+    # Comparable within one result list, not across modes.
     rank: float
     snippet: str
+    symbol: str | None = None
 
 
 class SearchPage(BaseModel):
