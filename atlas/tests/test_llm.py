@@ -201,3 +201,21 @@ def test_calls_are_recorded(session: Session) -> None:
 
     call = session.scalars(select(LlmCall)).one()
     assert (call.purpose, call.cost_usd, call.stop_reason) == ("answer", Decimal("0.010800"), "end")
+
+
+def test_claude_without_credentials_says_how_to_fix_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (lesson 6.2): the SDK raised a bare TypeError at request time, and
+    # `atlas llm` printed a traceback instead of a message.
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", "/nonexistent")  # no `ant auth login` profile either
+
+    def respond(body: dict[str, Any], http: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=claude_message("unreachable"))
+
+    client = anthropic.Anthropic(
+        http_client=anthropic.DefaultHttpxClient(transport=claude_transport(respond))
+    )
+
+    with pytest.raises(LLMError, match="ANTHROPIC_API_KEY"):
+        ClaudeChat(client=client).complete(request())

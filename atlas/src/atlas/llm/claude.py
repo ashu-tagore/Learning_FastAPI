@@ -59,6 +59,9 @@ class ClaudeChat:
         except anthropic.APIError as error:
             # Raised only after the SDK's own retries have given up.
             raise LLMError(f"Claude request failed: {error}") from error
+        except TypeError as error:
+            raise_if_no_credentials(error)
+            raise
         return self._result(request, message, started)
 
     def stream(self, request: ChatRequest) -> Iterator[ChatEvent]:
@@ -73,6 +76,9 @@ class ClaudeChat:
                 message = stream.get_final_message()
         except anthropic.APIError as error:
             raise LLMError(f"Claude request failed: {error}") from error
+        except TypeError as error:
+            raise_if_no_credentials(error)
+            raise
         yield self._result(request, message, started)
 
     def _params(self, request: ChatRequest) -> dict[str, Any]:
@@ -104,3 +110,17 @@ class ClaudeChat:
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             purpose=request.purpose,
         )
+
+
+def raise_if_no_credentials(error: TypeError) -> None:
+    """Turn the SDK's error for missing credentials into one that says how to fix it.
+
+    The SDK raises a plain TypeError at request time, not one of its APIError classes
+    (anthropic 2.11.0; lesson 6.2). It's recognised by its message; any other TypeError
+    is a bug and is left alone.
+    """
+    is_missing_credentials = "Could not resolve authentication method" in str(error)
+    if is_missing_credentials:
+        raise LLMError(
+            "no Claude credentials: set ANTHROPIC_API_KEY, or run `ant auth login`"
+        ) from error
