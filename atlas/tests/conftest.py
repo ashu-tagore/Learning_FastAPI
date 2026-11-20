@@ -86,10 +86,10 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
 from atlas.api.deps import get_embedder, get_queue, get_session  # noqa: E402
-from tests.fake_llm import FakeEmbeddings  # noqa: E402
 from atlas.api.limits import RateLimiter, ResponseCache, get_cache, get_limiter  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
+from tests.fake_llm import FakeEmbeddings  # noqa: E402
 
 
 @pytest.fixture
