@@ -9,11 +9,15 @@ users ──< refresh_tokens
   ├──< saved_issues >── issues
   ├──< issue_notes             (point at repo + issue number, so they survive an issue closing)
   ├──< idempotency_keys
+  ├──< issue_fits >── issues   (a model's score of each issue for the user)
   ├──< notifications           (also by repo name + number: the issue may be gone)
   └──< digests                 (one per user per day)
+
+llm_calls                      (every request to a language model, with its cost)
 """
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -24,6 +28,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Numeric,
     String,
     Table,
     Text,
@@ -297,3 +302,47 @@ class Digest(Base):
     issues: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     notification_count: Mapped[int]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LlmCall(Base):
+    """One request to a language model: what it was for, its size, time and cost (6.2)."""
+
+    __tablename__ = "llm_calls"
+    __table_args__ = (Index("ix_llm_calls_created", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20))
+    model: Mapped[str] = mapped_column(String(100))
+    purpose: Mapped[str] = mapped_column(String(50))
+    input_tokens: Mapped[int]
+    output_tokens: Mapped[int]
+    # Exact decimal dollars: floats would drift when thousands of tiny costs are summed.
+    # Null when the price isn't known (a model added to the API after this code).
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    latency_ms: Mapped[float]
+    stop_reason: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IssueFit(Base):
+    """A model's judgment of how well an issue fits a learner's skills (lesson 6.3)."""
+
+    __tablename__ = "issue_fits"
+    __table_args__ = (
+        UniqueConstraint("user_id", "issue_id"),
+        CheckConstraint("score BETWEEN 1 AND 5", name="issue_fits_score_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # A closed issue's row is deleted on sync, and its scores with it: nothing to recommend.
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id", ondelete="CASCADE"))
+    score: Mapped[int]
+    reasons: Mapped[list[str]] = mapped_column(JSONB)
+    first_step: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(String(100))
+    # Which version of the profile was scored: a changed profile makes the score stale.
+    profile_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    issue: Mapped[Issue] = relationship()

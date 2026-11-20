@@ -45,6 +45,17 @@ services:
       interval: 2s
       retries: 30
 
+  # Local language models (Part 6). After the first start, download the two models once:
+  #   docker compose exec ollama ollama pull qwen3:1.7b
+  #   docker compose exec ollama ollama pull nomic-embed-text
+  ollama:
+    image: ollama/ollama:0.40.16
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - atlas-models:/root/.ollama
+
 volumes:
   atlas-db:
   atlas-objects:
+  atlas-models:

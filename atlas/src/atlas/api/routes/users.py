@@ -6,8 +6,8 @@ from sqlalchemy.orm import selectinload
 
 from atlas.api.deps import CurrentUser, SessionDep
 from atlas.api.routes.issues import issue_out
-from atlas.api.schemas import IssueOut, UserOut, UserUpdate
-from atlas.models import Issue, User, saved_issues
+from atlas.api.schemas import FitOut, IssueOut, UserOut, UserUpdate
+from atlas.models import Issue, IssueFit, User, saved_issues
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -38,3 +38,32 @@ async def list_saved_issues(user: CurrentUser, session: SessionDep) -> list[Issu
         .options(selectinload(Issue.labels), selectinload(Issue.repo))
     )
     return [issue_out(issue) for issue in await session.scalars(statement)]
+
+
+@router.get("/me/fits", response_model=list[FitOut])
+async def my_fits(user: CurrentUser, session: SessionDep, limit: int = 20) -> list[FitOut]:
+    """Issues ranked by how well a model thinks they fit my skills profile, best first.
+
+    Scored ahead of time by `atlas fit` (lesson 6.3): a model takes seconds per issue,
+    far too long to wait for inside a request.
+    """
+    fits = await session.scalars(
+        select(IssueFit)
+        .where(IssueFit.user_id == user.id)
+        .order_by(IssueFit.score.desc(), IssueFit.issue_id.desc())
+        .limit(min(limit, 100))
+        .options(
+            selectinload(IssueFit.issue).selectinload(Issue.labels),
+            selectinload(IssueFit.issue).selectinload(Issue.repo),
+        )
+    )
+    return [
+        FitOut(
+            issue=issue_out(fit.issue),
+            score=fit.score,
+            reasons=fit.reasons,
+            first_step=fit.first_step,
+            model=fit.model,
+        )
+        for fit in fits
+    ]

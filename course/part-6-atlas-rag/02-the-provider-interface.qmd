@@ -1,0 +1,412 @@
+---
+title: "6.2 The provider interface: Claude via the Anthropic SDK, local models via Ollama, streaming, retries, cost logging"
+description: "Put every language model behind one small interface with neutral types, implement it for Ollama and for Claude with the official SDK, stream replies, retry what's worth retrying, and log every call's tokens and cost."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 2 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers frameworks like LangChain and when an interface is too thin or too thick.
+:::
+
+::: {.callout-note title="Analogy: a power socket"}
+A laptop doesn't care which power station made its electricity. It plugs into a socket of a standard shape, and the grid behind it can change from coal to wind without a new laptop. Travel abroad, and a small adapter does the translation.
+
+Atlas's model interface is the socket. Each provider (Ollama, Claude) is an adapter. And like an electricity meter, every call is recorded with what it cost.
+:::
+
+## The problem
+
+Lesson 6.1's experiments called Ollama's HTTP API directly: a dictionary of Ollama-specific fields (`num_predict`, `think`, `prompt_eval_count`, `done_reason`), sent with `httpx`. Copy that into the three features Part 6 builds (fit scoring, answers, evaluation) and Ollama's field names spread through Atlas. Then:
+
+- Switching a feature to Claude means rewriting each call: Claude's API has different field names, a different streaming format, its own error classes, and an official SDK that should be used instead of hand-written HTTP.
+- Each call site decides for itself what to do when the server is busy, how long to wait, and whether to check that the reply was cut off. Some will forget.
+- Nobody knows what the features cost. Claude bills per token; a feature that calls it in a loop can spend more in an afternoon than anyone expected, and the bill arrives at the end of the month.
+
+The fix is the one Part 5 used for queues (lesson 5.1's `JobQueue`): one small interface, written in Atlas's own terms, with one implementation per provider.
+
+## Theory
+
+### Neutral types at the boundary
+
+The interface speaks Atlas's language, not any provider's:
+
+| Atlas's type | Holds |
+|---|---|
+| `ChatRequest` | messages, system prompt, `max_tokens`, an optional output schema (lesson 6.3), a `purpose` for the cost log |
+| `ChatResult` | text, provider, model, input and output tokens, stop reason, latency |
+| `TextDelta` | one piece of a streamed reply |
+
+and a stop reason in Atlas's words: `end`, `max_tokens`, `refusal` or `other`. Each provider maps its own vocabulary onto these (Ollama's `done_reason: "length"` and Claude's `stop_reason: "max_tokens"` both become `max_tokens`), so code that checks for a cut-off works with both.
+
+The types are deliberately thin: only what Atlas uses. Inside each provider, that provider's own types are used fully. A neutral type that tried to cover every feature of every provider would be a worse copy of all of them.
+
+### Two ways to get a reply
+
+- **Complete**: send the request, wait, get the whole reply. Simple; right for background work like fit scoring.
+- **Stream**: get the reply in pieces as it's generated. The first words arrive after a fraction of a second instead of the whole wait (lesson 6.1 measured 0.19 s to the first token, 6.7 s in total). Right for anything a person watches.
+
+### Retries
+
+From Part 5: retry what's temporary, never what's permanent, and wait between attempts.
+
+| Failure | Retry? |
+|---|---|
+| Connection refused, timeout, 500, 502, 503, 504, 529 (overloaded) | Yes, a few times, with growing waits |
+| 429 (rate limited) | Yes, after the time the server asks for |
+| 400 (bad request), 401 (no key), 404 (no such model) | No: the same request fails the same way |
+| Reply cut off (`max_tokens`), refusal | No: not an error, a result; the caller decides |
+
+The Anthropic SDK retries the retryable statuses itself (twice by default, with backoff). For Ollama, Atlas does it: three attempts with waits of one then two seconds.
+
+### Cost logging
+
+Every call is recorded in a table, `llm_calls`: provider, model, purpose, input and output tokens, cost in dollars, latency and stop reason. The cost comes from a price list in code (lesson 6.1's formula); a model missing from the list gets a null cost and a warning instead of a wrong number. With that table, "what did fit scoring cost this week?" is a `GROUP BY`, and Part 7 can alert on spend.
+
+```{mermaid}
+flowchart LR
+    F[Feature code<br/>fit scoring, answers] -->|ChatRequest| I{{ChatProvider}}
+    I --> O[OllamaChat<br/>httpx, Atlas retries]
+    I --> C[ClaudeChat<br/>anthropic SDK, SDK retries]
+    O --> R[ChatResult]
+    C --> R
+    R -->|record| L[(llm_calls<br/>tokens, cost, latency)]
+    S[Settings<br/>LLM_PROVIDER, CHAT_MODEL] -->|make_chat| I
+```
+
+## In the project
+
+### The interface: `atlas/llm/__init__.py`
+
+```python
+@dataclass(frozen=True)
+class ChatRequest:
+    messages: list[Message]
+    system: str = ""
+    # A ceiling on the answer's length. Hitting it cuts the answer off mid-sentence:
+    # result.stop_reason says so (lesson 6.1).
+    max_tokens: int = 1024
+    # Ask for JSON matching this model's schema (lesson 6.3). The provider constrains the
+    # output; the caller still validates it, because constrained isn't the same as correct.
+    output_schema: type[BaseModel] | None = None
+    # What the call is for, recorded in the cost log: "fit_score", "answer", ...
+    purpose: str = "chat"
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    text: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    stop_reason: StopReason
+    latency_ms: float
+    purpose: str = "chat"
+
+
+# A stream yields TextDeltas, then exactly one ChatResult with the totals.
+ChatEvent = TextDelta | ChatResult
+
+
+class ChatProvider(Protocol):
+    provider: str
+    model: str
+
+    def complete(self, request: ChatRequest) -> ChatResult: ...
+    def stream(self, request: ChatRequest) -> Iterator[ChatEvent]: ...
+```
+
+A `Protocol`, as in lesson 5.1: any class with these attributes and methods is a `ChatProvider`, without inheriting from anything. `ChatEvent = TextDelta | ChatResult` is a **type alias** with a union: a stream's items are either kind, and code tells them apart with `isinstance`. Ending the stream with the full `ChatResult` means streaming callers get token counts and the stop reason too.
+
+The provider methods are synchronous (`def`, not `async def`): the worker and the command line are synchronous, and lesson 6.7 shows how the async API streams from them.
+
+### Ollama: `atlas/llm/ollama.py`
+
+```python
+def _post(self, body: dict[str, Any]) -> httpx.Response:
+    for attempt in range(1, ATTEMPTS + 1):
+        is_last = attempt == ATTEMPTS
+        try:
+            response = self.client.post("/api/chat", json=body)
+        except httpx.TransportError as error:
+            if is_last:
+                raise LLMError(f"cannot reach Ollama: {error}") from error
+            time.sleep(attempt)
+            continue
+        should_retry = response.status_code in RETRYABLE_STATUS and not is_last
+        if should_retry:
+            time.sleep(attempt)
+            continue
+        if response.status_code != 200:
+            raise LLMError(f"Ollama answered {response.status_code}: {response.text[:200]}")
+        return response
+    raise AssertionError("unreachable: the last attempt returns or raises")
+```
+
+`httpx.TransportError` covers the connection failures (refused, reset, timed out). A 400, such as lesson 6.1's context overflow, isn't retried: its message goes straight into the `LLMError`. The last line can't run, but without it a type checker sees a path that returns nothing.
+
+Streaming reads Ollama's format: one JSON object per line, the last with `"done": true` and the counts:
+
+```python
+with self.client.stream("POST", "/api/chat", json=self._body(request, stream=True)) as response:
+    ...
+    for line in response.iter_lines():
+        if not line:
+            continue
+        data = json.loads(line)
+        piece = data["message"]["content"]
+        if piece:
+            parts.append(piece)
+            yield TextDelta(piece)
+        if data["done"]:
+            yield self._result(request, data, "".join(parts), started)
+```
+
+A function containing `yield` is a **generator**: calling it returns an iterator, and the body runs bit by bit as the caller asks for items. The HTTP response stays open, inside the `with`, until the last item.
+
+### Claude: `atlas/llm/claude.py`
+
+The Claude provider uses the official `anthropic` SDK (2.11.0). Two notes on it. It's built on **`httpx2`**, a successor package to `httpx`, not `httpx` itself, so anything passed to its HTTP layer (a test transport, for one) must come from `httpx2`. And Atlas never handles the key: the SDK reads `ANTHROPIC_API_KEY` (or an `ant auth login` profile) itself.
+
+```python
+def complete(self, request: ChatRequest) -> ChatResult:
+    started = time.perf_counter()
+    try:
+        if request.output_schema is not None:
+            # parse() turns the Pydantic model into a schema Claude accepts (moving
+            # constraints such as minimum and maximum into client-side checks).
+            message = self.client.beta.messages.parse(
+                **self._params(request), output_format=request.output_schema
+            )
+        else:
+            message = self.client.beta.messages.create(**self._params(request))
+    except anthropic.APIError as error:
+        # Raised only after the SDK's own retries have given up.
+        raise LLMError(f"Claude request failed: {error}") from error
+    return self._result(request, message, started)
+
+
+def _params(self, request: ChatRequest) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "model": self.model,
+        "max_tokens": request.max_tokens,
+        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "output_config": {"effort": self.effort},
+    }
+    if request.system:
+        params["system"] = request.system
+    if self.model in MODELS_WITH_FALLBACK:
+        # "default" lets the API choose the fallback model by refusal category.
+        params["betas"] = [FALLBACK_BETA]
+        params["fallbacks"] = "default"
+    return params
+```
+
+`**params` unpacks a dictionary into keyword arguments. Three choices follow Anthropic's current guidance for Claude Opus 5.5, the default Claude model: effort is set explicitly (`medium`, the model's own default, kept visible in one place); thinking is left on (it can't be turned off on this model); and requests use the beta endpoint for **server-side refusal fallbacks**, so a request a safety classifier declines is re-run on a fallback model in the same call. `message.model` then names the model that actually answered, which is what the cost log records. Streaming uses the SDK's `messages.stream(...)` helper, whose `text_stream` yields text pieces and `get_final_message()` the full message.
+
+::: {.callout-warning title="Not run against the real API"}
+This course was written without an Anthropic API key (decision D28), so `ClaudeChat` has been tested only against a fake of the Messages API, below. The fake checks that Atlas sends what the SDK documentation says and reads what it describes; it can't show you Claude's actual replies. With a key, set `LLM_PROVIDER=anthropic` and every command in Part 6 uses Claude.
+:::
+
+### Choosing a provider, and logging: `atlas/llm/calls.py`
+
+```python
+def make_chat(settings: Settings) -> ChatProvider:
+    model = settings.chat_model or DEFAULT_MODELS[settings.llm_provider]
+    if settings.llm_provider == "anthropic":
+        # Imported here so Atlas runs without the anthropic package's import cost
+        # (and without a key) when it only uses local models.
+        from atlas.llm.claude import ClaudeChat
+
+        return ClaudeChat(model=model, effort=settings.llm_effort)
+    from atlas.llm.ollama import OllamaChat
+
+    return OllamaChat(model=model, base_url=settings.ollama_url)
+```
+
+New settings: `LLM_PROVIDER` (`ollama` or `anthropic`, a `Literal` so a typo fails at startup), `CHAT_MODEL`, `OLLAMA_URL`, `LLM_EFFORT`. Prices and the log:
+
+```python
+# Dollars per million input and output tokens, from Anthropic's price list (November 2026).
+# Local models cost electricity, not money: they're priced at zero.
+PRICES_PER_MILLION: dict[str, tuple[Decimal, Decimal]] = {
+    "claude-opus-5-5": (Decimal("4.00"), Decimal("20.00")),
+    "claude-sonnet-5-5": (Decimal("2.00"), Decimal("10.00")),
+    "claude-haiku-5-5": (Decimal("0.10"), Decimal("0.50")),
+}
+```
+
+`Decimal` is exact decimal arithmetic: summing thousands of tiny float costs drifts, which matters when the numbers are money. The `llm_calls` table (migration `0008`) stores the cost as `NUMERIC(12, 6)` for the same reason.
+
+### Tests with fake servers
+
+The tests talk to fakes at the HTTP boundary (lesson 4.19's rule): the real `OllamaChat` and the real Anthropic SDK, with transports that answer in memory. For Claude:
+
+```python
+def claude(respond: Any) -> ClaudeChat:
+    client = anthropic.Anthropic(
+        api_key="test-key",  # never sent anywhere: the transport answers in memory
+        max_retries=0,
+        http_client=anthropic.DefaultHttpxClient(transport=claude_transport(respond)),
+    )
+    return ClaudeChat(client=client)
+
+
+def test_claude_request_carries_effort_and_refusal_fallbacks() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def respond(body: dict[str, Any], http: httpx2.Request) -> httpx2.Response:
+        seen.append({**body, "beta": http.headers.get("anthropic-beta")})
+        return httpx2.Response(200, json=claude_message("It runs the training loop."))
+
+    result = claude(respond).complete(request(system="Be brief."))
+
+    assert result.text == "It runs the training loop."
+    assert (result.provider, result.input_tokens, result.output_tokens) == ("anthropic", 1200, 300)
+    sent = seen[0]
+    assert (sent["model"], sent["system"], sent["output_config"]) == (
+        "claude-opus-5-5",
+        "Be brief.",
+        {"effort": "medium"},
+    )
+    assert (sent["fallbacks"], sent["beta"]) == ("default", "server-side-fallback-2026-07-01")
+```
+
+Others check that a refusal is reported as `refusal`, that missing credentials give a clear message (below), that an overloaded API (529) becomes an `LLMError`, that Ollama's busy server is retried and a dead one gives a clear error, that streaming yields pieces then totals, and that costs are computed and recorded: 1,200 input and 300 output tokens on Claude Opus 5.5 is `Decimal("0.010800")`.
+
+### Using it: `atlas llm` and `atlas llm-usage`
+
+`atlas llm` sends one prompt through whichever provider the settings choose, prints the reply (as it arrives, with `--stream`), a summary line on stderr, and records the call:
+
+```text
+$ atlas llm "What does a learning rate scheduler do? Two sentences." --stream
+A learning rate scheduler adjusts the learning rate during training to optimize convergence and performance. It helps improve model accuracy by dynamically modifying the learning rate based on training progress.
+qwen3:1.7b via ollama: 23 tokens in, 33 out, 5.0 s, $0, stopped: end
+$ atlas llm-usage
+purpose      model              calls       in     out  avg s       cost
+cli          qwen3:1.7b             3       72      96    3.1    $0.0000
+```
+
+`llm-usage` is one `GROUP BY purpose, model` over `llm_calls`. With Ollama stopped (`docker compose stop ollama`), the three attempts and their waits, then a clear error and exit code 1:
+
+```text
+$ atlas llm "Hello"
+atlas: cannot reach Ollama: [Errno 111] Connection refused
+exit 1 after 3.95 s
+```
+
+Four seconds: attempts at 0, 1 and 3 seconds (waits of 1 then 2), each refused at once.
+
+### A bug: a missing key
+
+Choosing Claude without a key, in a clean environment (`env -i` starts a command with no inherited variables):
+
+```text
+$ LLM_PROVIDER=anthropic atlas llm "Hello"
+...
+TypeError: "Could not resolve authentication method. Expected one of api_key, auth_token, or credentials to be set. Or for the `Authorization` header to be explicitly omitted"
+```
+
+A traceback, not a message. The SDK (2.11.0) reports missing credentials with a plain `TypeError` when the request is sent, not with one of its `APIError` classes, so `ClaudeChat`'s `except anthropic.APIError` didn't catch it. The regression test removes every credential source and expects an `LLMError` naming the fix:
+
+```python
+def test_claude_without_credentials_says_how_to_fix_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (lesson 6.2): the SDK raised a bare TypeError at request time, and
+    # `atlas llm` printed a traceback instead of a message.
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", "/nonexistent")  # no `ant auth login` profile either
+    ...
+    with pytest.raises(LLMError, match="ANTHROPIC_API_KEY"):
+        ClaudeChat(client=client).complete(request())
+```
+
+Red: `TypeError: "Could not resolve authentication method..."`. Green with a narrow translation, recognising that one error by its message and leaving any other `TypeError` alone, because a `TypeError` is usually a bug that should surface:
+
+```python
+def raise_if_no_credentials(error: TypeError) -> None:
+    is_missing_credentials = "Could not resolve authentication method" in str(error)
+    if is_missing_credentials:
+        raise LLMError(
+            "no Claude credentials: set ANTHROPIC_API_KEY, or run `ant auth login`"
+        ) from error
+```
+
+```text
+$ LLM_PROVIDER=anthropic atlas llm "Hello"
+atlas: no Claude credentials: set ANTHROPIC_API_KEY, or run `ant auth login`
+exit 1
+```
+
+Matching an exception's message is fragile: a future SDK could reword it, and the test above would then fail, which is the point of having it.
+
+## Trade-offs *(deep dive)*
+
+**Frameworks.** LangChain, LlamaIndex and similar libraries offer provider interfaces, prompt templates, retrieval and agents in one package. They're quick for demos. They also put large abstractions between you and the API, change often, and hide exactly the details (tokens, stop reasons, retries, costs) this part teaches. Atlas's interface is two methods and five small types; reading it takes a minute.
+
+**Too thin, too thick.** An interface with only `complete(prompt: str) -> str` loses token counts, stop reasons and streaming, and every caller reinvents them. One that mirrors every provider feature becomes a second, worse SDK. Atlas adds a field only when a feature needs it: `output_schema` arrived with lesson 6.3.
+
+**Synchronous providers.** The worker and CLI are synchronous, and so are the providers. An async version would let the API serve many streams on one thread; lesson 6.7 measures whether Atlas needs that.
+
+## Common mistakes
+
+- **Provider fields outside the provider.** One `done_reason` in feature code and the switch to Claude becomes a search.
+- **Retrying a 400.** The same request fails the same way, and wastes time and money.
+- **Retrying a cut-off reply as an error.** Raise the limit or shorten the prompt instead.
+- **Floats for money.** Use `Decimal` and a `NUMERIC` column.
+- **A key in code or settings.** Let the SDK read it from the environment.
+- **Tests that call the real API.** Slow, flaky, costly, and they need a key in CI.
+
+## Check yourself
+
+**1.** Why does a stream end with a `ChatResult` rather than just stopping?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The last item carries what streaming callers still need: the token counts for the cost log, the stop reason (was it cut off?), and the full text and latency. Without it, every streaming caller would have to reassemble the text and couldn't know the counts.
+:::
+
+**2.** The Anthropic SDK retries a 529. Why does Atlas still wrap the call in `try/except anthropic.APIError`?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The SDK gives up after its retries and raises. Converting that to `LLMError` keeps feature code provider-neutral: it catches one Atlas exception whichever provider is configured, and never needs to import `anthropic`.
+:::
+
+**3.** A model is missing from `PRICES_PER_MILLION`. Why record a null cost rather than zero?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Zero is a claim (the call was free), and sums would silently under-report spend. Null says "unknown": `SUM` skips it, the warning in the log says which model to add, and a report can count the unpriced calls.
+:::
+
+## Exercise
+
+Add `--since YYYY-MM-DD` to `atlas llm-usage`, so it reports only calls from that date on.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Give the subparser `usage_parser.add_argument("--since", type=date.fromisoformat, default=None)`, pass `args` to `run_llm_usage`, and add a `where` before the `group_by`:
+```python
+.where(LlmCall.created_at >= (args.since or date.min))
+```
+`date.min` (the year 1) makes "no `--since`" mean "everything" without a second branch. Checked against the reference code, with two rows inserted by hand as if Claude had answered (one yesterday, one today; no real Claude call was made): `--since 2026-11-20` listed only today's, `answer  claude-opus-5-5  1  100000  20000  4.0  $0.8000`. Not in the reference code.
+:::
+
+## Stretch
+
+A cost log is only useful if someone looks at it. Add `--limit-usd AMOUNT` to `atlas llm-usage`: after printing, exit with code 1 and a message if the total cost is over the limit, so a scheduled job (lesson 5.2) or CI can raise the alarm.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+total = sum((row[6] or Decimal(0) for row in rows), Decimal(0))
+over_limit = args.limit_usd is not None and total > args.limit_usd
+if over_limit:
+    print(f"atlas: spent ${total:.4f}, over the ${args.limit_usd} limit", file=sys.stderr)
+    return 1
+```
+with `usage_parser.add_argument("--limit-usd", type=Decimal, default=None)`. `row[6] or Decimal(0)` treats unpriced (null) costs as zero for the sum; a stricter version would refuse to judge while any cost is unknown. With the same two hand-inserted rows: `atlas: spent $1.6000, over the $1.00 limit`, exit code 1. Part 7 turns this kind of check into an alert. Not in the reference code.
+:::
+
+## What changed in the project
+
+New `atlas/llm/` package: `__init__.py` (neutral types, `ChatProvider`, `LLMError`), `ollama.py` (`OllamaChat`), `claude.py` (`ClaudeChat`), `calls.py` (`make_chat`, prices, `cost_usd`, `record`); `llm_calls` table (migration `0008`); settings `LLM_PROVIDER`, `CHAT_MODEL`, `OLLAMA_URL`, `LLM_EFFORT`; `atlas llm` and `atlas llm-usage`; `anthropic` 2.11.0; `tests/fake_llm.py` and `tests/test_llm.py`. Commits: `feat: Added the llm package with Ollama and Claude providers and a cost log`, `fix: Turned missing Claude credentials into a clear error`.

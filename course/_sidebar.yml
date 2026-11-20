@@ -88,7 +88,9 @@ website:
       - section: "Part 6: AI engineering: Atlas"
         href: part-6-atlas-rag/index.qmd
         contents:
-          []
+          - part-6-atlas-rag/01-llms-for-engineers.qmd
+          - part-6-atlas-rag/02-the-provider-interface.qmd
+          - part-6-atlas-rag/03-structured-outputs.qmd
       - section: "Part 7: Production on AWS"
         href: part-7-production-aws/index.qmd
         contents:

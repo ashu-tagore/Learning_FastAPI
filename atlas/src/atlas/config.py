@@ -5,6 +5,7 @@ so a missing or malformed value fails at startup with a clear message.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,6 +37,14 @@ class Settings(BaseSettings):
     snapshot_bucket: str = "atlas-snapshots"
     # Older snapshots of a repository are deleted once this many newer ones exist.
     snapshots_kept: int = 3
+    # Language models (Part 6). Ollama runs models locally and is the default; "anthropic"
+    # uses Claude and needs ANTHROPIC_API_KEY (read by the SDK, not by Atlas).
+    llm_provider: Literal["ollama", "anthropic"] = "ollama"
+    # Unset: qwen3:1.7b on Ollama, claude-opus-5-5 on Anthropic.
+    chat_model: str | None = None
+    ollama_url: str = "http://localhost:11434"
+    # Claude only: how hard the model thinks (low, medium, high, xhigh, max).
+    llm_effort: str = "medium"
 
 
 class ApiSettings(Settings):

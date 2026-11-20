@@ -1,0 +1,287 @@
+---
+title: "6.1 LLMs for engineers: tokens, context windows, effort, cost, latency, failure modes"
+description: "Treat a language model as an engineering component: measure what it reads and writes in tokens, where its context runs out, what it costs and how long it takes, and watch it fail in the ways every design in Part 6 has to plan for."
+---
+
+::: {.lesson-meta}
+Part 6 · Lesson 1 · About 2 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "Failure modes". The trade-offs section *(deep dive)* compares local and hosted models.
+:::
+
+::: {.callout-note title="Analogy: a brilliant new colleague with no memory"}
+Imagine a new colleague who has read an enormous amount, writes fluently, and answers instantly. But they remember nothing between conversations, can only look at the papers you put on their desk right now, charge by the word, and, when they don't know something, they tell you an answer anyway, in the same confident voice.
+
+You'd still work with them. You'd just put the right papers on the desk, check what they say, and never let them sign anything alone. That's how Atlas works with a **large language model**.
+:::
+
+## The problem
+
+Part 6 adds questions and answers to Atlas: "How are events fired during `Engine.run`?", answered from Ignite's code. The obvious approach is to ask a model directly. Here is a real exchange with the local model this course uses (`qwen3:1.7b`, running on the laptop-class CPU this course was written on):
+
+```text
+In PyTorch-Ignite, what does Engine.fast_forward_to_epoch(n) do? Two sentences.
+
+`Engine.fast_forward_to_epoch(n)` skips the remaining epochs in the current training loop and
+moves to the nth epoch, skipping the current epoch.
+```
+
+Ignite has no `fast_forward_to_epoch`. The model described a plausible function anyway, with the same confidence as a true answer. Nothing in the reply signals the difference.
+
+The next obvious approach is to give the model the real code. Ignite's `engine.py` is 66,000 characters. Pasted into the prompt with a question:
+
+```text
+400 {"error":"request (13385 tokens) exceeds the available context size (4096 tokens), try increasing it"}
+```
+
+The model can't even read it. Raising the limit to 16,384 tokens works, and the model answers a question about the start of the prompt correctly, but reading took this long:
+
+```text
+read 13385 tokens in 184.4 s; answer 'The secret word is **PELICAN**.' ; total 193.0 s
+```
+
+Three minutes to read one file. A model makes things up when it lacks information, can only see a limited amount, and reading costs time (and, with hosted models, money). The rest of Part 6 is engineering around exactly these facts, so this lesson measures them.
+
+## Theory
+
+### What a language model does
+
+A **large language model** (LLM) is a program trained on a huge amount of text to do one thing: given some text, predict what comes next. It produces a reply one small piece at a time, each piece chosen from its predictions given everything before it, including the pieces it just wrote. That's all. There is no lookup in a database of facts, which is why a made-up function comes out as fluently as a real one: "fluent" is what the model is built for; "true" is a side effect of having seen true text.
+
+Models come in sizes, counted in **parameters** (the numbers learned during training). `qwen3:1.7b` has 1.7 billion; hosted models like Claude are far larger. Bigger models know more and reason better, and need more hardware.
+
+### Tokens
+
+Models don't read letters or words. Text is split into **tokens**, chunks from a fixed vocabulary of tens of thousands of pieces: common words are one token, rare words and code are split into several. Measured with the local model (the extra tokens each prompt costs, beyond an empty one):
+
+```text
+  6 tokens   26 chars  The engine fires an event.
+ 10 tokens   43 chars  self.fire_event(Events.ITERATION_COMPLETED)
+ 12 tokens   33 chars  Le moteur déclenche un événement.
+ 11 tokens   16 chars  エンジンがイベントを発生させる。
+```
+
+English prose: about 4 characters a token. Code: similar here. French: nearly twice as many tokens for the same meaning; Japanese, more tokens than characters. Every limit and price is in tokens, so the same task can cost twice as much in another language or with other code. Each model has its own **tokenizer** (the splitting rules), so counts differ between models: Claude's counts for the same text won't match these.
+
+### The context window
+
+A model can only consider a fixed number of tokens at once: its **context window**. The prompt (instructions, conversation so far, any documents) and the reply must fit in it together. `qwen3:1.7b` was trained for 40,960 tokens, but Ollama gives it 4,096 by default, because memory use grows with the window. Claude models offer up to a million.
+
+What happens when a prompt doesn't fit depends on the software. This version of Ollama refuses with a clear error, which is the friendly behaviour. Other servers and older versions silently cut off the start of the prompt, so the model never sees your instructions and nobody is told. Check what yours does.
+
+A bigger window isn't free, either. Reading costs time and money per token, and the more text there is, the more irrelevant text the model has to look past. So Part 6 does what a person would: find the few relevant passages (retrieval, lessons 6.4 to 6.6) and put only those on the desk.
+
+### Generation: sampling and temperature
+
+At each step the model gives probabilities for every possible next token. **Sampling** picks one, usually not always the most likely: that variety makes text read naturally. **Temperature** controls it: 0 means always the most likely token; higher values spread the choice. The same question, three times, with the defaults:
+
+```text
+default: A learning rate scheduler adjusts the learning rate during training to improve convergence and performance.
+default: A learning rate scheduler adjusts the learning rate during training to improve convergence and performance.
+default: A learning rate scheduler adjusts the learning rate during training to optimize model performance.
+temperature 0, seed 1: A learning rate scheduler adjusts the learning rate during training to optimize convergence.
+temperature 0, seed 1: A learning rate scheduler adjusts the learning rate during training to optimize convergence.
+```
+
+A **seed** fixes the random choices, so with temperature 0 and a seed the runs matched. Don't build on that: across model versions, hardware and batches, outputs still change, and current Claude models don't accept a temperature at all. Design so that different wording is fine, and test behaviour, not exact text (lesson 6.8).
+
+### Effort and thinking
+
+Some models can **think** before answering: generate reasoning tokens that aren't part of the reply, then answer. On hard problems, that improves answers; it always costs tokens and time. Claude models control it with **effort** (`low` to `max`); Qwen3 has a thinking mode Atlas turns off, because on a CPU it multiplies the wait for Atlas's short tasks. Thinking tokens are billed as output tokens even when you don't see them.
+
+### Cost
+
+Hosted models charge per million tokens, input and output priced separately, output several times dearer. Claude Opus 5.5 is $4 per million input tokens and $20 per million output (Anthropic's price list, November 2026); Claude Haiku 5.5 is $0.10 and $0.50. The formula:
+
+```text
+cost = input_tokens × input_price / 1,000,000 + output_tokens × output_price / 1,000,000
+```
+
+A local model costs nothing per token but runs on your hardware, slowly on a CPU. As a rough comparison only (Claude would count Ignite's `engine.py` with its own tokenizer, so the number would differ), the 13,385-token prompt above would cost about 13,385 × $4 / 1,000,000 ≈ $0.054 to send to Claude Opus 5.5 once. Fine for one question; for every question every user asks, it adds up. That's another reason to send only the relevant passages.
+
+### Latency
+
+Two numbers matter. **Time to first token**: how long until the reply starts. **Total time**: until it ends. Measured, for a 105-token explanation:
+
+```text
+first token after 0.19 s; 105 tokens; all done after 6.7 s
+```
+
+The local model writes about 16 tokens a second. Reading is faster but slows as prompts grow (the stretch measures by how much): a 1,909-token prompt (part of `engine.py` plus a question) was read at 135 tokens a second and answered in 19 seconds in all, while the 13,385-token one was read at 73 a second. Total time is roughly: prompt tokens ÷ reading speed + reply tokens ÷ writing speed. Two consequences. **Stream** replies (show them as they're written) so people see progress after 0.2 seconds instead of staring at a spinner for 7. And keep prompts short: on this machine, reading is what made the long-file question take three minutes.
+
+```{mermaid}
+flowchart LR
+    P[Prompt<br/>system + history + documents] --> T[Tokenizer]
+    T --> W{Fits the<br/>context window?}
+    W -->|no| E[Error, or silently cut]
+    W -->|yes| R[Read all tokens<br/>slow for long prompts]
+    R --> G[Generate one token at a time<br/>sampling, temperature]
+    G --> S{Stop?}
+    S -->|end of answer| A[Reply + token counts]
+    S -->|max_tokens reached| C[Reply cut off]
+```
+
+## Failure modes
+
+Every design in Part 6 plans for these. The names are standard; the examples are real runs above.
+
+| Failure | What it looks like | Atlas's defence |
+|---|---|---|
+| **Hallucination** | A confident answer that isn't true (`fast_forward_to_epoch`) | Answer only from retrieved code, with citations to check (6.7); measure (6.8) |
+| **Context overflow** | An error, or worse, a silently cut prompt | Retrieve a few relevant chunks instead of whole files (6.4 to 6.6) |
+| **Cut-off reply** | Generation hits `max_tokens` mid-sentence | Check the stop reason every time (6.2) |
+| **Wrong format** | Asked for JSON, got prose or invalid JSON | Constrain output to a schema and validate it (6.3) |
+| **Plausible but wrong judgment** | Valid output whose content is inconsistent | Validate what can be checked; evaluate the rest (6.3, 6.8) |
+| **Variation** | Different answers to the same question | Test behaviour, not wording (6.8) |
+| **Refusal** | A safety system declines | Report it as a refusal; Claude can fall back to another model (6.2) |
+| **Prompt injection** | Text in a document tells the model to ignore its instructions | Treat retrieved text as data; never give the model powers it can be talked into misusing (Part 8) |
+| **Slow or down** | Seconds per call; timeouts; outages | Timeouts, retries, background jobs, never inside a request (6.2, Part 5) |
+
+The cut-off is easy to see. With a limit of 20 tokens, asking for twenty numbers (this uses the `atlas llm` command lesson 6.2 builds):
+
+```text
+One, two, three, four, five, six, seven, eight, nine, ten,
+qwen3:1.7b via ollama: 23 tokens in, 20 out, 1.4 s, $0, stopped: max_tokens
+```
+
+The reply looks like an answer. Only the stop reason says it isn't complete.
+
+## Running the experiments yourself
+
+The model runs in Ollama, which joins `compose.yml` in this lesson's code:
+
+```yaml
+  ollama:
+    image: ollama/ollama:0.40.16
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - atlas-models:/root/.ollama
+```
+
+```bash
+docker compose up -d ollama
+```
+
+```bash
+docker compose exec ollama ollama pull qwen3:1.7b
+```
+
+The download is about 1.1 GB. (The machine this course was written on couldn't reach Ollama's model registry, so it imported the same model from the GGUF file Docker publishes as `ai/qwen3:1.7b`. If your copy comes from Ollama's registry it may be quantised differently, and your replies will be worded differently; the behaviour this lesson shows is the same.)
+
+Ollama has an HTTP API; the experiments are plain `httpx` calls to it:
+
+```python
+import httpx
+
+OLLAMA = httpx.Client(base_url="http://localhost:11434", timeout=600)
+
+
+def chat(content: str, **options: object) -> dict:
+    body = {
+        "model": "qwen3:1.7b",
+        "stream": False,
+        "think": False,
+        "options": options,  # num_ctx, num_predict (max tokens), temperature, seed
+        "messages": [{"role": "user", "content": content}],
+    }
+    return OLLAMA.post("/api/chat", json=body).json()
+
+
+reply = chat("In one sentence: what is an event in a training loop library?")
+print(reply["message"]["content"])
+print(reply["prompt_eval_count"], "tokens in,", reply["eval_count"], "out")
+```
+
+`prompt_eval_count` and `eval_count` are Ollama's names for input and output tokens; `done_reason` is `"stop"` or `"length"` (the reply hit `num_predict`). Lesson 6.2 wraps all of this behind one interface.
+
+## Trade-offs: local or hosted? *(deep dive)*
+
+| | Local (Ollama, small model) | Hosted (Claude) |
+|---|---|---|
+| Cost per token | None | Per million tokens, output dearer |
+| Quality | Fine for short, narrow tasks; makes more mistakes | Much stronger reasoning and knowledge |
+| Speed on a CPU | Seconds to minutes | Seconds, from fast hardware |
+| Privacy | Nothing leaves the machine | Sent to the provider, under its data policy |
+| Operations | Your hardware, your downloads | An API key and a bill |
+
+Atlas runs local by default, so every lesson works for free, and treats the hosted model as a setting (lesson 6.2). The small model's mistakes are useful here: they make every defence in the table above visible. A system that works with a 1.7-billion-parameter model usually works better with a stronger one; the reverse isn't true.
+
+## Common mistakes
+
+- **Trusting fluency.** A confident reply is no evidence of a correct one.
+- **Ignoring the stop reason.** A cut-off reply looks like a complete one.
+- **Pasting whole documents.** Context runs out, and reading time and cost grow with every token.
+- **Testing exact wording.** The same prompt gives different text; test behaviour.
+- **Estimating cost in words or characters.** Prices are per token, counts depend on the tokenizer and the language.
+- **Calling a model inside a web request without a timeout.** Seconds become minutes on a slow day.
+
+## Check yourself
+
+**1.** Why did the model describe `Engine.fast_forward_to_epoch` instead of saying it doesn't exist?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It predicts plausible text; it doesn't look facts up. A question that presumes a function exists makes a description of that function the most plausible continuation. It has no reliable signal for "I don't know", so the made-up answer comes out as fluently as a true one.
+:::
+
+**2.** A prompt is 3,900 tokens and the context window is 4,096. Can the model reply with 500 tokens?
+
+::: {.callout-tip collapse="true" title="Answer"}
+No. The prompt and the reply share the window, so only about 196 tokens remain for the reply; it would be cut off (or the request refused, depending on the server). Either shorten the prompt or raise the window, which costs memory.
+:::
+
+**3.** Using the measured speeds (about 135 tokens a second to read at moderate lengths, 16 a second to write), roughly how long does a 2,000-token prompt with a 300-token answer take on this machine?
+
+::: {.callout-tip collapse="true" title="Answer"}
+About 2,000 ÷ 135 ≈ 15 seconds to read plus 300 ÷ 16 ≈ 19 seconds to write: around 34 seconds, with the first words appearing after the 15 seconds of reading. (For comparison, the measured 1,909-token prompt with a 48-token reply took 19 seconds in total.)
+:::
+
+## Exercise
+
+How many tokens is Ignite's `README.md` for the local model, and would it fit in Ollama's default window together with a 500-token answer? Measure it with the `chat` function above: the prompt's `prompt_eval_count`, minus that of an empty prompt.
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+from pathlib import Path
+
+empty = chat("", num_predict=1)["prompt_eval_count"]
+readme = Path("ignite/README.md").read_text()  # in a clone of pytorch/ignite
+reply = chat(readme, num_predict=1, num_ctx=16384)
+print(len(readme), "chars,", reply["prompt_eval_count"] - empty, "tokens")
+```
+```text
+README.md: 27822 chars, 7123 tokens (empty prompt: 12)
+```
+About 3.9 characters a token: it's mostly English with some code. No, it doesn't fit: 7,123 tokens is already more than the default 4,096-token window before any answer. It needs `num_ctx` of at least about 7,700 (7,123 plus the 500-token answer, plus a little for the chat template's own tokens). `num_predict=1` keeps each measurement quick: the model reads everything but writes one token. (At the commit this course used; the README changes over time, so your numbers may differ slightly.)
+:::
+
+## Stretch
+
+Measure how reading speed changes with prompt length: send the first 1,000, 4,000 and 12,000 characters of `engine.py` (raise `num_ctx` to 16,384) with `num_predict` set to 1, and compute `prompt_eval_count / (prompt_eval_duration / 1e9)` for each. What does the trend mean for long prompts?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```python
+import uuid
+
+engine = Path("ignite/engine/engine.py").read_text()
+for n in (1000, 4000, 12000, 40000):
+    # A unique first line, so Ollama can't reuse a cached copy of an earlier prompt's start.
+    reply = chat(f"Request {uuid.uuid4().hex}.\n" + engine[:n], num_predict=1, num_ctx=16384)
+    tokens = reply["prompt_eval_count"]
+    seconds = reply["prompt_eval_duration"] / 1e9
+    print(f"{n:>6} chars: {tokens:>5} tokens read in {seconds:5.1f} s = {tokens / seconds:4.0f} tokens/s")
+```
+```text
+  1000 chars:   242 tokens read in   1.2 s =  197 tokens/s
+  4000 chars:   910 tokens read in   4.9 s =  187 tokens/s
+ 12000 chars:  2550 tokens read in  15.2 s =  167 tokens/s
+ 40000 chars:  8570 tokens read in  87.4 s =   98 tokens/s
+```
+Reading gets *slower per token* as the prompt grows: 35 times the tokens took 73 times as long. Each new token is compared with every token before it, so the work grows faster than the length. Doubling a prompt more than doubles its reading time, one more reason to send only the relevant passages. The unique first line matters: a first run without it reported speeds up to 233 tokens a second, because Ollama reuses the start of a prompt it has already read (`prompt_eval_cached_count` in the reply says how many tokens it skipped).
+:::
+
+## What changed in the project
+
+`compose.yml` gains the `ollama` service (`ollama/ollama:0.40.16`) and its `atlas-models` volume. No Python changes in this lesson: lesson 6.2 builds Atlas's model interface on what this one measured.

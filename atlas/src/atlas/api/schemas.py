@@ -178,6 +178,16 @@ class IssueOut(BaseModel):
     created_at: datetime
 
 
+class FitOut(BaseModel):
+    """A model's opinion of how well an issue fits me (lesson 6.3): a suggestion, not a fact."""
+
+    issue: IssueOut
+    score: int
+    reasons: list[str]
+    first_step: str
+    model: str
+
+
 def encode_issue_cursor(last_number: int) -> str:
     # Opaque to clients: they pass it back unchanged, so its format can change later.
     raw = json.dumps({"before": last_number}).encode("utf-8")

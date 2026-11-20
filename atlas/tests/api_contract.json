@@ -135,6 +135,12 @@
       "422"
     ]
   },
+  "/users/me/fits": {
+    "get": [
+      "200",
+      "422"
+    ]
+  },
   "/users/me/saved-issues": {
     "get": [
       "200"
