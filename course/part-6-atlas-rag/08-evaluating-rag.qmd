@@ -193,7 +193,23 @@ def answer_case(session, chat, repo, case, query_vector, model) -> AnswerOutcome
 
 A separate workflow, so it doesn't slow down the fast checks. On every pull request that touches `atlas/` or `evals/`, it starts Postgres and Ollama, pulls both models (cached between runs: 1.4 GB), fetches Ignite at the pinned commit, runs `atlas index` and `atlas embed`, then `atlas eval` with the thresholds and hand grades, and uploads the report as an artifact even when the evaluation fails, so the failing cases can be read. It takes about an hour, almost all of it embedding Ignite on the runner's CPU.
 
-FIRST_CI_RUN
+The first run on GitHub, for this lesson's pull request (timestamps from the job log):
+
+```text
+01:31:02  indexed 403 files into 4631 chunks (0 skipped) as pytorch/ignite
+01:34:07  embedded 448; 4183 remaining
+...
+02:04:32  embedded 4631; 0 remaining
+02:29:22  30 cases in 24.8 min
+          retrieval keyword  recall_at_5 0.2, recall_at_10 0.24, mrr 0.186
+          retrieval semantic recall_at_5 0.56, recall_at_10 0.64, mrr 0.403
+          retrieval hybrid   recall_at_5 0.64, recall_at_10 0.72, mrr 0.442
+          answers   cites_expected 0.52, valid_citations 1.0, wrongly_refused 0.0, correctly_refused 0.6, supported 1.0, judged 25
+          judge     agreed with the hand grades on 4 of 10
+02:29:35  Cache saved with key: ollama-qwen3:1.7b-nomic-embed-text
+```
+
+The same 4,631 chunks and the same retrieval scores as on the authoring machine: the pinned commit and the same embedding model make retrieval reproducible across machines. Embedding took 33 minutes, answering and judging 25; the whole job just under an hour. The models (1.55 GB with Ollama's files) were downloaded once and cached for later runs. `correctly_refused` was 0.6, the lowest of any run: since the three everyday questions never reach a model, the two answered must be Kubernetes and Core ML. The threshold held, for the reason explained under "Variation and thresholds" below.
 
 ## What the measurements found
 
@@ -321,7 +337,7 @@ refused = says_not_found and not cited
 
 with a test built from run 3's answer, which fails on the old check (`assert True is False`) and passes on the new one. Re-scored with it, `correctly_refused` across the three runs is 1.0, 0.8 and 0.8: the Core ML question was declined once in three. Kubernetes was declined every time.
 
-The thresholds, in `evals/thresholds.json`, sit below the worst of the three runs with room for about one more unlucky case, and only on exact checks:
+The thresholds, in `evals/thresholds.json`, sit below the worst of the three runs, and only on exact checks:
 
 ```json
 {
@@ -334,7 +350,7 @@ The thresholds, in `evals/thresholds.json`, sit below the worst of the three run
 }
 ```
 
-All three runs pass them. Retrieval's margin is one case (0.64 to 0.60), because retrieval doesn't vary: a drop there is always a real change. `answers.supported` has no threshold, for the reasons above.
+All three runs pass them. Retrieval's margin is one case (0.64 to 0.60), because retrieval doesn't vary: a drop there is always a real change. `correctly_refused` is set at 0.6, three of the five questions to decline: exactly the three everyday ones, which the similarity gate declines without asking a model, so they're declined in every run. The threshold can't fail because a model had a bad day, only because the gate broke; whether the model also declines Kubernetes and Core ML is reported, not gated. `answers.supported` has no threshold, for the reasons above.
 
 ## Trade-offs *(deep dive)*
 
