@@ -1,0 +1,8 @@
+{
+  "retrieval.hybrid.recall_at_5": 0.6,
+  "retrieval.hybrid.mrr": 0.4,
+  "answers.cites_expected": 0.4,
+  "answers.valid_citations": 0.9,
+  "answers.wrongly_refused": 0.1,
+  "answers.correctly_refused": 0.6
+}

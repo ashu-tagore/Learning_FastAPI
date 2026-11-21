@@ -1,4 +1,18 @@
 {
+  "/answers/{message_id}/feedback": {
+    "post": [
+      "200",
+      "404",
+      "422"
+    ]
+  },
+  "/ask": {
+    "post": [
+      "200",
+      "404",
+      "422"
+    ]
+  },
   "/auth/login": {
     "post": [
       "200",
@@ -23,9 +37,28 @@
       "422"
     ]
   },
+  "/conversations": {
+    "get": [
+      "200"
+    ]
+  },
+  "/conversations/{conversation_id}": {
+    "get": [
+      "200",
+      "404",
+      "422"
+    ]
+  },
   "/digests/latest": {
     "get": [
       "200"
+    ]
+  },
+  "/explain": {
+    "post": [
+      "200",
+      "404",
+      "422"
     ]
   },
   "/health": {

@@ -17,6 +17,9 @@ atlas digest --day 2026-11-19
 atlas llm "What is an event in a training loop?" --stream
 atlas llm-usage
 atlas fit --email ada@example.com --repo pytorch/ignite --limit 5
+atlas embed --repo pytorch/ignite
+atlas ask "How do I stop training early?" --repo pytorch/ignite
+atlas eval --cases ../evals/ignite.jsonl --thresholds ../evals/thresholds.json
 """
 
 import argparse
@@ -35,8 +38,9 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from atlas import digest, fit, issue_cache, storage, worker
+from atlas import answer, digest, evals, fit, issue_cache, storage, worker
 from atlas.config import Settings
+from atlas.embedding import embed_pending
 from atlas.events import EventStream
 from atlas.github import GitHubError, fetch_issues, fetch_recent_commits
 from atlas.issue_cache import CachedIssues
@@ -133,6 +137,22 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--limit", type=int, default=None, help="score at most N issues")
 
     commands.add_parser("llm-usage", help="calls, tokens and cost per purpose, from the log")
+
+    embed_parser = commands.add_parser("embed", help="embed a repository's pending chunks now")
+    embed_parser.add_argument("--repo", default=DEFAULT_REPO)
+
+    ask_parser = commands.add_parser("ask", help="answer a question from the indexed code")
+    ask_parser.add_argument("question")
+    ask_parser.add_argument("--repo", default=DEFAULT_REPO)
+
+    eval_parser = commands.add_parser("eval", help="measure retrieval and answers (lesson 6.8)")
+    # evals/ sits next to atlas/ in the course repository; commands run from atlas/.
+    eval_parser.add_argument("--cases", type=Path, default=Path("../evals/ignite.jsonl"))
+    eval_parser.add_argument("--repo", default=DEFAULT_REPO)
+    eval_parser.add_argument("--retrieval-only", action="store_true", help="no chat model")
+    eval_parser.add_argument("--thresholds", type=Path, help="fail if a score is below these")
+    eval_parser.add_argument("--hand-grades", type=Path, help="check the judge against these")
+    eval_parser.add_argument("--report", type=Path, help="write every result here, as JSON")
 
     digest_parser = commands.add_parser("digest", help="build every user's daily digest")
     digest_parser.add_argument(
@@ -458,6 +478,117 @@ def run_llm(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_embed(args: argparse.Namespace) -> int:
+    """Embed without a worker: for a first local setup and for CI's evaluation run."""
+    settings = Settings()
+    if settings.database_url is None:
+        open_database()  # prints the explanation
+        return 1
+    factory = sessionmaker(create_engine(settings.database_url))
+    with factory() as session:
+        repo_id = session.scalar(select(Repo.id).where(Repo.full_name == args.repo))
+    if repo_id is None:
+        print(f"atlas: {args.repo} isn't indexed", file=sys.stderr)
+        return 1
+
+    embedder = make_embeddings(settings)
+    total = 0
+    while True:
+        try:
+            summary = embed_pending(factory, embedder, repo_id)
+        except LLMError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
+        total += summary.embedded
+        print(f"embedded {total}; {summary.remaining} remaining", file=sys.stderr, flush=True)
+        if not summary.remaining:
+            return 0
+
+
+def run_ask(args: argparse.Namespace) -> int:
+    """One question, no conversation: the same retrieval and prompt as POST /ask."""
+    session = open_database()
+    if session is None:
+        return 1
+    settings = Settings()
+    embedder = make_embeddings(settings)
+    chat = make_chat(settings)
+    with session:
+        try:
+            query_vector = embedder.embed([args.question], "query")[0]
+        except LLMError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
+        sources = answer.find_sources(
+            session, args.repo, args.question, query_vector, embedder.model
+        )
+        for source in sources:
+            print(f"[{source.number}] {source.location}  {source.symbol or ''}", file=sys.stderr)
+        if not sources:
+            print(answer.NOT_FOUND)
+            return 0
+
+        request = answer.answer_request(args.question, sources, history=[])
+        try:
+            result = stream_to_stdout(chat, request)
+        except LLMError as error:
+            print(f"atlas: {error}", file=sys.stderr)
+            return 1
+        record(session, result)
+        session.commit()
+
+    cited, invalid = answer.check_citations(result.text, sources)
+    print(f"cited: {[s.number for s in cited]}; made up: {invalid}", file=sys.stderr)
+    print(
+        f"{result.model}: {result.input_tokens} tokens in, {result.output_tokens} out, "
+        f"{result.latency_ms / 1000:.1f} s, stopped: {result.stop_reason}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def run_eval(args: argparse.Namespace) -> int:
+    session = open_database()
+    if session is None:
+        return 1
+    settings = Settings()
+    chat = None if args.retrieval_only else make_chat(settings)
+    cases = evals.load_cases(args.cases)
+    started = datetime.now(UTC)
+    try:
+        with session:
+            report = evals.run_eval(session, chat, make_embeddings(settings), args.repo, cases)
+        if chat is not None and args.hand_grades is not None:
+            report["judge_agreement"] = evals.judge_agreement(chat, args.hand_grades)
+    except LLMError as error:
+        print(f"atlas: {error}", file=sys.stderr)
+        return 1
+    minutes = (datetime.now(UTC) - started).total_seconds() / 60
+    report["minutes"] = round(minutes, 1)
+
+    print(f"{len(cases)} cases in {minutes:.1f} min")
+    for mode, scores in report["scores"]["retrieval"].items():
+        values = ", ".join(f"{name} {value}" for name, value in scores.items())
+        print(f"retrieval {mode:<8} {values}")
+    if "answers" in report["scores"]:
+        values = ", ".join(f"{k} {v}" for k, v in report["scores"]["answers"].items())
+        print(f"answers   {values}")
+    if "judge_agreement" in report:
+        agreement = report["judge_agreement"]
+        agreed, graded = agreement["agreed"], agreement["graded"]
+        print(f"judge     agreed with the hand grades on {agreed} of {graded}")
+    if args.report is not None:
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+
+    if args.thresholds is None:
+        return 0
+    thresholds = json.loads(args.thresholds.read_text())
+    problems = evals.below_thresholds(report["scores"], thresholds)
+    for problem in problems:
+        print(f"FAIL {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
 def stream_to_stdout(chat: ChatProvider, request: ChatRequest) -> ChatResult:
     for event in chat.stream(request):
         if isinstance(event, TextDelta):
@@ -641,6 +772,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_sync(args)
     if args.command == "jobs":
         return run_jobs(args)
+    if args.command == "embed":
+        return run_embed(args)
+    if args.command == "ask":
+        return run_ask(args)
+    if args.command == "eval":
+        return run_eval(args)
     return run_issue_stats(args)
 
 

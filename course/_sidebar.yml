@@ -94,6 +94,9 @@ website:
           - part-6-atlas-rag/04-embeddings-and-pgvector.qmd
           - part-6-atlas-rag/05-ingestion.qmd
           - part-6-atlas-rag/06-hybrid-search.qmd
+          - part-6-atlas-rag/07-rag-answers.qmd
+          - part-6-atlas-rag/08-evaluating-rag.qmd
+          - part-6-atlas-rag/09-review-and-practice.qmd
       - section: "Part 7: Production on AWS"
         href: part-7-production-aws/index.qmd
         contents:

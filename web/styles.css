@@ -85,3 +85,10 @@ button:focus-visible, .button:focus-visible, input:focus-visible { outline: 2px 
 .snippet { color: var(--muted); }
 .meta { color: var(--muted); font-size: 0.9rem; }
 mark { background: color-mix(in srgb, var(--accent) 25%, transparent); color: inherit; }
+.exchange { border-top: 1px solid var(--border); padding: 0.75rem 0; }
+.question { font-weight: 600; }
+.answer { white-space: pre-wrap; overflow-wrap: anywhere; }
+.answer.error { color: var(--danger); }
+.sources { color: var(--muted); font-size: 0.9rem; list-style: none; padding-left: 0; overflow-wrap: anywhere; }
+.feedback { display: flex; gap: 0.5rem; color: var(--muted); }
+#new-conversation { margin-top: 0.75rem; }

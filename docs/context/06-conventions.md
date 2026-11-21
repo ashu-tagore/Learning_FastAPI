@@ -15,7 +15,7 @@
 ├── web/                    ready-made web UI (no build step)
 ├── sandbox-images/         one Dockerfile per target repo
 ├── infra/                  Terraform
-├── evals/                  evaluation datasets and runners
+├── evals/                  evaluation cases, thresholds, hand grades (runner: `atlas eval`)
 └── .github/workflows/      ci.yml, site.yml, later deploy.yml
 ```
 

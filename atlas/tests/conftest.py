@@ -85,11 +85,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E4
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from atlas.api.app import create_app  # noqa: E402
-from atlas.api.deps import get_embedder, get_queue, get_session  # noqa: E402
+from atlas.api.deps import get_chat, get_embedder, get_queue, get_session  # noqa: E402
 from atlas.api.limits import RateLimiter, ResponseCache, get_cache, get_limiter  # noqa: E402
 from atlas.config import ApiSettings  # noqa: E402
+from atlas.llm.ollama import OllamaChat  # noqa: E402
 from tests.fake_github import FakeGitHubSignIn  # noqa: E402
-from tests.fake_llm import FakeEmbeddings  # noqa: E402
+from tests.fake_llm import FakeEmbeddings, FakeOllama  # noqa: E402
 
 
 @pytest.fixture
@@ -203,12 +204,19 @@ async def api_redis(clock: FakeClock) -> AsyncIterator[tuple[RateLimiter, Respon
 
 
 @pytest.fixture
+def fake_ollama() -> FakeOllama:
+    """The chat model behind the test app: answers with whatever a test queues."""
+    return FakeOllama()
+
+
+@pytest.fixture
 def api_app(
     async_session: AsyncSession,
     api_settings: ApiSettings,
     github: FakeGitHubSignIn,
     sent_jobs: RecordingQueue,
     api_redis: tuple[RateLimiter, ResponseCache],
+    fake_ollama: FakeOllama,
 ) -> FastAPI:
     """The real app, wired to the test's rolled-back session, the fake GitHub and queue."""
     app = create_app(api_settings, github_transport=github.transport)
@@ -225,6 +233,8 @@ def api_app(
     # Semantic and hybrid search embed the query: a deterministic fake, no Ollama needed.
     embedder = FakeEmbeddings()
     app.dependency_overrides[get_embedder] = lambda: embedder
+    chat = OllamaChat(model="fake-chat", transport=fake_ollama.transport())
+    app.dependency_overrides[get_chat] = lambda: chat
     return app
 
 

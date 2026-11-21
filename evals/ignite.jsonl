@@ -1,0 +1,30 @@
+{"id": "save-every-epochs", "question": "How do I save the model every few epochs?", "expected_paths": ["ignite/handlers/checkpoint.py"]}
+{"id": "stop-on-plateau", "question": "How do I stop training when the validation loss stops improving?", "expected_paths": ["ignite/handlers/early_stopping.py"]}
+{"id": "change-lr", "question": "How do I change the learning rate while training?", "expected_paths": ["ignite/handlers/param_scheduler.py", "ignite/handlers/state_param_scheduler.py"]}
+{"id": "how-often-correct", "question": "How do I measure how often the predictions are correct?", "expected_paths": ["ignite/metrics/accuracy.py"]}
+{"id": "multi-gpu", "question": "How do I run the same training script on several GPUs or machines?", "expected_paths": ["ignite/distributed/launcher.py", "ignite/distributed/auto.py"]}
+{"id": "progress-bar", "question": "How do I show a progress bar during training?", "expected_paths": ["ignite/handlers/tqdm_logger.py"]}
+{"id": "tensorboard", "question": "How do I send metrics to TensorBoard?", "expected_paths": ["ignite/handlers/tensorboard_logger.py"]}
+{"id": "lr-finder", "question": "How do I find a good starting learning rate?", "expected_paths": ["ignite/handlers/lr_finder.py"]}
+{"id": "early-stopping-name", "question": "What does EarlyStopping do?", "expected_paths": ["ignite/handlers/early_stopping.py"]}
+{"id": "add-event-handler", "question": "What does add_event_handler do?", "expected_paths": ["ignite/engine/engine.py"]}
+{"id": "nan-loss", "question": "How do I stop training if the loss becomes NaN?", "expected_paths": ["ignite/handlers/terminate_on_nan.py"]}
+{"id": "time-limit", "question": "How do I stop training after a fixed amount of wall-clock time?", "expected_paths": ["ignite/handlers/time_limit.py"]}
+{"id": "ema", "question": "How do I keep an exponential moving average of the model's weights?", "expected_paths": ["ignite/handlers/ema_handler.py"]}
+{"id": "profile", "question": "How do I measure how long each part of training takes?", "expected_paths": ["ignite/handlers/time_profilers.py", "ignite/handlers/timing.py"]}
+{"id": "every-n", "question": "How do I run a handler only every 100 iterations?", "expected_paths": ["ignite/engine/events.py"]}
+{"id": "seed", "question": "How do I make training reproducible with a fixed random seed?", "expected_paths": ["ignite/engine/deterministic.py", "ignite/utils.py"]}
+{"id": "confusion", "question": "How do I compute a confusion matrix?", "expected_paths": ["ignite/metrics/confusion_matrix.py"]}
+{"id": "f1", "question": "How do I combine precision and recall into one score?", "expected_paths": ["ignite/metrics/fbeta.py"]}
+{"id": "running-average", "question": "How do I smooth a metric over the most recent iterations?", "expected_paths": ["ignite/metrics/running_average.py"]}
+{"id": "wandb", "question": "How do I log experiments to Weights & Biases?", "expected_paths": ["ignite/handlers/wandb_logger.py"]}
+{"id": "events", "question": "Which events does the engine fire during a run?", "expected_paths": ["ignite/engine/events.py"]}
+{"id": "resume", "question": "How do I resume training from a saved checkpoint?", "expected_paths": ["ignite/handlers/checkpoint.py"]}
+{"id": "mse", "question": "How do I compute the mean squared error?", "expected_paths": ["ignite/metrics/mean_squared_error.py"]}
+{"id": "metric-formula", "question": "How do I define a metric as a formula of other metrics?", "expected_paths": ["ignite/metrics/metrics_lambda.py"]}
+{"id": "supervised-trainer", "question": "How do I create a trainer for a supervised model?", "expected_paths": ["ignite/engine/__init__.py"]}
+{"id": "capital", "question": "What is the capital of France?", "expected_paths": []}
+{"id": "bread", "question": "How do I bake sourdough bread?", "expected_paths": []}
+{"id": "weather", "question": "Will it rain tomorrow?", "expected_paths": []}
+{"id": "kubernetes", "question": "How do I write a Kubernetes deployment manifest?", "expected_paths": []}
+{"id": "coreml", "question": "How do I export a model to Core ML for iPhones?", "expected_paths": []}
