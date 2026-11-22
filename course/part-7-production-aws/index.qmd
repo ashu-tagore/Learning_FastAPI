@@ -8,8 +8,8 @@ title: "Part 7: Production on AWS"
 
 | Lesson | Topic | Adds to the project |
 |---|---|---|
-| 7.1 | Production containers: multi-stage Dockerfiles, a non-root user, the full compose stack *(coming soon)* | Production images |
-| 7.2 | Continuous integration: required checks, dependency audit, image builds *(coming soon)* | `ci.yml` |
+| 7.1 | [Production containers: multi-stage Dockerfiles, a non-root user, the full compose stack](01-production-containers.qmd) | Production images |
+| 7.2 | [Continuous integration: required checks, dependency audit, image builds](02-continuous-integration.qmd) | `ci.yml` |
 | 7.3 | AWS foundations: accounts, IAM, regions, budgets and billing alarms *(coming soon)* | AWS account, budget |
 | 7.4 | Infrastructure as code with Terraform *(coming soon)* | `infra/` |
 | 7.5 | The network and the data: VPC, subnets, RDS, S3, SQS *(coming soon)* | Private network, database |
