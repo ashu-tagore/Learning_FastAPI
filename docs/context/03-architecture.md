@@ -168,7 +168,7 @@ Evaluation data is not in the database: cases, thresholds and hand grades are fi
 
 ## Local development stack
 
-`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage, `weed mini`), and optionally `ollama`. (At checkpoint 5, compose runs the services only: `postgres`, `redis` and `seaweedfs`; the Atlas processes run from the command line until Part 7 containerises them.) Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
+`docker compose up` starts: `api`, `worker`, `agent-worker`, `postgres` (with pgvector), `redis`, `seaweedfs` (S3-compatible object storage, `weed mini`), and optionally `ollama`. Since lesson 7.1 the Atlas processes run from one image (`atlas/Dockerfile`) as compose services under the `app` profile (`docker compose --profile app up -d --build`): `migrate` runs the migrations and exits, then `api`, `worker`, `scheduler` and `notifier` start. Plain `docker compose up -d` still starts only the backing services, for tests and the command line. Tests run against a real Postgres, not SQLite, because pgvector and full-text search are Postgres features.
 
 ## AWS deployment
 
