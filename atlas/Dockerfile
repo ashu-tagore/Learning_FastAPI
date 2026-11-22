@@ -51,7 +51,15 @@ FROM python:3.13-slim AS runtime
 # and 5.4); the slim image doesn't have it. --no-install-recommends skips the extras
 # (documentation, a mail client, Perl modules) that a plain install pulls in; the
 # package lists are deleted so they don't sit in the image.
-RUN apt-get update \
+# `upgrade` applies Debian's security fixes that the base image doesn't have yet: the
+# image scan found one (zlib) days after Debian had released it (lesson 7.1). The price:
+# builds on different days can differ, so CI rebuilds and rescans regularly (lesson 7.2).
+# The package mirror over HTTPS, not the image's default HTTP: apt checks signatures
+# either way, but HTTPS also hides which packages are fetched, and some networks (company
+# proxies, the machine this course was built on) allow nothing else.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 

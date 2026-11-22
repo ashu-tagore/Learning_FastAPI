@@ -88,6 +88,8 @@ Part 7 can't be written before Parts 5 and 6 exist: its lessons deploy their cod
 | 7.13 | Incident response | A real outage from the 7.14 drill, replayed | On-call, runbooks, blameless postmortems | A written postmortem |
 | 7.14 | Review and practice | | Game-day failure drill | |
 
+Found while building 7.1, for 7.12 (old 7.9, Reliability) to start from: when Redis lost its data (a restarted container, no volume), jobs waiting to retry stayed `queued` forever. Their queue messages were gone, and the scheduler re-sends only jobs that never started (lesson 5.2). Jobs 27, 29 and 31 had to be re-sent by hand.
+
 Part 7 grows from 14 to 17 lessons (7.5 and 7.7 split). Final curriculum: 103 lessons. The split ids (7.5a and so on) became proper numbers when M7 started (D31): 7.5a to 7.5c are 7.5 to 7.7, 7.6 is 7.8, 7.7a and 7.7b are 7.9 and 7.10, and 7.8 to 7.14 are 7.11 to 7.17.
 
 ## Risks
