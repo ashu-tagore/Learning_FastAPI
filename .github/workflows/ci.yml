@@ -1,11 +1,12 @@
 name: CI
 
+# On every pull request, not only those touching atlas/: the jobs here are required checks
+# (lesson 7.2), so they must report a result on every pull request, including ones that
+# only change lessons. Without path filters there is no case where they don't run.
 on:
   push:
     branches: [main]
-    paths: ["atlas/**", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["atlas/**", ".github/workflows/ci.yml"]
   # Weekly, with no code change: the image is rebuilt with that week's security updates and
   # scanned against that week's vulnerability database, and dependencies are audited
   # against newly published advisories (lesson 7.2).
