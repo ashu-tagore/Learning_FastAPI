@@ -35,9 +35,12 @@ class FakeOllama:
         if not body["stream"]:
             message = {"role": "assistant", "content": text}
             return httpx.Response(200, json={"message": message, **final})
+        # Word by word, each after the first carrying its leading space, as Ollama sends them.
+        words = text.split(" ")
+        pieces = words[:1] + [" " + word for word in words[1:]]
         lines = [
-            json.dumps({"message": {"role": "assistant", "content": word}, "done": False})
-            for word in text.split(" ")
+            json.dumps({"message": {"role": "assistant", "content": piece}, "done": False})
+            for piece in pieces
         ]
         lines.append(json.dumps({"message": {"role": "assistant", "content": ""}, **final}))
         return httpx.Response(200, content="\n".join(lines).encode())

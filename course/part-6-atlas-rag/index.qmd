@@ -14,6 +14,6 @@ title: "Part 6: AI engineering: Atlas"
 | 6.4 | [Embeddings and vector search with pgvector](04-embeddings-and-pgvector.qmd) | Vector column, HNSW index |
 | 6.5 | [Ingestion: chunking Markdown by heading and Python by `ast`, incremental re-index](05-ingestion.qmd) | Ingest pipeline |
 | 6.6 | [Retrieval: hybrid search, reciprocal rank fusion, filters](06-hybrid-search.qmd) | `/search?mode=hybrid` |
-| 6.7 | RAG answers with citations, streamed over SSE, conversation history *(coming soon)* | `/ask` |
-| 6.8 | Evaluating RAG: datasets, recall@k, answer grading, regression checks in CI *(coming soon)* | `evals/` |
-| 6.9 | Review and practice *(coming soon)* | Unguided: "explain this file" feature |
+| 6.7 | [RAG answers with citations, streamed over SSE, conversation history](07-rag-answers.qmd) | `/ask` |
+| 6.8 | [Evaluating RAG: datasets, recall@k, answer grading, regression checks in CI](08-evaluating-rag.qmd) | `evals/` |
+| 6.9 | [Review and practice](09-review-and-practice.qmd) | Unguided: "explain this file" feature |

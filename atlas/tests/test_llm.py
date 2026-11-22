@@ -85,9 +85,9 @@ def test_streaming_yields_pieces_then_the_totals(
     events = list(local_chat.stream(request()))
 
     pieces = [event.text for event in events if isinstance(event, TextDelta)]
-    assert pieces == ["It", "runs", "the", "loop."]
+    assert pieces == ["It", " runs", " the", " loop."]
     assert isinstance(events[-1], ChatResult)
-    assert events[-1].text == "Itrunstheloop."  # the fake splits on spaces, then drops them
+    assert events[-1].text == "It runs the loop."
 
 
 def test_a_busy_server_is_retried(local_chat: OllamaChat, ollama: FakeOllama) -> None:

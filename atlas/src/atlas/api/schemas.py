@@ -261,6 +261,96 @@ class NoteOut(BaseModel):
 # ---------- Errors ----------
 
 
+class AskIn(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+    repo: RepoFullName = "pytorch/ignite"
+    # Continue a conversation; its repository wins over `repo`.
+    conversation_id: int | None = None
+
+
+class SourceOut(BaseModel):
+    """A chunk the model was given, numbered as the answer cites it."""
+
+    number: int
+    path: str
+    start_line: int
+    end_line: int
+    symbol: str | None
+    url: str | None  # GitHub, at the indexed commit; None for a folder indexed locally
+
+
+class AnswerDone(BaseModel):
+    """The last event of an answer: where it was stored and what it cited."""
+
+    conversation_id: int
+    message_id: int
+    cited: list[int]
+    # Numbers the answer cites that match no source: shown to the reader as a warning.
+    invalid_citations: list[int]
+    # "end", or "max_tokens" when the answer was cut off; "not_found" when no model ran.
+    stop_reason: str
+
+
+class ExplainIn(BaseModel):
+    repo: RepoFullName = "pytorch/ignite"
+    path: str = Field(min_length=1, max_length=500)
+
+
+class ExplainDone(BaseModel):
+    """The last event of an explanation (lesson 6.9). Explanations aren't stored."""
+
+    cited: list[int]
+    invalid_citations: list[int]
+    stop_reason: str
+    # The file had more chunks than were sent: the explanation covers only its start.
+    truncated: bool
+
+
+class ConversationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    repo_full_name: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class CitationOut(BaseModel):
+    number: int
+    path: str
+    start_line: int
+    end_line: int
+    symbol: str | None
+    url: str | None
+
+
+class MessageOut(BaseModel):
+    id: int
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: datetime
+    citations: list[CitationOut]
+    rating: Literal["up", "down"] | None
+
+
+class ConversationDetail(ConversationOut):
+    messages: list[MessageOut]
+
+
+class FeedbackIn(BaseModel):
+    rating: Literal["up", "down"]
+    note: str = Field(default="", max_length=1000)
+
+
+class FeedbackOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    message_id: int
+    rating: Literal["up", "down"]
+    note: str
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str

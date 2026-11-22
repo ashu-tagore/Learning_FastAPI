@@ -34,13 +34,23 @@
 
     <section id="app" hidden>
       <nav class="tabs" role="tablist">
-        <button role="tab" data-tab="search" aria-selected="true">Search</button>
+        <button role="tab" data-tab="ask" aria-selected="true">Ask</button>
+        <button role="tab" data-tab="search" aria-selected="false">Search</button>
         <button role="tab" data-tab="issues">Issues</button>
         <button role="tab" data-tab="saved">Saved</button>
         <button role="tab" data-tab="profile">Profile</button>
       </nav>
 
-      <div data-panel="search" class="panel">
+      <div data-panel="ask" class="panel">
+        <form id="ask-form" class="row">
+          <input id="question" placeholder="e.g. How do I stop training early?" aria-label="Your question" maxlength="1000" required>
+          <button type="submit">Ask</button>
+        </form>
+        <button id="new-conversation" type="button" class="secondary" hidden>New conversation</button>
+        <div id="exchanges"></div>
+      </div>
+
+      <div data-panel="search" class="panel" hidden>
         <form id="search-form" class="row">
           <input id="query" type="search" placeholder="e.g. event handler" aria-label="Search the codebase" required>
           <button type="submit">Search</button>

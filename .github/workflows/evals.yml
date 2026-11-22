@@ -1,0 +1,96 @@
+name: Evals
+
+# The full evaluation (lesson 6.8): index and embed PyTorch-Ignite at a pinned commit, answer
+# every question in evals/ignite.jsonl with the local models, judge the answers, and fail
+# if a score falls below evals/thresholds.json. About an hour on a GitHub runner's CPU,
+# so it runs separately from the fast CI job, which it doesn't slow down.
+on:
+  push:
+    branches: [main]
+    paths: ["atlas/**", "evals/**", ".github/workflows/evals.yml"]
+  pull_request:
+    paths: ["atlas/**", "evals/**", ".github/workflows/evals.yml"]
+  workflow_dispatch:
+
+env:
+  # The commit the cases' expected files were checked against. Moving it means checking
+  # the cases again: files move, and questions can stop having the answer they expect.
+  IGNITE_COMMIT: 0abbcab445634b98efcdc6e2d19e3235c0e13e3d
+  CHAT_MODEL: qwen3:1.7b
+  EMBEDDING_MODEL: nomic-embed-text
+  OLLAMA_IMAGE: ollama/ollama:0.40.16
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: atlas
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas-test-password
+          POSTGRES_DB: atlas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atlas -d atlas"
+          --health-interval 2s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+psycopg://atlas:atlas-test-password@localhost:5432/atlas
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      # The models are 1.4 GB together; cached between runs so only the first one downloads.
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ~/ollama-models
+          key: ollama-${{ env.CHAT_MODEL }}-${{ env.EMBEDDING_MODEL }}
+      # Not a service: services start before the cache is restored. Run as the runner's
+      # user, so the cache step can read the model files afterwards.
+      - name: Start Ollama
+        run: |
+          mkdir -p ~/ollama-models
+          docker run -d --name ollama -p 11434:11434 --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e OLLAMA_MODELS=/models -v ~/ollama-models:/models "$OLLAMA_IMAGE"
+          for attempt in $(seq 30); do
+            curl -sf http://localhost:11434/api/version && break
+            sleep 2
+          done
+          docker exec ollama ollama pull "$CHAT_MODEL"
+          docker exec ollama ollama pull "$EMBEDDING_MODEL"
+
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Create the tables
+        run: uv run atlas init-db
+
+      - name: Index Ignite at the pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/ignite"
+          git -C "$RUNNER_TEMP/ignite" fetch -q --depth 1 https://github.com/pytorch/ignite.git "$IGNITE_COMMIT"
+          git -C "$RUNNER_TEMP/ignite" checkout -q FETCH_HEAD
+          uv run atlas index --path "$RUNNER_TEMP/ignite" --repo pytorch/ignite
+      - name: Embed
+        run: uv run atlas embed --repo pytorch/ignite
+
+      - name: Evaluate
+        run: >-
+          uv run atlas eval --cases ../evals/ignite.jsonl
+          --thresholds ../evals/thresholds.json
+          --hand-grades ../evals/hand_grades.jsonl
+          --report "$RUNNER_TEMP/eval-report.json"
+      # Kept even when the evaluation fails: the report says which cases got worse.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: ${{ runner.temp }}/eval-report.json
+          if-no-files-found: ignore

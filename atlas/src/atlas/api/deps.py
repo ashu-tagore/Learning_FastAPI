@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from atlas.api.errors import ApiError
 from atlas.config import ApiSettings
-from atlas.llm import EmbeddingProvider
+from atlas.llm import ChatProvider, EmbeddingProvider
 from atlas.models import User
 from atlas.queue import JobQueue
 from atlas.security import InvalidToken, decode_access_token
@@ -46,6 +46,11 @@ def get_embedder(request: Request) -> EmbeddingProvider:
     return embedder
 
 
+def get_chat(request: Request) -> ChatProvider:
+    chat: ChatProvider = request.app.state.chat
+    return chat
+
+
 def get_snapshots(request: Request) -> SnapshotStore:
     snapshots: SnapshotStore = request.app.state.snapshots
     return snapshots
@@ -56,6 +61,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 QueueDep = Annotated[JobQueue, Depends(get_queue)]
 SnapshotsDep = Annotated[SnapshotStore, Depends(get_snapshots)]
 EmbedderDep = Annotated[EmbeddingProvider, Depends(get_embedder)]
+ChatDep = Annotated[ChatProvider, Depends(get_chat)]
 
 
 async def get_current_user(

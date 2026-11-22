@@ -163,6 +163,165 @@ document.querySelectorAll("[role=tab]").forEach((tab) => {
   });
 });
 
+// ---------- Ask (Server-Sent Events over fetch) ----------
+
+// EventSource, the browser's built-in SSE client, can only send GET requests without
+// headers. /ask needs POST with a JSON body and a bearer token, so this reads the
+// stream with fetch and splits it into events by hand: blank lines end an event, and
+// each line inside is "field: value".
+async function* serverSentEvents(response) {
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += value;
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop(); // the last piece may be an event that hasn't fully arrived
+    for (const block of blocks) {
+      const fields = {};
+      for (const line of block.split("\n")) {
+        const isComment = line.startsWith(":"); // ": ping" keep-alives
+        const separator = line.indexOf(": ");
+        if (isComment || separator === -1) continue;
+        fields[line.slice(0, separator)] = line.slice(separator + 2);
+      }
+      if (fields.event) yield { event: fields.event, data: JSON.parse(fields.data) };
+    }
+  }
+}
+
+let conversationId = null;
+
+// The answer's text with each [n] turned into a link to the cited lines. Built from text
+// nodes, never innerHTML: the model's output is untrusted, like any user input.
+function withCitationLinks(text, sources) {
+  const urls = new Map(sources.map((source) => [source.number, source.url]));
+  const fragment = document.createDocumentFragment();
+  text.split(/(\[\d+\])/).forEach((part) => {
+    const number = Number(part.slice(1, -1));
+    const isCitation = /^\[\d+\]$/.test(part) && urls.get(number);
+    if (!isCitation) {
+      fragment.append(document.createTextNode(part));
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = urls.get(number);
+    link.textContent = part;
+    link.target = "_blank";
+    link.rel = "noopener";
+    fragment.append(link);
+  });
+  return fragment;
+}
+
+function sourceItem(source) {
+  const item = document.createElement("li");
+  const label = `[${source.number}] ${source.path}:${source.start_line}-${source.end_line}`;
+  const target = source.url ? document.createElement("a") : document.createElement("span");
+  if (source.url) {
+    target.href = source.url;
+    target.target = "_blank";
+    target.rel = "noopener";
+  }
+  target.textContent = source.symbol ? `${label} ${source.symbol}` : label;
+  item.append(target);
+  return item;
+}
+
+function feedbackButtons(messageId) {
+  const box = document.createElement("div");
+  box.className = "feedback";
+  for (const rating of ["up", "down"]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = rating === "up" ? "Helpful" : "Not helpful";
+    button.addEventListener("click", async () => {
+      await api(`/answers/${messageId}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rating }),
+      });
+      box.textContent = "Thanks for the rating.";
+    });
+    box.append(button);
+  }
+  return box;
+}
+
+async function askQuestion(question) {
+  const exchange = document.createElement("section");
+  exchange.className = "exchange";
+  const asked = document.createElement("p");
+  asked.className = "question";
+  asked.textContent = question;
+  const answer = document.createElement("p");
+  answer.className = "answer";
+  answer.textContent = "Searching the code...";
+  const sourcesList = document.createElement("ol");
+  sourcesList.className = "sources";
+  exchange.append(asked, answer, sourcesList);
+  $("#exchanges").append(exchange);
+
+  // Not through api(): that helper reads the whole body as JSON, and this body is a stream.
+  // On a 401 it refreshes the token once, as api() does.
+  const send = () =>
+    fetch("/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokens.access}` },
+      body: JSON.stringify({ question, conversation_id: conversationId }),
+    });
+  let response = await send();
+  if (response.status === 401 && (await refreshTokens())) response = await send();
+  if (!response.ok) {
+    const body = await response.json();
+    answer.textContent = body.error ? body.error.message : `HTTP ${response.status}`;
+    return;
+  }
+
+  let sources = [];
+  let text = "";
+  for await (const { event, data } of serverSentEvents(response)) {
+    if (event === "sources") {
+      sources = data;
+      sourcesList.replaceChildren(...sources.map(sourceItem));
+      answer.textContent = sources.length ? "Reading the sources..." : "";
+    } else if (event === "delta") {
+      text += data.text;
+      answer.textContent = text; // plain text while it streams; links once it's complete
+    } else if (event === "done") {
+      answer.replaceChildren(withCitationLinks(text, sources));
+      if (data.invalid_citations.length) {
+        const warning = document.createElement("p");
+        warning.className = "message error";
+        warning.textContent = `This answer cites sources that don't exist: ${data.invalid_citations.join(", ")}.`;
+        exchange.append(warning);
+      }
+      conversationId = data.conversation_id;
+      $("#new-conversation").hidden = false;
+      exchange.append(feedbackButtons(data.message_id));
+    } else if (event === "error") {
+      answer.textContent = data.message;
+      answer.classList.add("error");
+    }
+  }
+}
+
+$("#ask-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = $("#question").value.trim();
+  if (!question) return;
+  $("#question").value = "";
+  await askQuestion(question);
+});
+
+$("#new-conversation").addEventListener("click", () => {
+  conversationId = null;
+  $("#exchanges").replaceChildren();
+  $("#new-conversation").hidden = true;
+});
+
 // ---------- Search (offset pagination) ----------
 
 let searchOffset = 0;
