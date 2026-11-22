@@ -390,7 +390,17 @@ After committing the regenerated pages: `exit code 0`. Should it be required? It
 
 ## Stretch
 
-STRETCH_72
+Measure what the layer cache saves in CI. GitHub's Actions API reports each step's start and end; compare the Build step of two runs of the `image` job on the same pull request, the first with an empty cache and a later one. For this lesson's pull request:
+
+```text
+first run  (empty cache)          Build 61 s   image job 1 min 46 s
+second run (cache from the first) Build  9 s   image job    38 s
+```
+
+The second push changed only a lesson file, nothing under `atlas/`, so every layer, Atlas's own included, came from the cache; a push that changes Atlas's code would also rebuild the small last layers (about 1 MB, lesson 7.1), and a change to `uv.lock` the 185 MB dependency layer. Two things to find out yourself:
+
+- Push a one-line change to a Python file and measure the Build step again. Where does it land between 9 and 61 seconds, and why?
+- Actions caches are scoped: not every run can read every cache. Look up in GitHub's documentation on dependency caching which caches a pull request's run may restore. What does that mean for the first run of every new pull request, and what would the `push` trigger's runs on `main` change?
 
 ## What changed in the project
 
