@@ -1,6 +1,6 @@
 # 04. Curriculum
 
-100 lessons in 10 parts. Each part ends at a **checkpoint**: a git tag where the reference implementation works and its tests pass. "Builds" says what the lesson adds to the project.
+103 lessons in 10 parts. Each part ends at a **checkpoint**: a git tag where the reference implementation works and its tests pass. "Builds" says what the lesson adds to the project.
 
 Lesson ids are `P.N` (part, number). Lesson files live at `course/part-P-<slug>/NN-<slug>.qmd`.
 
@@ -125,24 +125,27 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 
 **Checkpoint 6:** Atlas answers questions about PyTorch-Ignite with `file:line` citations, and its quality is measured.
 
-## Part 7: Production on AWS (14)
+## Part 7: Production on AWS (17)
 
 | Id | Lesson | Builds |
 |---|---|---|
-| 7.1 | Containers for real: multi-stage Dockerfiles, the full compose stack | Production images |
-| 7.2 | Continuous integration: lint, types, tests, dependency audit, image builds | `ci.yml` |
-| 7.3 | AWS foundations: accounts, IAM, regions, VPC, budgets and billing alarms | AWS account, budget |
+| 7.1 | Production containers: multi-stage Dockerfiles, a non-root user, the full compose stack | Production images |
+| 7.2 | Continuous integration: required checks, dependency audit, image builds | `ci.yml` |
+| 7.3 | AWS foundations: accounts, IAM, regions, budgets and billing alarms | AWS account, budget |
 | 7.4 | Infrastructure as code with Terraform | `infra/` |
-| 7.5 | Deploying Atlas: ECR, ECS Fargate, RDS, S3, SQS, ALB, Secrets Manager, CloudFront | Live environment |
-| 7.6 | Continuous delivery: deploy pipeline, migrations on deploy, rollbacks | `deploy.yml` |
-| 7.7 | Databases in production: replication, backups and a restore drill, connection pooling, zero-downtime schema changes | Backup policy, pooler |
-| 7.8 | Observability: structured logs, metrics, traces, LLM cost dashboards, alerts | Dashboards, alarms |
-| 7.9 | Reliability: health checks, graceful shutdown, timeouts, retries, circuit breakers | Hardening |
-| 7.10 | Security across the system: threat modelling, OWASP Top 10, secrets, supply-chain security | Threat model, scans |
-| 7.11 | Privacy and personal data: what to store, retention, deletion | Data retention job |
-| 7.12 | Performance: load testing, profiling, capacity planning | Load test script |
-| 7.13 | Incident response: on-call, runbooks, blameless postmortems | Runbooks |
-| 7.14 | Review and practice | Unguided: a game-day failure drill |
+| 7.5 | The network and the data: VPC, subnets, RDS, S3, SQS | Private network, database |
+| 7.6 | Running Atlas: ECR, ECS Fargate, load balancer, health checks, Secrets Manager | Live services |
+| 7.7 | The front door: CloudFront, HTTPS, caching | Public URL |
+| 7.8 | Continuous delivery: deploy pipeline, migrations on deploy, rollbacks | `deploy.yml` |
+| 7.9 | Backups and a restore drill: point-in-time recovery, RPO and RTO | Backup policy, measured restore |
+| 7.10 | Databases under load: connection pooling, zero-downtime schema changes | Pooler, safe migrations |
+| 7.11 | Observability in production: metrics, traces, LLM cost dashboards, alerts | Dashboards, alarms |
+| 7.12 | Reliability: timeouts, retries, circuit breakers, graceful shutdown | Hardening |
+| 7.13 | Security across the system: threat modelling, OWASP Top 10, secrets, supply-chain security | Threat model, scans |
+| 7.14 | Privacy and personal data: what to store, retention, deletion | Data retention job |
+| 7.15 | Performance: load testing, profiling, capacity planning | Load test script |
+| 7.16 | Incident response: on-call, runbooks, blameless postmortems | Runbooks |
+| 7.17 | Review and practice | Unguided: a game-day failure drill |
 
 **Checkpoint 7:** Atlas runs on AWS, deployed by CI/CD, observable, secure and within budget.
 

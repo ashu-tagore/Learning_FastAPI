@@ -14,7 +14,7 @@ How the work is sequenced. Each milestone produces lessons **and** reference cod
 | D1 | Part 4 depth pass | Part 4 grows to 20 lessons, failure-first and test-first; Part 7 designed in depth ([08-depth-pass.md](08-depth-pass.md)) | Part 4 done (20 lessons, 126 tests, 94% coverage); Part 7 design fixed, written in M7 |
 | M5 | Part 5 | 7 lessons; worker, queue, webhooks, storage, cache, event streams | Done: block A (5.1 to 5.3: queue, worker, scheduler, webhooks, incremental sync) and block B (5.4 to 5.7: snapshots, cache and rate limits, event stream and notifier, daily digest); 191 tests, 91% coverage |
 | M6 | Part 6 | 9 lessons; providers, ingestion, hybrid search, `/ask`, evals | Done (local models by default, D28): block A (6.1 to 6.3: provider interface, cost log, fit scoring), block B (6.4 to 6.6: embeddings in pgvector, structural chunking, hybrid search, D29) and block C (6.7 to 6.9: `/ask` with citations over SSE, evaluation in CI, explain this file, D30) |
-| M7 | Part 7 | 14 lessons; Terraform, ECS deploy, CI/CD, database operations, observability, security, privacy, incident response | Not started |
+| M7 | Part 7 | 17 lessons; Terraform, ECS deploy, CI/CD, database operations, observability, security, privacy, incident response | In progress (D31): block A (renumbering, 7.1 containers, 7.2 CI) under way; lessons that need AWS paused until an account exists |
 | M8 | Part 8 | 10 lessons; agent runs, sandbox, Issue Briefs, web UI v2 | Not started |
 | M9 | Part 9 | 6 lessons; distributed systems, design docs, outbox, unguided capstone, career material | Not started |
 

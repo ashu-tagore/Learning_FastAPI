@@ -53,7 +53,7 @@ Logs are the main way to understand a running system you can't attach a debugger
 - **Metrics**: numbers aggregated over time. "1.2% of requests failed in the last 5 minutes; 99% finished within 300 ms."
 - **Traces**: the path of one request through every service it touched, with timings for each step.
 
-Part 4 builds logs, because they're the foundation and every later part produces them. Lesson 7.8 adds metrics, traces and alerts.
+Part 4 builds logs, because they're the foundation and every later part produces them. Lesson 7.11 adds metrics, traces and alerts.
 
 ### Structured logging
 
@@ -74,7 +74,7 @@ Lesson 4.14's middleware gives each request an id. To put it on *every* line log
 Logs are copied widely (to log services, to support tickets, to laptops), kept for months, and readable by more people than your database. So:
 
 - **Never**: passwords, tokens, API keys, session cookies, full request or response bodies.
-- **Avoid**: query strings (they can carry search text or, in careless clients, tokens; lesson 4.8), personal data beyond an internal user id (lesson 7.11 covers retention).
+- **Avoid**: query strings (they can carry search text or, in careless clients, tokens; lesson 4.8), personal data beyond an internal user id (lesson 7.14 covers retention).
 - **Always**: the request id, what happened, how long it took, and for errors the full traceback.
 
 ```{mermaid}
@@ -282,7 +282,7 @@ ERROR unhandled error  sqlalchemy.exc.OperationalError: (psycopg.OperationalErro
 
 Request `/issues`, failed after 3.7 ms, because the database refused connections. Notice too that `/search` took 320 ms: something to look at before anyone complains, and the kind of question this lesson's stretch answers from these lines.
 
-One thing remains untidy: when a request crashes, Uvicorn still prints its own plain-text traceback ("Exception in ASGI application") next to Atlas's JSON line, and its startup messages are plain text too. Lesson 7.8 configures Uvicorn's own loggers to write JSON as well; for now, Atlas's lines are the ones to search.
+One thing remains untidy: when a request crashes, Uvicorn still prints its own plain-text traceback ("Exception in ASGI application") next to Atlas's JSON line, and its startup messages are plain text too. Lesson 7.11 configures Uvicorn's own loggers to write JSON as well; for now, Atlas's lines are the ones to search.
 
 ## Trade-offs: how to log *(deep dive)*
 
@@ -292,7 +292,7 @@ One thing remains untidy: when a request crashes, Uvicorn still prints its own p
 | `logging` with text format | humans reading a terminal | every question needs a new text search |
 | `logging` with a JSON formatter (Atlas) | log services, `grep` plus a small script | less pleasant to read raw; a small amount of code to own |
 | A structured-logging library (structlog) | bigger apps: key-value logging everywhere, development and production renderers | one more dependency to learn |
-| OpenTelemetry logs and traces | many services, one trace across all of them | setup and a collector to run (lesson 7.8) |
+| OpenTelemetry logs and traces | many services, one trace across all of them | setup and a collector to run (lesson 7.11) |
 
 Atlas's ~50-line module is enough for one service, and it uses only the standard library, so everything it does is visible. If a later part needs more, structlog or OpenTelemetry slot in behind the same idea: fields, not prose; ids on everything.
 
@@ -373,7 +373,7 @@ Run it with `uv run uvicorn ... 2>&1 | tee api.log`, then `python3 slowest.py < 
 /health                            1 requests  slowest      1.3 ms
 ```
 
-Search is usually the slowest route: full-text ranking over thousands of chunks. Lesson 7.8 turns the same numbers into metrics with percentiles.
+Search is usually the slowest route: full-text ranking over thousands of chunks. Lesson 7.11 turns the same numbers into metrics with percentiles.
 :::
 
 ## What changed in the project

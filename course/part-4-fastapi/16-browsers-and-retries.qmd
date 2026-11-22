@@ -267,7 +267,7 @@ Grace asked to add `sktime/sktime`, and got back Ada's stored response for `pyto
 
 ## Trade-offs: cookies, CSRF and keys *(deep dive)*
 
-**Why the CORS story would be different with cookies.** Atlas sends its token in an `Authorization` header, which a page on another origin can't add for you. If Atlas used a **session cookie** instead, the browser would attach it automatically to *any* request to Atlas, including one sent by a hostile page. CORS would stop that page reading the answer, but, as the log showed, the request would still run. A hostile page could make a logged-in user's browser `POST /repos` or delete a note. That's **CSRF** (cross-site request forgery), and cookie-based APIs defend against it with `SameSite` cookies and CSRF tokens (lesson 7.10).
+**Why the CORS story would be different with cookies.** Atlas sends its token in an `Authorization` header, which a page on another origin can't add for you. If Atlas used a **session cookie** instead, the browser would attach it automatically to *any* request to Atlas, including one sent by a hostile page. CORS would stop that page reading the answer, but, as the log showed, the request would still run. A hostile page could make a logged-in user's browser `POST /repos` or delete a note. That's **CSRF** (cross-site request forgery), and cookie-based APIs defend against it with `SameSite` cookies and CSRF tokens (lesson 7.13).
 
 | Approach | CORS's role | CSRF risk | Token theft risk |
 |---|---|---|---|

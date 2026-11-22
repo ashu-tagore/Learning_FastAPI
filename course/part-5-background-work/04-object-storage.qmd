@@ -369,7 +369,7 @@ What the attacker *can* do: download that one snapshot, repeatedly, for up to fi
 
 ## Trade-offs *(deep dive)*
 
-**Postgres instead.** A `bytea` column can hold the archive, with transactions and one fewer service. But large values make the database bigger, its backups slower (lesson 7.7a), and every download would pass through the API and a database connection. Databases are for data you query; object storage is for bytes you fetch whole.
+**Postgres instead.** A `bytea` column can hold the archive, with transactions and one fewer service. But large values make the database bigger, its backups slower (lesson 7.9), and every download would pass through the API and a database connection. Databases are for data you query; object storage is for bytes you fetch whole.
 
 **A shared disk.** A network file system mounted on every machine (Amazon EFS, say) looks like local files. It's more expensive per gigabyte, needs mounting everywhere, and can't hand a browser a link. Object storage is reached over HTTP from anywhere, with permissions per request.
 

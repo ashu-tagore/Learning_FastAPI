@@ -135,7 +135,7 @@ KeyboardInterrupt
 
 ### Why this matters: graceful shutdown
 
-When you deploy a new version of a web service (Part 7), the platform sends the old processes `SIGTERM`, waits a few seconds, then sends `SIGKILL`. A well-behaved server uses that window to finish the requests it's handling, close database connections and exit. A badly behaved one is killed mid-request, and users see errors on every deploy. Uvicorn, the server that runs FastAPI, handles this for you; lesson 7.9 checks that it's configured properly.
+When you deploy a new version of a web service (Part 7), the platform sends the old processes `SIGTERM`, waits a few seconds, then sends `SIGKILL`. A well-behaved server uses that window to finish the requests it's handling, close database connections and exit. A badly behaved one is killed mid-request, and users see errors on every deploy. Uvicorn, the server that runs FastAPI, handles this for you; lesson 7.12 checks that it's configured properly.
 
 ```{mermaid}
 sequenceDiagram

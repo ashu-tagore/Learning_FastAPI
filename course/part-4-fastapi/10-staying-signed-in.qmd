@@ -270,7 +270,7 @@ attacker tries their new token         -> 401 Invalid refresh token
 
 The moment Grace's app presented the already-used token, Atlas revoked every refresh token of hers, including the one it had just given the attacker. The attacker keeps the access token from that first refresh for at most 15 minutes, and then they're out.
 
-Reuse detection can't prevent the theft, and it can't tell the attacker from Grace. What it does is turn a silent, permanent compromise into one that is short, and noticed: in Part 7 the same event can raise an alert (lesson 7.8).
+Reuse detection can't prevent the theft, and it can't tell the attacker from Grace. What it does is turn a silent, permanent compromise into one that is short, and noticed: in Part 7 the same event can raise an alert (lesson 7.11).
 
 ## Trade-offs: where should the client keep the refresh token? *(deep dive)*
 
@@ -281,7 +281,7 @@ Reuse detection can't prevent the theft, and it can't tell the attacker from Gra
 | `HttpOnly` cookie | no | yes, to the API | other sites can trigger requests that carry it (CSRF), so it needs `SameSite` and CSRF protection |
 | Mobile app secure storage | no (other apps) | no | lost or rooted devices |
 
-Atlas's ready-made UI uses `sessionStorage` and loads no third-party scripts, which keeps it simple for this course. Many production web apps put the refresh token in an `HttpOnly`, `SameSite` cookie scoped to the refresh route only, so page scripts never see it; lesson 7.10 revisits this with the full threat model. Rotation and reuse detection help in every row of the table: whatever the theft route, a copied token can be used at most once without being noticed.
+Atlas's ready-made UI uses `sessionStorage` and loads no third-party scripts, which keeps it simple for this course. Many production web apps put the refresh token in an `HttpOnly`, `SameSite` cookie scoped to the refresh route only, so page scripts never see it; lesson 7.13 revisits this with the full threat model. Rotation and reuse detection help in every row of the table: whatever the theft route, a copied token can be used at most once without being noticed.
 
 ## Common mistakes
 

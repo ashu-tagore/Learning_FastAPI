@@ -49,7 +49,7 @@ unsafe: 5
 safe:   0
 ```
 
-The "title" a user typed rewrote the query itself: `OR '1'='1'` is always true, so it matched every row. This is **SQL injection**, one of the oldest and most damaging security holes on the web (lesson 7.10): the same trick can read other users' data or delete tables. With a placeholder, the input is only ever treated as a value, and no title equals that strange string.
+The "title" a user typed rewrote the query itself: `OR '1'='1'` is always true, so it matched every row. This is **SQL injection**, one of the oldest and most damaging security holes on the web (lesson 7.13): the same trick can read other users' data or delete tables. With a placeholder, the input is only ever treated as a value, and no title equals that strange string.
 
 ## SQLAlchemy: the ORM
 

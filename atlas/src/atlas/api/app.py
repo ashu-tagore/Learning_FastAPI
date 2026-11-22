@@ -194,7 +194,7 @@ def create_app(
             await session.execute(text("SELECT 1"))
         except OperationalError:
             # 503, not 500: nothing is broken in this process, it just can't serve yet.
-            # Load balancers stop sending traffic on 503 and retry later (lesson 7.9).
+            # Load balancers stop sending traffic on 503 and retry later (lesson 7.6).
             raise ApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "database_unavailable",
