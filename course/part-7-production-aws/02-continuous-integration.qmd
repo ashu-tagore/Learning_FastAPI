@@ -330,7 +330,30 @@ Every pull request would wait about an hour, including ones that only change les
 Add a check that the generated course pages are up to date to the CI workflow, as a third job, so it can be required too. (The site workflow already runs `generate_part_pages.py`, but only when `course/` changes.) Then decide: should it be required?
 
 ::: {.callout-tip collapse="true" title="Solution"}
-EXERCISE_72
+```yaml
+  pages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generated course pages are up to date
+        run: |
+          python3 course/_tools/generate_part_pages.py
+          git diff --exit-code course/
+```
+
+`git diff --exit-code` exits with 1 when the working tree differs from what's committed, so the job fails if regenerating changed anything. It caught a real slip while this lesson was being written: lesson 7.1's file had been committed without regenerating the pages.
+
+```text
+$ git diff --stat --exit-code -- course/_sidebar.yml course/part-7-production-aws/index.qmd
+ course/_sidebar.yml                    | 3 ++-
+ course/part-7-production-aws/index.qmd | 4 ++--
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+exit code: 1
+-| 7.2 | Continuous integration: required checks, dependency audit, image builds *(coming soon)* | `ci.yml` |
++| 7.2 | [Continuous integration: required checks, dependency audit, image builds](02-continuous-integration.qmd) | `ci.yml` |
+```
+
+After committing the regenerated pages: `exit code 0`. Should it be required? It takes seconds, never fails at random, and guards against a mistake that has happened: yes. Not in the reference code, where the site workflow runs the same check for pull requests that change `course/`.
 :::
 
 ## Stretch
