@@ -40,29 +40,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------- Stage 3: what actually runs ----------
 FROM python:3.13-slim AS runtime
 
-# A user with no password, no shell login and no rights beyond its own home: if Atlas
-# is ever compromised, the attacker is this user, not root (lesson 2.4).
-# pip goes: nothing installs packages at runtime, and its bundled copies of urllib3 and
-# msgpack were the only fixable high-severity findings in the image scan (lesson 7.1).
-# The clones folder is created here, owned by atlas: a volume mounted on a folder that
-# doesn't exist in the image is created as root, and the worker couldn't write to it
-# (lesson 7.1).
 # git, because the worker clones repositories and `git archive`s snapshots (lessons 5.3
 # and 5.4); the slim image doesn't have it. --no-install-recommends skips the extras
-# (documentation, a mail client, Perl modules) that a plain install pulls in; the
+# (documentation, a mail client, Perl modules) that a plain install pulls in, and the
 # package lists are deleted so they don't sit in the image.
-# `upgrade` applies Debian's security fixes that the base image doesn't have yet: the
-# image scan found one (zlib) days after Debian had released it (lesson 7.1). The price:
-# builds on different days can differ, so CI rebuilds and rescans regularly (lesson 7.2).
 # The package mirror over HTTPS, not the image's default HTTP: apt checks signatures
 # either way, but HTTPS also hides which packages are fetched, and some networks (company
 # proxies, the machine this course was built on) allow nothing else.
+# `upgrade` applies Debian's security fixes that the base image doesn't have yet: the
+# image scan found one (zlib) after Debian had released its fix. The price: builds on
+# different days can differ, so CI rebuilds and rescans regularly (lesson 7.2).
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
+# A user with no password, no shell login and no rights beyond its own home: if Atlas
+# is ever compromised, the attacker is this user, not root (lesson 2.4).
+# The clones folder is created now, owned by atlas: a volume mounted on a folder that
+# doesn't exist in the image is created as root, and the worker couldn't write to it.
+# pip goes: nothing installs packages at runtime, and its bundled copies of urllib3 and
+# msgpack were the only fixable high-severity findings in the Python packages.
 RUN groupadd --system --gid 10001 atlas \
     && useradd --system --uid 10001 --gid atlas --create-home atlas \
     && install --directory --owner atlas --group atlas /home/atlas/.cache/atlas \
@@ -71,7 +70,7 @@ RUN groupadd --system --gid 10001 atlas \
 # Only the built environment crosses over: no uv, no source tree, no cache. In two layers,
 # slowest-changing first: the dependencies (about 180 MB, unchanged until uv.lock changes),
 # then Atlas's own files (under 1 MB). A code change rebuilds, pushes and pulls only the
-# second (lesson 7.1).
+# second.
 COPY --from=build --chown=atlas:atlas /app/.venv /app/.venv
 COPY --from=project --chown=atlas:atlas /app/.venv/lib/python3.13/site-packages/atlas /app/.venv/lib/python3.13/site-packages/atlas
 COPY --from=project --chown=atlas:atlas /app/.venv/lib/python3.13/site-packages/atlas-0.1.0.dist-info /app/.venv/lib/python3.13/site-packages/atlas-0.1.0.dist-info
