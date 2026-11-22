@@ -1,0 +1,465 @@
+---
+title: "7.1 Production containers"
+description: "Package Atlas as a container image fit for production: measure a naive image that is huge, runs as root, rebuilds slowly and doesn't even start, then fix it with a multi-stage build, cached layers, a non-root user and a vulnerability scan, and run every Atlas process from it with Docker Compose."
+---
+
+::: {.lesson-meta}
+Part 7 · Lesson 1 · About 3 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory", "In the project" and "Running the whole system". The trade-offs section *(deep dive)* covers one image or several, pinning, and smaller base images.
+:::
+
+::: {.callout-note title="Analogy: packing for a move"}
+You could move house by loading the whole garage into the truck: tools, offcuts, packaging, the lot. It arrives, but the truck is full, nothing can be found, and half of it was only needed while building the furniture. A good mover assembles the furniture in the workshop, then loads only the finished pieces, labelled, the heavy ones that rarely change at the bottom.
+
+A **container image** is the truck load. A **multi-stage build** assembles in a workshop and ships only the finished pieces; **layers** are the boxes, with the ones that rarely change packed first.
+:::
+
+## The problem
+
+Since lesson 3.1 you've *run* images other people built: Postgres, Redis, SeaweedFS, Ollama. Atlas itself still runs from your terminal, with `uv run`. To run it on a server (Part 7's goal), Atlas needs an image of its own. Here is the Dockerfile most people write first:
+
+```dockerfile
+FROM python:3.13
+WORKDIR /app
+COPY . .
+RUN pip install uv && uv sync
+CMD ["uv", "run", "uvicorn", "atlas.api.app:create_app", "--factory", "--host", "0.0.0.0"]
+```
+
+Built from `atlas/` and measured:
+
+```text
+cold build: 35.3 s
+size: 2.16GB
+runs as: root
+rebuild after a one-line change: 20.3 s
+```
+
+Four problems in four lines:
+
+- **2.16 GB.** Every deploy pushes and pulls that over the network. `docker history` shows where it comes from: the full Debian-based Python image (with compilers, git, documentation), plus a 350 MB `COPY . .` layer that copied *everything in the folder*, including the laptop's `.venv` (275 MB), test caches and coverage data.
+- **Root.** The process runs as the most powerful user in the container. A vulnerability that lets an attacker run code gives them root.
+- **20 seconds for a one-line change**, because changing any file invalidates the `COPY . .` step and everything after it, including installing every dependency again.
+- And it doesn't start:
+
+```text
+$ docker run ... atlas:naive
+Uninstalled 1 package in 0.89ms
+Installed 1 package in 1ms
+error: Failed to spawn: uvicorn
+  cause: No such file or directory (os error 2)
+```
+
+The copied `.venv` was built on the laptop, with paths that only exist there; `uv run` couldn't use it. On a Mac the binaries inside it would be for the wrong operating system entirely. The image worked by accident or not at all, depending on whose laptop built it.
+
+A vulnerability scanner (explained below) adds one more number: **16 critical and 523 high** known vulnerabilities in the operating system packages, most in software Atlas never uses.
+
+## Theory
+
+### Images, layers and the build cache
+
+A **Dockerfile** is a recipe for an image: each line is an instruction. `FROM` picks a **base image** to start from; `COPY` puts files in; `RUN` runs a command at build time; `CMD` says what to run when a container starts.
+
+An image is a stack of **layers**: each `COPY` and `RUN` produces one, holding only the files that step changed. When you run a container, Docker stacks the layers into one filesystem. Layers are what gets pushed to and pulled from a **registry** (a server that stores images, like Docker Hub, or AWS's ECR in lesson 7.6), and a layer already present isn't transferred again.
+
+Docker also keeps a **build cache**: before running a step, it checks whether it has run *exactly this step on exactly this input* before. If so, it reuses the layer. The rule that matters: once one step's input changes, every step after it runs again. So a Dockerfile should go **from what changes least to what changes most**: dependencies (change when the lock file changes) before your code (changes every commit).
+
+### Multi-stage builds
+
+Building needs things running doesn't: uv, package caches, the source tree. A **multi-stage build** has several `FROM` lines; each starts a **stage**, and a later stage can `COPY --from=` an earlier one. Only the last stage becomes the image. So you build in one stage and copy just the result into a clean, small one.
+
+### Containers and signals
+
+When you stop a container, Docker sends `SIGTERM` to its **process 1** (PID 1, the first process started in it), waits ten seconds, then sends `SIGKILL` (lesson 2.1: `SIGTERM` can be handled, `SIGKILL` can't). Which process is PID 1 depends on how `CMD` is written:
+
+- **Exec form**, `CMD ["uvicorn", ...]`: uvicorn itself is PID 1 and receives `SIGTERM`.
+- **Shell form**, `CMD uvicorn ...` (or wrapping in `sh -c`): a shell is PID 1, and the shell doesn't pass `SIGTERM` on.
+
+### Vulnerability scanning
+
+A **CVE** (Common Vulnerabilities and Exposures entry) is a public record of a known security flaw in a specific version of a package. A **vulnerability scanner** lists every package in an image, operating system and language packages alike, and looks each up in a database of CVEs. Atlas uses **Trivy**, a free scanner run as a container. A scan answers two different questions, and they need different responses: *what is vulnerable* (often hundreds of entries), and *what can I fix* (usually a handful).
+
+```{mermaid}
+flowchart LR
+    subgraph build["Stage 1: build"]
+        B1[python:3.13-slim + uv] --> B2[pyproject.toml, uv.lock]
+        B2 --> B3[".venv: dependencies only"]
+    end
+    subgraph project["Stage 2: project"]
+        P1[src/] --> P2[".venv + Atlas installed"]
+    end
+    subgraph runtime["Stage 3: runtime (the image)"]
+        R1[python:3.13-slim] --> R2[git, security updates]
+        R2 --> R3[user atlas, no pip]
+        R3 --> R4["layer: dependencies, 185 MB"]
+        R4 --> R5["layer: Atlas, about 1 MB"]
+    end
+    B3 --> project
+    B3 -. COPY .-> R4
+    P2 -. COPY .-> R5
+```
+
+## In the project
+
+### `atlas/.dockerignore`: an allowlist
+
+Before anything is copied, Docker sends the **build context** (the folder you build from) to the builder. A `.dockerignore` file excludes paths from it. Atlas's ignores everything, then lets back in exactly what the build needs:
+
+```text
+*
+!pyproject.toml
+!uv.lock
+!src/
+**/__pycache__
+```
+
+An allowlist, not a list of things to leave out: a file you forget to list stays out. That includes a `.env` with real secrets created next year.
+
+### `atlas/Dockerfile`
+
+The first two stages build the virtual environment, dependencies first:
+
+```dockerfile
+FROM python:3.13-slim AS build
+
+COPY --from=astral/uv:0.11.32 /uv /bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
+
+FROM build AS project
+
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable
+```
+
+- `python:3.13-slim` is the same Python without compilers and documentation: 178 MB instead of over a gigabyte.
+- `COPY --from=astral/uv:0.11.32` takes the `uv` binary out of uv's official image, pinned to the version the project uses.
+- `--locked` installs exactly what `uv.lock` says and fails if the lock file is out of date; `--no-dev` leaves out pytest, mypy and ruff; `--no-install-project` installs only the dependencies, so this layer is reused until `uv.lock` changes.
+- `--mount=type=cache` gives the step a folder that survives between builds but never enters the image: packages downloaded once aren't downloaded again.
+- `--no-editable` installs Atlas as a normal package inside `.venv`, instead of a link back to `/app/src`, so `.venv` is all the runtime needs.
+
+The third stage is the image that runs:
+
+```dockerfile
+FROM python:3.13-slim AS runtime
+
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get upgrade --yes \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 10001 atlas \
+    && useradd --system --uid 10001 --gid atlas --create-home atlas \
+    && install --directory --owner atlas --group atlas /home/atlas/.cache/atlas \
+    && python -m pip uninstall --yes --quiet pip
+
+COPY --from=build --chown=atlas:atlas /app/.venv /app/.venv
+COPY --from=project --chown=atlas:atlas /app/.venv/lib/python3.13/site-packages/atlas /app/.venv/lib/python3.13/site-packages/atlas
+COPY --from=project --chown=atlas:atlas /app/.venv/lib/python3.13/site-packages/atlas-0.1.0.dist-info /app/.venv/lib/python3.13/site-packages/atlas-0.1.0.dist-info
+COPY --from=project --chown=atlas:atlas /app/.venv/bin/atlas /app/.venv/bin/atlas
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+USER atlas
+WORKDIR /home/atlas
+
+EXPOSE 8000
+CMD ["uvicorn", "atlas.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+```
+
+(In the repository, a comment explains each step; each is also explained below, because each was added for a reason this lesson measured.) `USER atlas` makes every later step and the running container use that user. `PYTHONUNBUFFERED=1` sends Python's output straight to the log, instead of holding it in a buffer a crash would lose. `0.0.0.0`, because inside a container `127.0.0.1` is the container alone (lesson 2.2). One image serves every Atlas process: the API by default, and `atlas worker`, `atlas scheduler`, `atlas notifier` or `atlas init-db` when given as the command.
+
+### Measured, step by step
+
+The first version had the two build stages folded into one and copied the whole `.venv` in a single `COPY`, without git:
+
+```text
+cold build: 16.5 s
+size: 416MB
+runs as: atlas
+rebuild after a one-line change: 9.7 s
+```
+
+Five times smaller, and not root. But still ten seconds for a one-line change. The build log showed the build steps themselves took about a second; the rest was Docker writing a new 186 MB layer, because installing Atlas into `.venv` changed the folder that layer was made from. Every code change would also push and pull 186 MB. Splitting the environment into two layers, dependencies first and Atlas's own files (about 1 MB) last, as above:
+
+```text
+rebuild after a one-line change: 1.3 s
+```
+
+```text
+$ docker history atlas:prod
+20.5kB  COPY --chown=atlas:atlas /app/.venv/bin/atla…
+65.5kB  COPY --chown=atlas:atlas /app/.venv/lib/pyth…
+1.08MB  COPY --chown=atlas:atlas /app/.venv/lib/pyth…
+185MB   COPY --chown=atlas:atlas /app/.venv /app/.ve…
+```
+
+### A bug only the image could find
+
+The first time the image ran `atlas`:
+
+```text
+  File "/app/.venv/lib/python3.13/site-packages/atlas/snapshots.py", line 21, in <module>
+    from mypy_boto3_s3 import S3Client
+ModuleNotFoundError: No module named 'mypy_boto3_s3'
+```
+
+`mypy_boto3_s3` is a **type stub** package: type information for boto3, used only by mypy, so it's a development dependency. Lesson 5.4 imported it at the top of `snapshots.py`. Every test passed, every time, because tests always run with development dependencies installed. The production image, with `--no-dev`, is the first place the import ever ran without them. The fix imports it only for the type checker:
+
+```python
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
+
+def make_s3_client(settings: Settings) -> "S3Client":
+    ...
+```
+
+`TYPE_CHECKING` is `False` when the program runs and `True` for mypy; the annotation is in quotes, so Python doesn't need the name at runtime. To catch every such import, not just this one, import every module inside the image:
+
+```text
+$ docker run --rm atlas:prod python -c "
+import importlib, pkgutil, atlas
+names = [m.name for m in pkgutil.walk_packages(atlas.__path__, 'atlas.') if '.migrations' not in m.name]
+for name in names:
+    importlib.import_module(name)
+print(f'{len(names)} modules import without development dependencies')"
+47 modules import without development dependencies
+```
+
+Lesson 7.2 makes this a CI step, so it can't happen again.
+
+### Scanning the image
+
+Trivy on the 416 MB image found no critical vulnerabilities, 51 high in the operating system and 5 high in Python packages. The operating system ones had no fixed versions yet; the Python ones did:
+
+```text
+HIGH CVE-2026-114613 msgpack 1.1.2 -> fixed in 1.2.3 | Denial of Service via memory leak during map deseria…
+HIGH GHSA-6v7p-g79w-8964 msgpack 1.1.2 -> fixed in 1.2.1 | Out-of-bounds read / crash on Unpacker reuse…
+HIGH CVE-2025-47273 setuptools 70.3.0 -> fixed in 78.1.1 | Path Traversal Vulnerability in setuptools PackageIndex
+HIGH CVE-2026-97687 urllib3 2.7.0 -> fixed in 2.8.0 | Traffic interception via HTTPS proxy TLS configurati…
+HIGH CVE-2026-97689 urllib3 2.7.0 -> fixed in 2.8.0 | Denial of Service via unbounded memory allocation…
+```
+
+Odd: Atlas's `uv.lock` already pins urllib3 2.8.0. Inside the image, Atlas's environment did have 2.8.0; these copies were inside **pip**, which ships its own copies of urllib3, msgpack and part of setuptools. pip came with the base image and nothing in production uses it, so the runtime stage uninstalls it. Rescanned: no fixable findings in Python packages.
+
+Trivy's secret scanner also reported two "CRITICAL: Google service account" findings, inside the Anthropic SDK's documentation strings: text that happened to look like a key. Scanners produce false positives; each finding is something to read, not to obey.
+
+### Running the whole system
+
+`compose.yml` gains the Atlas processes, behind a **profile** (a name that switches a group of services on), so the plain `docker compose up -d` you've used since Part 3 still starts only Postgres, Redis, SeaweedFS and Ollama:
+
+```bash
+docker compose --profile app up -d --build
+```
+
+```yaml
+  migrate:
+    profiles: ["app"]
+    build: .
+    image: atlas:local
+    command: ["atlas", "init-db"]
+    environment: &atlas-environment
+      DATABASE_URL: postgresql+psycopg://atlas:atlas-dev-password@db:5432/atlas
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://seaweedfs:8333
+      ...
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    image: atlas:local
+    environment:
+      <<: *atlas-environment
+      WEB_DIR: /web
+    volumes:
+      - ../web:/web:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on: &after-migrations
+      migrate:
+        condition: service_completed_successfully
+      ...
+```
+
+`migrate` runs the migrations and exits; the API, worker, scheduler and notifier start only after it succeeded (`service_completed_successfully`), so they never meet an outdated schema. Inside the Compose network, services find each other by name: `db`, not `localhost`. `&atlas-environment` names a block of YAML and `*atlas-environment` reuses it (`<<:` merges it with more keys), so the shared settings are written once.
+
+Started, the whole system came up, and two failures appeared within seconds in the worker's log:
+
+```text
+ERROR job failed 29 sync_repo  ["PermissionError: [Errno 13] Permission denied: '/home/atlas/.cache/atlas/repos'"]
+```
+
+The worker keeps its clones in a **volume** (lesson 3.1), mounted at `/home/atlas/.cache/atlas`. That folder didn't exist in the image, so Docker created it when mounting the volume, owned by root, and the `atlas` user couldn't write to it. Creating the folder in the image, owned by `atlas` (`install --directory --owner atlas ...` above), fixes it: a new volume copies the folder's ownership. Then the next failure:
+
+```text
+FileNotFoundError: [Errno 2] No such file or directory: 'git'
+```
+
+The worker clones with `git` (lesson 5.3) and makes snapshots with `git archive` (5.4), and the slim image has no git. Installing it (`--no-install-recommends` skips documentation, a mail client and Perl modules a plain install pulls in) costs 105 MB, and the scanner's high findings rise from 51 to 121: git and its libraries bring their own. One of them could be fixed:
+
+```text
+HIGH CVE-2026-85091 zlib1g 1:1.3.dfsg+really1.3.1-1+b1 -> 1:1.3.dfsg+really1.3.1-1+deb13u1 | Heap buffer overflow in gz_vacate()…
+```
+
+Debian had released the fix, but the official `python:3.13-slim` image hadn't been rebuilt with it yet. `apt-get upgrade` applies Debian's security updates at build time: 7 packages upgraded, and a scan for fixable high or critical findings now passes:
+
+```text
+$ trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 atlas:prod
+$ echo $?
+0
+```
+
+The apt mirror is switched to `https://` first: apt checks package signatures either way, but HTTPS also hides which packages are downloaded, and some networks only allow HTTPS (this course's build machine is one).
+
+With the fixes, from the running containers:
+
+```text
+$ curl localhost:8000/ready
+{"status":"ready"}
+$ docker compose exec worker atlas jobs --limit 4
+   41  sync_repo      succeeded  1  pytorch/ignite
+   31  snapshot_repo  succeeded  5  pytorch/ignite
+   29  sync_repo      succeeded  5  pytorch/ignite
+$ docker compose exec api whoami
+atlas
+```
+
+The final image:
+
+```text
+cold build: 28.1 s
+size: 599MB
+rebuild after a one-line change: 1.6 s
+```
+
+| | Naive | Final |
+|---|---|---|
+| Size | 2.16 GB | 599 MB |
+| Runs as | root | `atlas` |
+| Rebuild after a one-line change | 20.3 s | 1.6 s |
+| Critical vulnerabilities | 16 | 0 |
+| Fixable high or critical | many | 0 |
+| Starts | no | yes |
+
+### Stopping cleanly
+
+Each service stopped with `docker stop`:
+
+```text
+atlas-api-1 stopped in 0.8 s, exit code 0
+atlas-worker-1 stopped in 1.4 s, exit code 0
+atlas-scheduler-1 stopped in 0.4 s, exit code 0
+atlas-notifier-1 stopped in 1.8 s, exit code 0
+```
+
+The worker and scheduler finish their current step and exit (lesson 5.1's `stop_on_signals`). The same image, started through a shell instead:
+
+```text
+$ docker run -d --name shell-form ... atlas:prod sh -c 'uvicorn atlas.api.app:create_app ...'
+$ docker exec shell-form cat /proc/1/cmdline
+sh -c uvicorn atlas.api.app:create_app --factory --host 0.0.
+exec-form stopped in 0.5 s, exit code 0
+shell-form stopped in 10.1 s, exit code 137
+```
+
+`sh` was PID 1 and ignored `SIGTERM`; after ten seconds Docker killed everything (`137` is 128 + 9, killed by signal 9, `SIGKILL`), cutting off whatever requests were in flight. On every deploy (lesson 7.8) that's ten seconds of waiting and a batch of failed requests.
+
+## Trade-offs *(deep dive)*
+
+**One image or several.** The API never runs git. An API-only image without it measured 422 MB instead of 599 MB, with 51 high findings instead of 121. Separate images mean a second build target, two images to push, and two to keep patched; one image means every process carries the worker's tools. Atlas uses one, for now; Part 7's security lesson (7.13) revisits it.
+
+**`apt-get upgrade` or not.** Upgrading picks up security fixes days or weeks before the base image does, but two builds of the same Dockerfile on different days can now differ, and a broken update can break a build. The alternative is to rebuild regularly and wait for the base image. Atlas upgrades, and lesson 7.2 rebuilds and rescans on a schedule, so "different days differ" is visible rather than surprising.
+
+**Smaller bases.** Images without a shell or package manager at all (such as Google's "distroless") cut the operating system down further. They also remove `sh`, so debugging a running container is harder, and Atlas needs git, which they don't include.
+
+**Pinning.** `python:3.13-slim` gets new builds under the same tag. Pinning it by **digest** (`python:3.13-slim@sha256:...`) makes builds repeatable, at the price of updating the digest by hand or with a bot. uv's version is pinned; the Python base isn't, deliberately, so security updates arrive with each rebuild.
+
+## Common mistakes
+
+- **`COPY . .` without a `.dockerignore`**: laptop virtual environments, caches and secrets end up in the image.
+- **Copying code before installing dependencies**: every commit reinstalls everything.
+- **Running as root** because nothing said otherwise.
+- **The shell form of `CMD`**: PID 1 is a shell, `SIGTERM` is lost, every stop takes ten seconds and kills requests.
+- **Binding to `127.0.0.1`** inside the container: nothing outside can connect.
+- **Importing development-only packages at runtime**: tests pass, the image crashes. Import the whole package inside the image to find out.
+- **Treating the scan's total as the to-do list**: fix what is fixable, track the rest.
+
+## Check yourself
+
+**1.** You edit one line in `answer.py` and rebuild. Which steps of Atlas's Dockerfile run again, and why not the dependency install?
+
+::: {.callout-tip collapse="true" title="Answer"}
+`COPY src ./src` and the second `uv sync` in the `project` stage, then the three `COPY --from=project` lines in the runtime stage. The first `uv sync` ran on `pyproject.toml` and `uv.lock` only, which didn't change, so its layer and the 185 MB dependency layer come from the cache. That's why the rebuild takes 1.6 seconds and only about 1 MB of layers changes.
+:::
+
+**2.** A container takes exactly ten seconds to stop and exits with code 137. What happened?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Its PID 1 didn't exit on `SIGTERM`, so after Docker's ten-second wait it was killed with `SIGKILL` (137 = 128 + 9). The usual cause is a shell as PID 1, from the shell form of `CMD` or an `sh -c` wrapper, which doesn't pass the signal on.
+:::
+
+**3.** The scan reports urllib3 2.7.0, but `uv.lock` says 2.8.0. How can both be true?
+
+::: {.callout-tip collapse="true" title="Answer"}
+There were two copies: Atlas's environment had 2.8.0, and pip, from the base image, carried its own copy of 2.7.0. Scanners report every copy in the image. Removing pip, which production doesn't use, removed that copy.
+:::
+
+## Exercise
+
+Make a second image for the API only, without git. Add a stage to the Dockerfile so that `docker build --target api -t atlas-api .` builds it, measure both images' size and high findings, and decide whether the difference is worth a second image.
+
+::: {.callout-tip collapse="true" title="Solution"}
+Docker stages can be built separately with `--target`, and a stage can start `FROM` another stage. Move everything the two images share (the user, the environment, `PATH`, `CMD`) into a stage `FROM python:3.13-slim AS api`, then add `FROM api AS runtime` with the git step and `USER root` before it and `USER atlas` after it. The last stage in the file stays the default, so `docker build .` still builds the full image.
+
+Built both ways from that Dockerfile and checked:
+
+```text
+atlas-full 599MB
+atlas-api  422MB
+atlas-api:  atlas  sh: 1: git: not found  usage: atlas [-h]
+atlas-full: atlas  git version 2.47.3     usage: atlas [-h]
+```
+
+Both run as `atlas` and both have the `atlas` command; only the full one has git. Scanned (severity counts):
+
+```text
+atlas:prod     {'HIGH': 121, 'LOW': 145, 'MEDIUM': 122, 'UNKNOWN': 12}
+atlas:api-only {'HIGH': 51, 'LOW': 81, 'MEDIUM': 101, 'UNKNOWN': 7}
+```
+
+177 MB and 70 high findings less for the process that faces the internet. That's a reasonable argument for two images once the API is exposed (lesson 7.7); the cost is a second image to build, push and scan in every pipeline. Not in the reference code, for now.
+:::
+
+## Stretch
+
+Lint the Dockerfile with **hadolint**, a Dockerfile linter that runs as a container:
+
+```text
+$ docker run --rm -i hadolint/hadolint:v2.14.0 < Dockerfile
+-:53 DL3008 warning: Pin versions in apt get install. Instead of `apt-get install <package>` use `apt-get install <package>=<version>`
+```
+
+One warning: pin `git` to an exact version. Pinning makes builds repeatable, and conflicts with `apt-get upgrade`, which exists to *not* stay on old versions. Decide which you want, and if you keep the upgrade, silence the warning on that line with a comment `# hadolint ignore=DL3008` and the reason. A linter's rule is a question to answer, not an order.
+
+## What changed in the project
+
+`atlas/Dockerfile` (three stages: dependencies, project, a non-root runtime with git and security updates, no pip), `atlas/.dockerignore` (an allowlist), the `app` profile in `compose.yml` (`migrate`, `api`, `worker`, `scheduler`, `notifier` from one image); `snapshots.py` imports its type stubs only for the type checker. Commits: `feat: Added the production image and the full compose stack`, `fix: Installed git and Debian security updates in the production image`.
