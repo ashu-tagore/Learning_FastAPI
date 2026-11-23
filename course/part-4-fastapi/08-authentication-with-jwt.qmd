@@ -381,7 +381,7 @@ The server's access log now holds a working token. URLs are also kept in browser
 
 ### Where the web page keeps tokens
 
-The ready-made web interface (`web/app.js`) keeps tokens in `sessionStorage`, which is cleared when the tab closes. Any script running on the page can read it, so the page loads no third-party scripts. The alternative, an `HttpOnly` cookie that scripts can't read, brings its own problem (cross-site request forgery, lesson 7.10). Both are common; know the trade-off.
+The ready-made web interface (`web/app.js`) keeps tokens in `sessionStorage`, which is cleared when the tab closes. Any script running on the page can read it, so the page loads no third-party scripts. The alternative, an `HttpOnly` cookie that scripts can't read, brings its own problem (cross-site request forgery, lesson 7.13). Both are common; know the trade-off.
 
 ## Trade-offs: tokens or sessions? *(deep dive)*
 

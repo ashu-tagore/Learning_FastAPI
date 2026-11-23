@@ -14,13 +14,19 @@ import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from mypy_boto3_s3 import S3Client
 
 from atlas.config import Settings
+
+if TYPE_CHECKING:
+    # Type stubs, a development dependency: only the type checker imports them. Imported
+    # at runtime, they crashed the production image, which has no development
+    # dependencies (lesson 7.1). Annotations below name the type in quotes for this reason.
+    from mypy_boto3_s3 import S3Client
 
 # Signature Version 4, always. Left to itself, boto3 1.44 signed download links with the
 # older Version 2 (AWSAccessKeyId, Signature and Expires in the URL), which AWS has
@@ -28,7 +34,7 @@ from atlas.config import Settings
 S3_CONFIG = Config(signature_version="s3v4")
 
 
-def make_s3_client(settings: Settings) -> S3Client:
+def make_s3_client(settings: Settings) -> "S3Client":
     # Credentials are not passed: boto3 finds them in the environment, or on AWS from the
     # task's IAM role. Code that never handles a key can't leak one.
     return boto3.client(
@@ -40,7 +46,7 @@ def make_s3_client(settings: Settings) -> S3Client:
 
 
 class SnapshotStore:
-    def __init__(self, client: S3Client, bucket: str) -> None:
+    def __init__(self, client: "S3Client", bucket: str) -> None:
         self.client = client
         self.bucket = bucket
 

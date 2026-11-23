@@ -38,7 +38,7 @@ flowchart LR
 | [8](part-8-atlas-agents/index.qmd) | AI engineering: Atlas Agents | Verified Issue Briefs |
 | [9](part-9-scale-and-career/index.qmd) | Scale and career | An unguided capstone and a portfolio |
 
-100 lessons in total. Lessons are published as they are written; each part's page shows which are ready.
+103 lessons in total. Lessons are published as they are written; each part's page shows which are ready.
 
 ## How every lesson works
 

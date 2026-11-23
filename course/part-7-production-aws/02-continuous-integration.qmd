@@ -1,0 +1,455 @@
+---
+title: "7.2 Continuous integration"
+description: "Make every pull request prove it's safe to merge: reproduce a migration that passes every existing check and breaks on real data, then add the checks that catch it, audit dependencies for known vulnerabilities, build and scan the production image in CI, and make the checks required so a red build blocks the merge."
+---
+
+::: {.lesson-meta}
+Part 7 · Lesson 2 · About 2.5 hours
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers what to require, how long CI may take, and scheduled runs.
+:::
+
+::: {.callout-note title="Analogy: a pre-flight checklist"}
+A pilot doesn't decide each morning which checks feel necessary: a fixed checklist runs before every flight, and the plane doesn't leave until every item is ticked. The list grows after every incident that it would have caught. Nobody remembers to check the fuel on a Friday afternoon; the checklist does.
+
+**Continuous integration** is that checklist for code: a fixed set of checks, run on every change, and with **required checks**, nothing merges until they pass. Each check exists because of a failure it would have caught.
+:::
+
+## The problem
+
+Atlas has had CI since lesson 3.11: lint, format, types, tests, and since lesson 4.13 a migration check. A developer adds a field to conversations, the way lesson 4.13 taught: a column on the model, with a default, and a migration from Alembic's autogenerate:
+
+```python
+language: Mapped[str] = mapped_column(String(10), default="en")
+```
+
+```python
+op.add_column("conversations", sa.Column("language", sa.String(length=10), nullable=False))
+```
+
+Every check CI runs, on that change:
+
+```text
+== lint, format, types:
+All checks passed!
+102 files already formatted
+Success: no issues found in 102 source files
+== tests:
+260 passed in 42.09s
+== migrations, as CI runs them:
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+No new upgrade operations detected.
+CI migrations step exit code: 0
+```
+
+All green. It's Friday afternoon; it's merged and deployed. The deploy runs the migration on the real database, which has conversations in it:
+
+```text
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+sqlalchemy.exc.IntegrityError: (psycopg.errors.NotNullViolation) column "language" of relation "conversations" contains null values
+```
+
+`default="en"` lives in Python: SQLAlchemy fills it in for *new* rows it inserts. The database knows nothing about it, so adding a `NOT NULL` column to a table with rows leaves those rows with nothing, which `NOT NULL` forbids. CI never noticed, because CI's migration check runs on an **empty** database, where there are no rows to complain about. (Postgres runs the migration in a transaction, so the database rolled back to `0012` unharmed. The new code, expecting the column, is now broken against it.)
+
+Two things went wrong: a check that couldn't see the problem, and nothing that would have stopped the merge if it had. This lesson fixes both.
+
+## Theory
+
+### Continuous integration
+
+**Continuous integration** (CI) means every change is merged into the main branch often, and each one is checked automatically first. Atlas's CI is a **workflow**: a YAML file in `.github/workflows/` that GitHub Actions runs on its own machines (**runners**) when something happens, such as a pull request being opened or updated. A workflow has **jobs**, which run in parallel on separate runners, and each job has **steps**, which run in order.
+
+### What a check can see
+
+A check proves only what it exercises. Atlas's tests create tables from the models, so they never run migrations; the migration check runs migrations, on empty tables. Neither ran a migration on data, so neither could fail on data. Every check in CI is a deliberate answer to "what could go wrong, and what would notice?", and when something goes wrong that nothing noticed, the answer is a new check.
+
+### Required checks
+
+By default, a red check on a pull request is information: the merge button still works. A **required status check** is a check GitHub won't merge without. They're set in a **ruleset** (or the older **branch protection rule**) on the `main` branch: Settings, Rules, Rulesets, New branch ruleset, target `main`, "Require status checks to pass", and add each check by its job name. Two consequences:
+
+- A required check must report on *every* pull request. A workflow that only runs when certain paths change can't promise that, so Atlas's CI workflow runs on every pull request.
+- Required checks should be fast and reliable. A check that fails at random teaches everyone to ignore red builds, which is worse than no check.
+
+### Supply chain: dependencies and images
+
+Atlas runs 161 packages it didn't write, and a 600 MB operating system image. Each can have a **known vulnerability**: one with a public advisory, often with a fixed version. Checking them is **software supply chain** hygiene, and it has to run regularly, not just when your code changes: a package that was fine on Monday gets an advisory on Thursday.
+
+- A **dependency audit** compares the exact versions in `uv.lock` with a vulnerability database. Atlas uses `pip-audit`.
+- An **image scan** (lesson 7.1's Trivy) does the same for everything in the image, including operating system packages.
+
+```{mermaid}
+flowchart LR
+    PR[Pull request] --> A[atlas job<br/>lint, types, tests,<br/>dependency audit,<br/>migrations: empty and with data]
+    PR --> I[image job<br/>build with cache,<br/>imports, non-root, git,<br/>vulnerability scan]
+    PR --> E[evals workflow<br/>about an hour,<br/>not required]
+    A --> R{Required checks<br/>green?}
+    I --> R
+    R -->|no| B[Merge blocked]
+    R -->|yes| M[Merge allowed]
+    S[Weekly schedule] --> A
+    S --> I
+```
+
+## In the project
+
+### Red, then green: a migration on data
+
+The check that would have caught it runs the newest migration again on a database with data in it. `tests/seed.py` puts one row in each of Atlas's main tables, built with the models so it always matches the current schema:
+
+```python
+def seed(session: Session) -> None:
+    now = datetime.now(UTC)
+    repo = Repo(full_name="pytorch/ignite", indexed_at=now, indexed_commit="0" * 40)
+    user = User(email="seed@example.com", password_hash="not-a-real-hash")
+    session.add_all([repo, user])
+    session.flush()
+    ...
+    conversation = Conversation(user_id=user.id, repo_full_name=repo.full_name, title="Seed")
+    ...
+```
+
+and a new CI step, after the existing migration check:
+
+```yaml
+      - name: Newest migration on a database with data
+        env:
+          DATABASE_URL: postgresql+psycopg://atlas:atlas-test-password@localhost:5432/migrations
+        run: |
+          uv run python -m tests.seed
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+```
+
+`downgrade -1` steps back one migration; `upgrade head` applies it again, this time to tables with rows. On the broken migration:
+
+```text
+seeded one row of each kind
+INFO  [alembic.runtime.migration] Running downgrade 0013 -> 0012, conversation language
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+sqlalchemy.exc.IntegrityError: (psycopg.errors.NotNullViolation) column "language" of relation "conversations" contains null values
+```
+
+Red, in CI, before any deploy. The fix belongs in the migration: a default the *database* knows.
+
+```python
+op.add_column(
+    "conversations",
+    sa.Column("language", sa.String(length=10), nullable=False, server_default="en"),
+)
+```
+
+```text
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+INFO  [alembic.runtime.migration] Running downgrade 0013 -> 0012, conversation language
+INFO  [alembic.runtime.migration] Running upgrade 0012 -> 0013, conversation language
+$ psql -c "select title, language from conversations"
+Seed|en
+```
+
+Green, and the existing row got `en`. (The `language` column was a demonstration; it isn't in Atlas.) A test keeps the seed honest, failing when a model gains a required column the seed doesn't set:
+
+```python
+def test_the_seed_fills_the_tables_migrations_are_tested_on(session: Session) -> None:
+    seed(session)
+    session.flush()
+
+    for model in (Conversation, Message, Citation, Feedback):
+        rows = session.scalar(select(func.count()).select_from(model)) or 0
+        assert rows >= 1, model.__tablename__
+```
+
+### The dependency audit
+
+```yaml
+      - name: Dependency audit
+        run: |
+          uv export --locked --no-dev --format requirements-txt --no-emit-project > "$RUNNER_TEMP/requirements.txt"
+          uvx --from pip-audit==2.10.0 pip-audit -r "$RUNNER_TEMP/requirements.txt" --require-hashes --disable-pip
+```
+
+`uv export` writes the lock file's production dependencies as a requirements file, with each file's hash; `uvx` runs pip-audit without installing it into the project; `--disable-pip` checks the listed versions without installing them. On Atlas today:
+
+```text
+No known vulnerabilities found
+```
+
+A check that has never failed might not work. Against urllib3 2.7.0, the version lesson 7.1 found inside pip:
+
+```text
+Found 3 known vulnerabilities in 1 package
+Name    Version ID              Fix Versions
+------- ------- --------------- ------------
+urllib3 2.7.0   PYSEC-2026-4177 2.8.0
+urllib3 2.7.0   PYSEC-2026-4176 2.8.0
+urllib3 2.7.0   PYSEC-2026-4175 2.8.0
+```
+
+pip-audit exits with a non-zero code when it finds anything, which fails the step.
+
+### The image job
+
+Lesson 7.1 found a crash that only existed inside the image. A new job builds the image on every pull request and checks it:
+
+```yaml
+  image:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: atlas
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: atlas
+          tags: atlas:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Every module imports without development dependencies
+        run: |
+          docker run --rm atlas:ci python -c "
+          ...
+          print(f'{len(names)} modules import')"
+      - name: Runs as a non-root user, with git
+        run: |
+          test "$(docker run --rm atlas:ci whoami)" = atlas
+          docker run --rm atlas:ci git --version
+          docker run --rm atlas:ci atlas --help > /dev/null
+      - name: Vulnerability scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3 \
+            image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 atlas:ci
+```
+
+- `uses:` runs an **action**, a reusable step published by someone else, pinned to a major version. `docker/setup-buildx-action` and `docker/build-push-action` are Docker's own.
+- `load: true` keeps the image in the runner's Docker for the checks below; pushing it to a registry is lesson 7.8's.
+- `cache-from` and `cache-to` with `type=gha` store layers in GitHub's Actions cache, so an unchanged `uv.lock` reuses the dependency layer here exactly as it does on a laptop.
+- `test "$(...)" = atlas` fails the step unless the container's user is `atlas`.
+- The scan fails only on high or critical vulnerabilities **that have a fix** (`--ignore-unfixed`): those are the ones a pull request can do something about.
+
+Run locally on the image from lesson 7.1, the checks pass:
+
+```text
+47 modules import
+non-root: ok
+git version 2.47.3
+atlas --help: ok
+```
+
+On GitHub, the first run, for this lesson's own pull request (step times from the Actions API):
+
+```text
+image job, 1 min 46 s in all
+  Build                                                   61 s   (empty cache: every layer built)
+  Every module imports without development dependencies    3 s
+  Runs as a non-root user, with git                        1 s
+  Vulnerability scan                                       21 s
+atlas job, 1 min 40 s in all, dependency audit and the new migration step included
+```
+
+Both jobs run side by side, so CI takes about two minutes. (The evaluation workflow, lesson 6.8, runs separately and takes an hour.)
+
+### Running on a schedule, and least privilege
+
+```yaml
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+- `schedule` runs the workflow every Monday at 04:23 UTC with no code change. Lesson 7.1's `apt-get upgrade` takes security updates at build time and the scanner's database grows daily, so the same commit can pass on Monday and fail the next week. The schedule makes that visible within a week instead of at the next unrelated pull request. (`cron` fields: minute, hour, day of month, month, day of week.)
+- `workflow_dispatch` adds a "Run workflow" button.
+
+The day after this lesson's checks first passed, with no code change at all, the `image` job went red. The vulnerability scan:
+
+```text
+Total: 56 (HIGH: 56, CRITICAL: 0)
+│ libgssapi-krb5-2 │ CVE-2026-107364 │ HIGH     │ fixed  │ 1.21.3-5+deb13u1  │ 1.21.3-5+deb13u2 │ krb5: Unauthenticated KDC DoS based on ASN.1 decoder read    │
+...
+##[error]Process completed with exit code 1.
+```
+
+Debian had released fixes for Kerberos (`krb5`, an authentication library) overnight. The slim base image doesn't contain it; it arrived with git, through git's HTTP library (`libcurl3t64-gnutls`), one more reason lesson 7.1's API-only image would scan cleaner. The image runs `apt-get upgrade` precisely to pick up such fixes (lesson 7.1), yet the Build step took 8 seconds: every layer came from the cache, including the upgrade from the day before. The cache had quietly turned "today's security updates" into "the first day's, forever". Reproduced locally:
+
+```text
+#19 [runtime 2/8] RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' ... && apt-get upgrade --yes ...
+#19 CACHED
+```
+
+Docker reruns a step when its inputs change, and a **build argument** (`ARG`) is an input to every `RUN` after it. So the Dockerfile declares one, and CI passes the date:
+
+```dockerfile
+ARG SECURITY_UPDATES_DATE=unset
+RUN echo "Debian security updates as of ${SECURITY_UPDATES_DATE}" \
+    && sed -i ... && apt-get update && apt-get upgrade --yes && ...
+```
+
+```yaml
+      - name: Date
+        id: date
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          ...
+          build-args: SECURITY_UPDATES_DATE=${{ steps.date.outputs.today }}
+```
+
+`$GITHUB_OUTPUT` is a file where a step leaves values for later steps, read back as `steps.<id>.outputs.<name>`. Three builds with the argument:
+
+```text
+== SECURITY_UPDATES_DATE=2026-11-23
+#8 0.808 Debian security updates as of 2026-11-23
+== SECURITY_UPDATES_DATE=2026-11-23
+#13 CACHED
+== SECURITY_UPDATES_DATE=2026-11-24
+#14 0.077 Debian security updates as of 2026-11-24
+```
+
+A new date runs the step again; the same date uses the cache. Afterwards `libkrb5-3` was at `1.21.3-5+deb13u2` and the scan passed (exit code 0). Each day's first build pays for the upgrade once; the rest of the day stays fast. A red build that no code change caused is the scan doing its job: here it found a flaw in how the image was built, not in Atlas.
+- `permissions: contents: read` gives the workflow's token read access to the code and nothing else: a compromised step, say in a third-party action, can't push code or change settings.
+- `concurrency` cancels the run for an older push to the same pull request when a newer one arrives.
+
+### Linting the workflows themselves
+
+Workflows are code, and they break like code. **actionlint** checks them, including the shell scripts inside them, with **shellcheck**:
+
+```text
+.github/workflows/ci.yml:64:9: shellcheck reported issue in this script: SC2034:warning:4:1: attempt appears unused. Verify use (or export if used externally) [shellcheck]
+.github/workflows/evals.yml:58:9: shellcheck reported issue in this script: SC2034:warning:4:1: attempt appears unused. Verify use (or export if used externally) [shellcheck]
+```
+
+Both were wait loops (`for attempt in $(seq 30)`) that never used their counter; the conventional name for a variable you don't use is `_`. After that:
+
+```text
+actionlint: no problems in the three workflows
+```
+
+### Making the checks required
+
+To see what red means without a requirement, the broken migration went up as a real pull request: a throwaway draft, based on this lesson's branch, containing only the `language` column and its autogenerated migration. Its `atlas` job failed exactly where it should, in the new step:
+
+```text
+sqlalchemy.exc.IntegrityError: (psycopg.errors.NotNullViolation) column "language" of relation "conversations" contains null values
+[SQL: ALTER TABLE conversations ADD COLUMN language VARCHAR(10) NOT NULL]
+##[error]Process completed with exit code 1.
+```
+
+and GitHub's own summary of whether it could be merged:
+
+```text
+"mergeable_state": "unstable"
+```
+
+`unstable` means "a check failed, and merging is still allowed". The red check was right, and nothing stopped anyone from pressing the button anyway. That's the gap a required check closes. This course's repository doesn't require checks (its owner decided against it, and it's their setting); for your own `my-atlas` repository, the steps are:
+
+1. On GitHub: Settings, Rules, Rulesets, New ruleset, New branch ruleset.
+2. Name it ("main is protected"), set Enforcement status to Active, and under Targets add the default branch.
+3. Tick "Require a pull request before merging" and "Require status checks to pass", then add the checks `atlas` and `image`. GitHub offers only checks it has seen run, so open one pull request first.
+4. Save. From then on, a pull request with a red `atlas` or `image` check shows the merge as blocked instead of `unstable`.
+
+These steps describe GitHub's settings pages as this lesson was written; they weren't carried out for this lesson, so if a page looks different, GitHub's documentation on rulesets is the reference. (The demonstration pull request was closed unmerged.)
+
+## Trade-offs *(deep dive)*
+
+**What to require.** Atlas requires the `atlas` and `image` jobs: a few minutes, deterministic, and each guards against a failure that has happened. The evaluation workflow (lesson 6.8) takes an hour and depends on a model's sampling; it runs on pull requests that change Atlas, but isn't required. Requiring it would make every pull request wait an hour, and its occasional variation would teach people to re-run red builds until they're green.
+
+**Fail on what, exactly.** Failing the image scan on every high finding would fail every build (121 have no fix). Failing on nothing makes the scan decoration. "Fixable, high or critical" is a line a pull request can act on. The rest is reported, and reviewed periodically.
+
+**Seed data or production data.** One seeded row per table catches `NOT NULL` without a default, broken downgrades and foreign keys to missing rows. It won't catch a migration that's too *slow* on 10 million rows, or data that breaks a new constraint (a duplicate email under a new unique index). Testing migrations on a recent, anonymised copy of production data catches those (lesson 7.9 makes such copies from backups), at the cost of handling real data carefully (lesson 7.14).
+
+**CI time.** Every minute of CI is a minute someone waits. Caching (layers, packages) and running jobs in parallel keep it short; jobs that aren't required can be slow.
+
+## Common mistakes
+
+- **Trusting green checks that can't see the problem**: migrations tested only on empty tables, an image never built before deploy.
+- **`default=` where `server_default=` is needed**: Python defaults don't exist for rows the database already has.
+- **Checks that aren't required**: the merge button ignores red.
+- **Required checks behind path filters**: they may not run, so they can't be relied on to report.
+- **Scanning once**: new advisories arrive for old versions; scan on a schedule.
+- **Workflows with write permissions by default**: give the token only what the job needs.
+
+## Check yourself
+
+**1.** Why did all of Atlas's existing checks pass on the broken migration?
+
+::: {.callout-tip collapse="true" title="Answer"}
+None of them ran a migration on a table with rows. The tests create tables from the models, without migrations; the migration check runs every migration on an empty database, where a `NOT NULL` column without a default has no rows to violate. The failure only exists where data exists.
+:::
+
+**2.** The image scan passes on Monday. The next Monday, with no code change, the scheduled run fails it. What changed?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The world, not the code: a new vulnerability with a fix was published for a package in the image, or the base image changed. The scan's database is updated continuously, and the image is rebuilt with that week's packages. That's what the schedule is for: to find this within a week, on its own run, rather than in someone's unrelated pull request.
+:::
+
+**3.** A colleague proposes making the evaluation workflow a required check "so answers can't get worse". What would you say?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Every pull request would wait about an hour, including ones that only change lessons, and the answer scores vary between runs (lesson 6.8), so it would fail at random and teach people to re-run red builds. Its exact checks have thresholds that hold across runs; keep it running on Atlas changes, read its report in review, and require only fast, deterministic checks.
+:::
+
+## Exercise
+
+Add a check that the generated course pages are up to date to the CI workflow, as a third job, so it can be required too. (The site workflow already runs `generate_part_pages.py`, but only when `course/` changes.) Then decide: should it be required?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```yaml
+  pages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generated course pages are up to date
+        run: |
+          python3 course/_tools/generate_part_pages.py
+          git diff --exit-code course/
+```
+
+`git diff --exit-code` exits with 1 when the working tree differs from what's committed, so the job fails if regenerating changed anything. It caught a real slip while this lesson was being written: lesson 7.1's file had been committed without regenerating the pages.
+
+```text
+$ git diff --stat --exit-code -- course/_sidebar.yml course/part-7-production-aws/index.qmd
+ course/_sidebar.yml                    | 3 ++-
+ course/part-7-production-aws/index.qmd | 4 ++--
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+exit code: 1
+-| 7.2 | Continuous integration: required checks, dependency audit, image builds *(coming soon)* | `ci.yml` |
++| 7.2 | [Continuous integration: required checks, dependency audit, image builds](02-continuous-integration.qmd) | `ci.yml` |
+```
+
+After committing the regenerated pages: `exit code 0`. Should it be required? It takes seconds, never fails at random, and guards against a mistake that has happened: yes. Not in the reference code, where the site workflow runs the same check for pull requests that change `course/`.
+:::
+
+## Stretch
+
+Measure what the layer cache saves in CI. GitHub's Actions API reports each step's start and end; compare the Build step of two runs of the `image` job on the same pull request, the first with an empty cache and a later one. For this lesson's pull request:
+
+```text
+first run  (empty cache)          Build 61 s   image job 1 min 46 s
+second run (cache from the first) Build  9 s   image job    38 s
+```
+
+The second push changed only a lesson file, nothing under `atlas/`, so every layer, Atlas's own included, came from the cache; a push that changes Atlas's code would also rebuild the small last layers (about 1 MB, lesson 7.1), and a change to `uv.lock` the 185 MB dependency layer. Two things to find out yourself:
+
+- Push a one-line change to a Python file and measure the Build step again. Where does it land between 9 and 61 seconds, and why?
+- Actions caches are scoped: not every run can read every cache. Look up in GitHub's documentation on dependency caching which caches a pull request's run may restore. What does that mean for the first run of every new pull request, and what would the `push` trigger's runs on `main` change?
+
+## What changed in the project
+
+`.github/workflows/ci.yml`: runs on every pull request, weekly and on demand; read-only token; cancels superseded runs; a dependency audit with pip-audit; a migration check on seeded data; a new `image` job that builds with layer caching, checks imports, the user and git, and fails on fixable high or critical vulnerabilities. `tests/seed.py` and `tests/test_seed.py`. Unused loop variables fixed in two workflows (actionlint). Commits: `feat: Added a dependency audit, an image build and scan, and a migration check on data to CI`, `ci: Ran CI on every pull request so its checks can be required`.

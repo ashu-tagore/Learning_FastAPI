@@ -299,7 +299,7 @@ Up, all the way down, up again, then "do the models match?". It catches a migrat
 
 ## Trade-offs: renaming without downtime *(deep dive)*
 
-The rename above is instant, but it breaks every program still using the old name: during a deploy, the old version of Atlas keeps running for a minute alongside the new one (lesson 7.6), and it still asks for `github_login`. The standard technique is **expand and contract**, in several deploys:
+The rename above is instant, but it breaks every program still using the old name: during a deploy, the old version of Atlas keeps running for a minute alongside the new one (lesson 7.8), and it still asks for `github_login`. The standard technique is **expand and contract**, in several deploys:
 
 | Step | Schema | Code |
 |---|---|---|
@@ -307,14 +307,14 @@ The rename above is instant, but it breaks every program still using the old nam
 | 2. Switch | (no change) | reads the new column, still writes both |
 | 3. Contract | drop `github_login` | uses only the new column |
 
-Each step works with the code before and after it, so there's never a moment when running code expects a column that isn't there. It's slower and more work, so it's worth it only where downtime isn't acceptable. Atlas, a course project, takes the simple rename during development; lesson 7.7 applies expand and contract to production changes.
+Each step works with the code before and after it, so there's never a moment when running code expects a column that isn't there. It's slower and more work, so it's worth it only where downtime isn't acceptable. Atlas, a course project, takes the simple rename during development; lesson 7.10 applies expand and contract to production changes.
 
 ## Common mistakes
 
 - **Trusting autogenerate blindly**: a renamed column becomes drop-and-add, and the data is gone. Read every migration.
 - **Editing a migration that already ran elsewhere.** Other databases won't rerun it. Write a new migration instead.
 - **Models and migrations drifting apart**: someone changes a model and forgets the migration. `alembic check` in CI catches it.
-- **Long locks in production**: `CREATE INDEX` blocks writes to the table while it builds. On big tables Postgres offers `CREATE INDEX CONCURRENTLY` (outside a transaction); lesson 7.7 covers zero-downtime schema changes.
+- **Long locks in production**: `CREATE INDEX` blocks writes to the table while it builds. On big tables Postgres offers `CREATE INDEX CONCURRENTLY` (outside a transaction); lesson 7.10 covers zero-downtime schema changes.
 - **No downgrade.** Write it, and run it once, while the change is fresh in your mind.
 
 ## Check yourself
@@ -328,7 +328,7 @@ The `alembic_version` table holds the revision the database is at. Alembic follo
 **2.** In "The problem", why didn't `alembic downgrade -1` bring the logins back?
 
 ::: {.callout-tip collapse="true" title="Answer"}
-`downgrade()` reverses the *schema* change: it re-adds the `github_login` column. The data was deleted by the `DROP COLUMN` and isn't stored anywhere a migration can reach. A downgrade can only restore data that the upgrade kept; recovering deleted data needs a backup (lesson 7.7).
+`downgrade()` reverses the *schema* change: it re-adds the `github_login` column. The data was deleted by the `DROP COLUMN` and isn't stored anywhere a migration can reach. A downgrade can only restore data that the upgrade kept; recovering deleted data needs a backup (lesson 7.9).
 :::
 
 **3.** What does `alembic stamp 0001` change in the database?

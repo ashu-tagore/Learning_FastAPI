@@ -138,7 +138,7 @@ sequenceDiagram
 
 ### Liveness and readiness
 
-A running service gets asked two different questions by the machines around it (lesson 7.9 uses both):
+A running service gets asked two different questions by the machines around it (lesson 7.6 uses both):
 
 - **Liveness**: "is the process up and answering?" If not, restart it. `/health` answers this, and touches nothing else, so a database outage doesn't make every instance restart in a loop.
 - **Readiness**: "can it do real work right now?" If not, stop sending it traffic for a while. `/ready` answers this by asking the database for `SELECT 1`.

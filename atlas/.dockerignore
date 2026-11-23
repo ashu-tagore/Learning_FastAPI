@@ -1,0 +1,8 @@
+# An allowlist (lesson 7.1): ignore everything, then name what the build needs.
+# Anything not named here never reaches the build, including a .env with real secrets,
+# the local .venv, test databases and caches.
+*
+!pyproject.toml
+!uv.lock
+!src/
+**/__pycache__

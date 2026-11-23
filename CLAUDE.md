@@ -25,6 +25,8 @@ Follow the template in `docs/context/06-conventions.md`: analogy, theory, diagra
 
 ```bash
 cd atlas && docker compose up -d                           # local Postgres (Part 3 onward)
+cd atlas && docker compose --profile app up -d --build     # the whole system from the production image (7.1)
+cd atlas && docker build -t atlas .                        # the production image alone (7.1)
 export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
 export TEST_REDIS_URL=redis://localhost:6379/15             # queue, cache, stream tests (Part 5 onward)
 export TEST_S3_URL=http://localhost:8333                   # object storage tests (lesson 5.4; SeaweedFS from compose)

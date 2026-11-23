@@ -100,7 +100,8 @@ website:
       - section: "Part 7: Production on AWS"
         href: part-7-production-aws/index.qmd
         contents:
-          []
+          - part-7-production-aws/01-production-containers.qmd
+          - part-7-production-aws/02-continuous-integration.qmd
       - section: "Part 8: AI engineering: Atlas Agents"
         href: part-8-atlas-agents/index.qmd
         contents:

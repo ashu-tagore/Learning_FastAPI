@@ -197,7 +197,7 @@ Rules that follow:
 
 - **Never disable certificate checks** (`verify=False`, `curl -k`) to "make an error go away". That removes the authentication guarantee completely. Fix the cause instead.
 - **Send tokens and passwords only over HTTPS.**
-- In production, your API will sit behind HTTPS too (lesson 7.5).
+- In production, your API will sit behind HTTPS too (lesson 7.7).
 
 ## Common mistakes
 

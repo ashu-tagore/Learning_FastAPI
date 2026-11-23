@@ -129,7 +129,7 @@ CREATE INDEX notes_live_issue_idx ON notes (issue_ref) WHERE deleted_at IS NULL;
 | Undo | impossible (without backups) | set `deleted_at` back to `NULL` |
 | Every query | simple | must remember `WHERE deleted_at IS NULL` |
 | Unique constraints | simple | a deleted row still blocks a new one with the same value, unless the constraint is partial too |
-| Privacy laws ("delete my data") | satisfied | not satisfied: the data is still there (lesson 7.11) |
+| Privacy laws ("delete my data") | satisfied | not satisfied: the data is still there (lesson 7.14) |
 
 Use soft delete when users need undo or you need history for business reasons; use hard delete by default. Atlas hard-deletes closed issues, because GitHub remains the source of truth.
 

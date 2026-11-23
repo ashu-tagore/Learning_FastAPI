@@ -27,7 +27,7 @@ The obvious fix is to clone and index inside the request. Here's what that costs
 first sync (clone + full index): 403 files, 2437 chunks in 3.74s
 ```
 
-Almost four seconds with the admin's browser waiting, for a small repository on a fast network. A large repository takes minutes, and every web server and load balancer in front of Atlas gives up on a request long before that (AWS's load balancer's default idle timeout is 60 seconds; lesson 7.5b meets it). Worse, while one request is busy cloning, the work is tied to that request: if the client disconnects or the server restarts for a deploy, the half-done clone is simply abandoned and nobody knows.
+Almost four seconds with the admin's browser waiting, for a small repository on a fast network. A large repository takes minutes, and every web server and load balancer in front of Atlas gives up on a request long before that (AWS's load balancer's default idle timeout is 60 seconds; lesson 7.6 meets it). Worse, while one request is busy cloning, the work is tied to that request: if the client disconnects or the server restarts for a deploy, the half-done clone is simply abandoned and nobody knows.
 
 So the work has to happen somewhere else, later, in a separate process. That raises the real question of this lesson: **how do you hand work to another process without ever losing it?**
 
@@ -58,7 +58,7 @@ The job wasn't deleted when it was received, only moved to an "in flight" list w
 
 A **queue** is a list of messages waiting to be processed, held by a separate service so that it outlives any one process. The process that adds messages is the **producer** (the API, and later the scheduler). The process that takes and handles them is the **consumer**, usually called a **worker**. They never talk to each other directly, which is the point: the API can answer in milliseconds, and workers can be slow, restarted, or scaled to ten copies without the API noticing.
 
-Atlas's messages are tiny: just a **job id**, a number. Everything about the job (what kind, which repository, how many attempts, the last error) lives in a Postgres table, `jobs`. Two reasons. Postgres is where Atlas keeps state it can't afford to lose, with transactions and backups (lesson 7.7a). And a message that is only an id can be delivered twice, or late, without carrying stale instructions: the worker always reads the job's current state.
+Atlas's messages are tiny: just a **job id**, a number. Everything about the job (what kind, which repository, how many attempts, the last error) lives in a Postgres table, `jobs`. Two reasons. Postgres is where Atlas keeps state it can't afford to lose, with transactions and backups (lesson 7.9). And a message that is only an id can be delivered twice, or late, without carrying stale instructions: the worker always reads the job's current state.
 
 ### Delivery guarantees
 

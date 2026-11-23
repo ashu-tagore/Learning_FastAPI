@@ -72,7 +72,7 @@ Part 7 can't be written before Parts 5 and 6 exist: its lessons deploy their cod
 |---|---|---|---|---|
 | 7.1 | Production containers | A 1.5 GB image that runs as root and rebuilds on every change | Multi-stage builds, layer caching, non-root user, image scanning | Image sizes and build times, before and after |
 | 7.2 | Continuous integration | A broken migration merged on Friday | Required checks, dependency audit, image build, caching | A red build blocking a bad PR |
-| 7.3 | AWS foundations | An access key committed to a repo; a surprise bill | IAM least privilege, roles not keys, budget alarm first, regions | The budget alarm email; a denied IAM call |
+| 7.3 | AWS from zero | An access key committed to a repo; a surprise bill | For a first-time AWS user: creating a Free plan account, the console, the root user and MFA, an everyday IAM user, the AWS CLI; then IAM least privilege, roles not keys, budget alarm first, regions; and checking which services the Free plan allows, with current prices | The budget alarm email; a denied IAM call; the Free plan's eligible services |
 | 7.4 | Infrastructure as code with Terraform | Click-ops drift between two environments | State, plans, modules kept shallow, remote state locking | `terraform plan` diffs |
 | 7.5a | The network and the data: VPC, RDS, S3, SQS | A database reachable from the internet | Subnets, security groups, private RDS, no NAT gateway (cost) | A blocked connection from outside |
 | 7.5b | Running Atlas: ECR, ECS Fargate, ALB, Secrets Manager | A task that starts, fails health checks and loops | Task definitions, health checks from 4.4, secrets injection, autoscaling basics | ECS events of a failing then healthy deploy |
@@ -88,11 +88,13 @@ Part 7 can't be written before Parts 5 and 6 exist: its lessons deploy their cod
 | 7.13 | Incident response | A real outage from the 7.14 drill, replayed | On-call, runbooks, blameless postmortems | A written postmortem |
 | 7.14 | Review and practice | | Game-day failure drill | |
 
-Part 7 grows from 14 to 17 lessons (7.5 and 7.7 split). Final curriculum: 103 lessons. The split ids (7.5a and so on) become proper numbers when M7 starts.
+Found while building 7.1, for 7.12 (old 7.9, Reliability) to start from: when Redis lost its data (a restarted container, no volume), jobs waiting to retry stayed `queued` forever. Their queue messages were gone, and the scheduler re-sends only jobs that never started (lesson 5.2). Jobs 27, 29 and 31 had to be re-sent by hand.
+
+Part 7 grows from 14 to 17 lessons (7.5 and 7.7 split). Final curriculum: 103 lessons. The split ids (7.5a and so on) became proper numbers when M7 started (D31): 7.5a to 7.5c are 7.5 to 7.7, 7.6 is 7.8, 7.7a and 7.7b are 7.9 and 7.10, and 7.8 to 7.14 are 7.11 to 7.17.
 
 ## Risks
 
 - **Renumbering** touches many files at once. Mitigation: a script, its own commit, and a link check on the rendered site.
 - **Length vs momentum**: a truly-zero learner may stall in longer lessons. Mitigation: each lesson keeps a "minimum path" (sections marked optional) and the 4.20 self-check.
 - **Accuracy at greater length**: more claims to verify. The rule stays: every output is captured from running code.
-- **Cost (Part 7)**: depth means more AWS resources. The budget alarm stays the first step, and each lesson ends with teardown.
+- **Cost (Part 7)**: depth means more AWS resources. The budget alarm stays the first step, and each lesson ends with teardown. The database is the largest running cost; the owner asked (2026-11-23) to keep Postgres and keep its cost low, so lesson 7.5 compares Postgres options on AWS (the smallest RDS instance, Aurora Serverless scaling to zero when idle, free-tier credits) with prices checked at the time, and picks the cheapest that still teaches running a database on AWS.
