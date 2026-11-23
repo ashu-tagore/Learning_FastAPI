@@ -131,7 +131,7 @@ This part absorbs the original 17-chapter FastAPI tutorial (tag `posts-api-v1`),
 |---|---|---|
 | 7.1 | Production containers: multi-stage Dockerfiles, a non-root user, the full compose stack | Production images |
 | 7.2 | Continuous integration: required checks, dependency audit, image builds | `ci.yml` |
-| 7.3 | AWS foundations: accounts, IAM, regions, budgets and billing alarms | AWS account, budget |
+| 7.3 | AWS from zero: creating a Free plan account, the console, the root user and MFA, IAM users and roles, regions, the AWS CLI, budgets and billing alarms | AWS account, budget |
 | 7.4 | Infrastructure as code with Terraform | `infra/` |
 | 7.5 | The network and the data: VPC, subnets, RDS, S3, SQS | Private network, database |
 | 7.6 | Running Atlas: ECR, ECS Fargate, load balancer, health checks, Secrets Manager | Live services |

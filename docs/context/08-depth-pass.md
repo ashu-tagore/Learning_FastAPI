@@ -72,7 +72,7 @@ Part 7 can't be written before Parts 5 and 6 exist: its lessons deploy their cod
 |---|---|---|---|---|
 | 7.1 | Production containers | A 1.5 GB image that runs as root and rebuilds on every change | Multi-stage builds, layer caching, non-root user, image scanning | Image sizes and build times, before and after |
 | 7.2 | Continuous integration | A broken migration merged on Friday | Required checks, dependency audit, image build, caching | A red build blocking a bad PR |
-| 7.3 | AWS foundations | An access key committed to a repo; a surprise bill | IAM least privilege, roles not keys, budget alarm first, regions | The budget alarm email; a denied IAM call |
+| 7.3 | AWS from zero | An access key committed to a repo; a surprise bill | For a first-time AWS user: creating a Free plan account, the console, the root user and MFA, an everyday IAM user, the AWS CLI; then IAM least privilege, roles not keys, budget alarm first, regions; and checking which services the Free plan allows, with current prices | The budget alarm email; a denied IAM call; the Free plan's eligible services |
 | 7.4 | Infrastructure as code with Terraform | Click-ops drift between two environments | State, plans, modules kept shallow, remote state locking | `terraform plan` diffs |
 | 7.5a | The network and the data: VPC, RDS, S3, SQS | A database reachable from the internet | Subnets, security groups, private RDS, no NAT gateway (cost) | A blocked connection from outside |
 | 7.5b | Running Atlas: ECR, ECS Fargate, ALB, Secrets Manager | A task that starts, fails health checks and loops | Task definitions, health checks from 4.4, secrets injection, autoscaling basics | ECS events of a failing then healthy deploy |
