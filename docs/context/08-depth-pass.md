@@ -97,4 +97,4 @@ Part 7 grows from 14 to 17 lessons (7.5 and 7.7 split). Final curriculum: 103 le
 - **Renumbering** touches many files at once. Mitigation: a script, its own commit, and a link check on the rendered site.
 - **Length vs momentum**: a truly-zero learner may stall in longer lessons. Mitigation: each lesson keeps a "minimum path" (sections marked optional) and the 4.20 self-check.
 - **Accuracy at greater length**: more claims to verify. The rule stays: every output is captured from running code.
-- **Cost (Part 7)**: depth means more AWS resources. The budget alarm stays the first step, and each lesson ends with teardown.
+- **Cost (Part 7)**: depth means more AWS resources. The budget alarm stays the first step, and each lesson ends with teardown. The database is the largest running cost; the owner asked (2026-11-23) to keep Postgres and keep its cost low, so lesson 7.5 compares Postgres options on AWS (the smallest RDS instance, Aurora Serverless scaling to zero when idle, free-tier credits) with prices checked at the time, and picks the cheapest that still teaches running a database on AWS.
