@@ -155,7 +155,9 @@ The third stage is the image that runs:
 ```dockerfile
 FROM python:3.13-slim AS runtime
 
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+ARG SECURITY_UPDATES_DATE=unset
+RUN echo "Debian security updates as of ${SECURITY_UPDATES_DATE}" \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends git \
@@ -181,7 +183,7 @@ EXPOSE 8000
 CMD ["uvicorn", "atlas.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
 ```
 
-(In the repository, a comment explains each step; each is also explained below, because each was added for a reason this lesson measured.) `USER atlas` makes every later step and the running container use that user. `PYTHONUNBUFFERED=1` sends Python's output straight to the log, instead of holding it in a buffer a crash would lose. `0.0.0.0`, because inside a container `127.0.0.1` is the container alone (lesson 2.2). One image serves every Atlas process: the API by default, and `atlas worker`, `atlas scheduler`, `atlas notifier` or `atlas init-db` when given as the command.
+(In the repository, a comment explains each step; each is also explained below, because each was added for a reason this lesson measured. `ARG SECURITY_UPDATES_DATE` comes from lesson 7.2, where the build cache turned out to keep an old security update forever.) `USER atlas` makes every later step and the running container use that user. `PYTHONUNBUFFERED=1` sends Python's output straight to the log, instead of holding it in a buffer a crash would lose. `0.0.0.0`, because inside a container `127.0.0.1` is the container alone (lesson 2.2). One image serves every Atlas process: the API by default, and `atlas worker`, `atlas scheduler`, `atlas notifier` or `atlas init-db` when given as the command.
 
 ### Measured, step by step
 

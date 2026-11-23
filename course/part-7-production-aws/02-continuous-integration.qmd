@@ -275,6 +275,54 @@ concurrency:
 
 - `schedule` runs the workflow every Monday at 04:23 UTC with no code change. Lesson 7.1's `apt-get upgrade` takes security updates at build time and the scanner's database grows daily, so the same commit can pass on Monday and fail the next week. The schedule makes that visible within a week instead of at the next unrelated pull request. (`cron` fields: minute, hour, day of month, month, day of week.)
 - `workflow_dispatch` adds a "Run workflow" button.
+
+The day after this lesson's checks first passed, with no code change at all, the `image` job went red. The vulnerability scan:
+
+```text
+Total: 56 (HIGH: 56, CRITICAL: 0)
+│ libgssapi-krb5-2 │ CVE-2026-107364 │ HIGH     │ fixed  │ 1.21.3-5+deb13u1  │ 1.21.3-5+deb13u2 │ krb5: Unauthenticated KDC DoS based on ASN.1 decoder read    │
+...
+##[error]Process completed with exit code 1.
+```
+
+Debian had released fixes for Kerberos (`krb5`, an authentication library) overnight. The slim base image doesn't contain it; it arrived with git, through git's HTTP library (`libcurl3t64-gnutls`), one more reason lesson 7.1's API-only image would scan cleaner. The image runs `apt-get upgrade` precisely to pick up such fixes (lesson 7.1), yet the Build step took 8 seconds: every layer came from the cache, including the upgrade from the day before. The cache had quietly turned "today's security updates" into "the first day's, forever". Reproduced locally:
+
+```text
+#19 [runtime 2/8] RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' ... && apt-get upgrade --yes ...
+#19 CACHED
+```
+
+Docker reruns a step when its inputs change, and a **build argument** (`ARG`) is an input to every `RUN` after it. So the Dockerfile declares one, and CI passes the date:
+
+```dockerfile
+ARG SECURITY_UPDATES_DATE=unset
+RUN echo "Debian security updates as of ${SECURITY_UPDATES_DATE}" \
+    && sed -i ... && apt-get update && apt-get upgrade --yes && ...
+```
+
+```yaml
+      - name: Date
+        id: date
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          ...
+          build-args: SECURITY_UPDATES_DATE=${{ steps.date.outputs.today }}
+```
+
+`$GITHUB_OUTPUT` is a file where a step leaves values for later steps, read back as `steps.<id>.outputs.<name>`. Three builds with the argument:
+
+```text
+== SECURITY_UPDATES_DATE=2026-11-23
+#8 0.808 Debian security updates as of 2026-11-23
+== SECURITY_UPDATES_DATE=2026-11-23
+#13 CACHED
+== SECURITY_UPDATES_DATE=2026-11-24
+#14 0.077 Debian security updates as of 2026-11-24
+```
+
+A new date runs the step again; the same date uses the cache. Afterwards `libkrb5-3` was at `1.21.3-5+deb13u2` and the scan passed (exit code 0). Each day's first build pays for the upgrade once; the rest of the day stays fast. A red build that no code change caused is the scan doing its job: here it found a flaw in how the image was built, not in Atlas.
 - `permissions: contents: read` gives the workflow's token read access to the code and nothing else: a compromised step, say in a third-party action, can't push code or change settings.
 - `concurrency` cancels the run for an older push to the same pull request when a newer one arrives.
 

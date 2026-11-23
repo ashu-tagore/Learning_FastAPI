@@ -50,7 +50,12 @@ FROM python:3.13-slim AS runtime
 # `upgrade` applies Debian's security fixes that the base image doesn't have yet: the
 # image scan found one (zlib) after Debian had released its fix. The price: builds on
 # different days can differ, so CI rebuilds and rescans regularly (lesson 7.2).
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+# The build cache would otherwise keep the first day's upgrade forever: CI's scan went
+# red overnight on Kerberos fixes this step had never fetched (lesson 7.2). A new value
+# here makes Docker run this step again; CI passes the date, so it runs once a day.
+ARG SECURITY_UPDATES_DATE=unset
+RUN echo "Debian security updates as of ${SECURITY_UPDATES_DATE}" \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends git \

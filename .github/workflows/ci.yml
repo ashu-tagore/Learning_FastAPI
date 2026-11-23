@@ -119,11 +119,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      # Today's date, so the image's security-update step runs once a day instead of being
+      # reused from the cache forever (lesson 7.2).
+      - name: Date
+        id: date
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
       - name: Build
         uses: docker/build-push-action@v6
         with:
           context: atlas
           tags: atlas:ci
+          build-args: SECURITY_UPDATES_DATE=${{ steps.date.outputs.today }}
           # Into the runner's Docker, for the checks below; pushing is lesson 7.8's job.
           load: true
           # Layers cached between runs, so an unchanged lock file means an unchanged
