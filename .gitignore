@@ -26,3 +26,11 @@ wheels/
 course/_site/
 course/.quarto/
 /.quarto/
+
+# Terraform (lesson 7.4): downloaded providers and any local state never go in git.
+# State lives in S3; .terraform.lock.hcl, which pins provider checksums, is committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log

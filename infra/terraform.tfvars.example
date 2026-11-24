@@ -1,0 +1,3 @@
+# Copy to terraform.tfvars (ignored by git: it holds your email address) and fill in.
+alert_email        = "you@example.com"
+monthly_budget_usd = 5

@@ -156,3 +156,30 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3 \
             image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 atlas:ci
 
+  # Atlas's AWS configuration (lesson 7.4), checked without an AWS account: formatting,
+  # validity, tests against a mocked AWS provider, and a scan for insecure settings.
+  infra:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+      - name: Format
+        run: terraform fmt -check -recursive
+      - name: Validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+          terraform -chdir=bootstrap init -backend=false -input=false
+          terraform -chdir=bootstrap validate
+      - name: Tests against a mocked AWS
+        run: terraform test
+      - name: Configuration scan
+        run: |
+          docker run --rm -v "$PWD:/infra:ro" aquasec/trivy:0.69.3 \
+            config --quiet --exit-code 1 --severity HIGH,CRITICAL /infra
+
