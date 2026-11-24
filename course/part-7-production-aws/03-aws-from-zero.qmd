@@ -1,0 +1,295 @@
+---
+title: "7.3 AWS from zero"
+description: "Your first AWS account, set up safely: what AWS is, the Free plan, the root user and why it gets MFA and no keys, an everyday IAM user, permissions and a denied request, regions, signing in from the command line without long-lived keys, and a budget before anything else is built."
+---
+
+::: {.lesson-meta}
+Part 7 · Lesson 3 · About 2 hours
+:::
+
+::: {.callout-warning title="About the AWS output in this lesson"}
+This lesson was written without an AWS account (decision D33). Output that would come from AWS itself is written from AWS's documentation and shown in boxes labelled **Expected output, not run on AWS**: your screens and messages may differ in detail. Everything else, such as the secret scan and the AWS CLI's behaviour on your own computer, was run for real.
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "Step by step". The trade-offs section *(deep dive)* covers IAM Identity Center, several accounts, and access keys.
+:::
+
+::: {.callout-note title="Analogy: the master key and the staff badges"}
+A new office building comes with one master key that opens every door, including the safe and the fuse box. Nobody carries it around: it goes in a safe, with a second lock. Each person gets a badge that opens the doors their job needs. When a badge is lost, you cancel that badge, not change every lock.
+
+An AWS account comes with a **root user**, the master key. You lock it away behind **multi-factor authentication**, and do your daily work as an **IAM user**, a badge with exactly the permissions you give it.
+:::
+
+## The problem
+
+Two ways new AWS users get hurt, both common enough to have names.
+
+**The leaked key.** A learner wants their code to talk to AWS, so they create an **access key** (a long-lived username and password for programs) and put it in `.env`. It gets committed. Realising, they delete the file in the next commit. Here is that repository, with a randomly generated key in AWS's format (not a real one):
+
+```text
+$ git log --oneline
+523cf8b Removed .env
+354ba53 Added settings
+$ ls -A
+.git  .gitignore
+```
+
+A **secret scanner** reads every commit, not just the latest. gitleaks, a free one:
+
+```text
+$ docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.0 git /repo --verbose --redact=85
+Finding:     AWS_SECRET_ACCESS_KEY=zaatKV...
+RuleID:      generic-api-key
+File:        .env
+Line:        3
+Finding:     AKI...
+RuleID:      aws-access-token
+File:        .env
+Line:        2
+WRN leaks found: 2
+```
+
+The key is still in the history, visible to anyone who can read the repository. Automated scanners search public repositories for exactly this, and a key with broad permissions can be used to start expensive machines on your account. Deleting the file doesn't undo a leak: the key has to be **deactivated**.
+
+(A detail found while preparing this example: AWS's documentation uses a fake key, `AKIAIOSFODNN7EXAMPLE`, and gitleaks deliberately ignores it, reporting `no leaks found`, because it appears in thousands of tutorials. Test a scanner with a realistic fake, not the famous one.)
+
+**The surprise bill.** Someone tries a service, forgets it running, and a month later the bill arrives. AWS's budget alerts help, but they aren't instant: AWS's documentation says budget information "is updated up to three times a day", typically 8 to 12 hours after the previous update, and "you might incur additional costs or usage that exceed your budget notification threshold before AWS Budgets can notify you".
+
+This lesson sets up an account so that neither can happen to you: no long-lived keys exist to leak, and on the Free plan, AWS doesn't charge at all.
+
+## Theory
+
+### What AWS is
+
+**Amazon Web Services** (AWS) rents computing out by the second: machines, databases, storage, networks, each as a **service** you control through a web page or an API. Instead of buying a server for Atlas, you'll ask AWS to run Atlas's container (7.6), give it a database (7.5), and put it behind an address on the internet (7.7), and you pay (or, on the Free plan, spend credits) only while they exist. Everything you do in the web page, the **AWS Management Console**, is an API call underneath, which is why everything can also be done from the command line (this lesson) and from code (7.4).
+
+### An account, and the Free plan
+
+An **AWS account** is a container for everything you create and the bill for it, identified by a 12-digit **account id**. When you sign up you choose a plan. AWS's documentation, read in November 2026:
+
+- New accounts get **USD $100 in credits** at sign-up, and can earn **up to $100 more** by completing activities ($20 each). Two of those activities are steps this course takes anyway: creating a cost budget (this lesson) and creating an RDS database (lesson 7.5).
+- On the **Free plan**, "you won't incur any charges while you explore AWS services". It ends after **six months** or when the credits are used, whichever comes first; the account then closes unless you upgrade to the **Paid plan** within 90 days.
+- The Free plan doesn't include services "that could possibly deplete your credits", and joining AWS Organizations (a multi-account setup) upgrades the account to the Paid plan automatically. Atlas needs neither.
+
+So the order for this course is: create the account when you're ready to work through the AWS lessons, not before, since the six months start at sign-up.
+
+### Identities: the root user, IAM users, roles
+
+Every request to AWS is made by an **identity**, and AWS decides whether to allow it.
+
+- The **root user** is the email address you signed up with. It can do everything, including closing the account, and no permission can restrict it. AWS's own advice: protect it with MFA, don't create access keys for it, and "instead of accessing the root user, create an administrative user for everyday tasks".
+- **IAM** (Identity and Access Management) is the AWS service that manages who can do what. An **IAM user** is a long-lived identity for a person (with a console password) or, historically, a program (with an access key).
+- An **IAM role** is an identity with no password or key of its own: something *assumes* it and receives **temporary credentials** that expire. Atlas's containers will use roles (7.6), and GitHub Actions will too (7.8). Lesson 5.4 already relied on this: on AWS, the worker gets credentials from its role, so no key exists to leak.
+- **Multi-factor authentication** (MFA) means a password isn't enough to sign in: you also need a second factor, such as a code from an authenticator app or a passkey.
+
+### Permissions: policies, and least privilege
+
+What an identity may do is written in **policies**, JSON documents of **statements**:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::atlas-snapshots/*"
+    }
+  ]
+}
+```
+
+Each statement allows (or denies) **actions** (`service:Operation`) on **resources**, named by an **ARN** (Amazon Resource Name: `arn:aws:service:region:account:resource`). Anything not allowed is denied. AWS-managed policies, written by AWS, cover common needs: `AdministratorAccess` allows everything; `ReadOnlyAccess` allows reading almost everything.
+
+**Least privilege** means giving each identity only what it needs. A badge that opens only the doors you use limits the damage when it's lost. A denied request comes back as an error of this form (from AWS's documentation): "User *user* is not authorized to perform *action* on *resource*".
+
+### Regions
+
+AWS runs separate data centres around the world, grouped into **regions** such as `us-east-1` (Northern Virginia) or `eu-west-1` (Ireland). Most resources live in one region; you choose it per request. Atlas uses `us-east-1`, because CloudFront (lesson 7.7) requires its HTTPS certificates to be created there, and keeping everything in one region keeps it simpler. Each region is split into **availability zones**, separate buildings with separate power: lesson 7.5 spreads the network across two.
+
+```{mermaid}
+flowchart TB
+    Root["Root user<br/>(email + MFA)<br/>locked away"] -.creates once.-> Admin
+    subgraph Account["AWS account 1234-5678-9012 (Free plan)"]
+        Admin["IAM user: you<br/>console password + MFA<br/>AdministratorAccess"]
+        Reader["IAM user: reader<br/>ReadOnlyAccess<br/>(to see a denial)"]
+        Budget["AWS Budgets<br/>alerts by email"]
+        Roles["IAM roles (7.6, 7.8)<br/>temporary credentials<br/>for containers and CI"]
+    end
+    Admin -->|aws login:<br/>temporary credentials,<br/>no access key| CLI[AWS CLI on your computer]
+```
+
+## Step by step
+
+### 1. Create the account
+
+On `aws.amazon.com`, choose **Create a free account**. You give an email address (it becomes the root user, so use one you'll keep; AWS recommends a group address for organisations), a password and an account name, verify the email and a phone number, and choose the **Free plan**. AWS's FAQ says a payment method "isn't required to sign up for most new customers", though AWS may ask for one to verify your identity.
+
+When it's done, the console's home page shows your account. Your 12-digit account id is in the menu under your account name at the top right.
+
+### 2. Lock away the root user
+
+Still signed in as root: account menu, **Security credentials**, **Multi-factor authentication (MFA)**, **Assign MFA device**. Choose a passkey or an authenticator app, and follow the steps. Then check the same page shows **no access keys** for root, and leave it that way.
+
+From now on, sign in as root only for the few tasks only root can do (such as closing the account).
+
+### 3. An everyday user for you
+
+Open **IAM** (type it in the console's search box), **Users**, **Create user**:
+
+- User name: your name, say `ada`.
+- Tick **Provide user access to the AWS Management Console**, choose **I want to create an IAM user**, and set a password.
+- Permissions: **Attach policies directly**, then `AdministratorAccess` and `SignInLocalDevelopmentAccess`.
+
+`AdministratorAccess` because you're the account's administrator and will build everything in Part 7; least privilege applies to Atlas's own identities, which get far less (7.6). `SignInLocalDevelopmentAccess` allows exactly two actions, `signin:AuthorizeOAuth2Access` and `signin:CreateOAuth2Token`: what the command line needs to sign in as you (step 5).
+
+The user list shows a **console sign-in URL** with your account id: bookmark it. Sign out of root, sign in there as `ada`, and add MFA to `ada` too (IAM, Users, `ada`, Security credentials, Assign MFA device).
+
+### 4. A budget, first
+
+Before building anything: **Billing and Cost Management**, **Budgets**, **Create budget**, **Use a template**, **Monthly cost budget**, a budget amount of USD 5, and your email address. This is one of the Free plan's credit-earning activities.
+
+On the Free plan you won't be charged, so what is the budget for? It watches the **credits**: at $5 a month, an email arrives long before the credits are gone, and Part 7's lessons, which tear down everything at the end, should never come close. Lesson 7.4 then moves the budget into code, with alerts at 50%, 80% and 100%.
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+The email that AWS Budgets sends when actual costs pass a threshold names the budget, the threshold and the amounts: for example, that the actual cost of `Monthly cost budget` has exceeded 80% of the USD 5.00 budgeted. Remember the delay: up to three updates a day, typically 8 to 12 hours apart.
+:::
+
+### 5. The command line, without keys
+
+Install the AWS CLI version 2 (AWS's guide "Installing or updating to the latest version of the AWS CLI" has a one-line installer per system), at least version 2.32.0. Run on this course's build machine:
+
+```text
+$ aws --version
+aws-cli/2.42.2 Python/3.14.10 Linux/6.18.44-fc-v819 exe/x86_64.ubuntu.24
+$ aws sts get-caller-identity
+
+aws: [ERROR]: An error occurred (NoCredentials): Unable to locate credentials. You can configure credentials by running "aws login".
+```
+
+`sts get-caller-identity` asks AWS "who am I?". With no credentials, the CLI can't even ask, and suggests `aws login`. That command opens a browser, where you sign in to the console as `ada` (with MFA); the CLI then receives **temporary credentials**, which it refreshes for up to 12 hours. Nothing secret is written to a file you could commit.
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ aws login
+(a browser opens; you sign in as ada with MFA; the terminal confirms the login)
+$ aws sts get-caller-identity
+{
+    "UserId": "AIDA...",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/ada"
+}
+```
+:::
+
+`Arn` names who AWS thinks you are: user `ada` in your account. Check it whenever a command does something unexpected; most AWS confusion is "I'm not who I thought I was".
+
+### 6. Watch a permission work: a denied request
+
+Create a second IAM user, `reader`, with only `ReadOnlyAccess` and `SignInLocalDevelopmentAccess`, sign the CLI in as it under a separate **profile** (a named set of credentials: `aws login --profile reader`), and try to create a storage bucket:
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ aws s3 ls --profile reader
+(lists any buckets: reading is allowed)
+$ aws s3 mb s3://atlas-denied-demo-123456789012 --profile reader
+make_bucket failed: s3://atlas-denied-demo-123456789012 An error occurred (AccessDenied) when calling the CreateBucket operation: User: arn:aws:iam::123456789012:user/reader is not authorized to perform: s3:CreateBucket on resource: "arn:aws:s3:::atlas-denied-demo-123456789012" because no identity-based policy allows the s3:CreateBucket action
+```
+:::
+
+The message follows AWS's documented format: who (`user/reader`), what (`s3:CreateBucket`), on what, and why ("no identity-based policy allows"). Reading that sentence carefully solves most permission problems. Then delete `reader`: an unused identity is one more thing to leak.
+
+### 7. Choose the region
+
+```bash
+aws configure set region us-east-1
+```
+
+This writes the default region to `~/.aws/config` (a settings file, no secrets). Commands now go to Northern Virginia unless told otherwise.
+
+## Trade-offs *(deep dive)*
+
+**IAM users or IAM Identity Center.** For organisations, AWS recommends **IAM Identity Center**: people sign in through one portal, with permission sets instead of per-account users. It's designed around AWS Organizations, which would move a Free plan account to the Paid plan. For one person learning in one account, an IAM user with MFA is simpler and stays on the Free plan.
+
+**Access keys.** Some tools still only accept an access key. If you must create one, give it to a user with only the permissions that tool needs, store it outside the repository, rotate it, and delete it when done. `aws login` and roles exist so that you rarely need one.
+
+**One account or several.** Companies separate production, staging and experiments into different accounts, so a mistake in one can't touch another. That requires Organizations; Atlas uses one account.
+
+**`AdministratorAccess` for you.** Least privilege for a human administrator is a trade-off between safety and getting work done. MFA, no keys, and temporary credentials make the broad permission much safer; Atlas's own identities (7.6, 7.8) get narrow ones.
+
+## Common mistakes
+
+- **Using the root user day to day**, or creating access keys for it.
+- **Access keys in `.env`, in code, or in chat**: they end up in history. Deleting the file doesn't help; deactivate the key.
+- **Testing a secret scanner with AWS's example key**: scanners ignore it on purpose.
+- **Trusting a budget alert as a brake**: it's hours late. The Free plan's "no charges" is the guarantee; the budget is the early warning.
+- **Signing up long before you need the account**: the Free plan's six months start at sign-up.
+- **Creating things in the wrong region**, then not finding them. Check the region selector, and `aws configure get region`.
+
+## Check yourself
+
+**1.** A key was committed, then the file deleted in the next commit and pushed. What must you do, and why isn't deleting enough?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Deactivate (and delete) the key in IAM, then check what was done with it. The key is still in the repository's history, readable by anyone who can read the repository, and scanners find exactly this; deleting the file only hides it from the latest commit.
+:::
+
+**2.** `aws s3 mb` fails with "is not authorized to perform: s3:CreateBucket ... because no identity-based policy allows the s3:CreateBucket action". What three things does that message tell you?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Who made the request (the user's ARN), which action was refused (`s3:CreateBucket`) on which resource, and why: no policy attached to that identity allows it (as opposed to a policy explicitly denying it). The fix is a policy that allows that action, if the identity should have it.
+:::
+
+**3.** You're on the Free plan. Why set up a budget at all?
+
+::: {.callout-tip collapse="true" title="Answer"}
+To watch the credits. The Free plan won't charge you, but when the credits run out the plan ends and the account closes. A small budget with alerts warns you early that something is consuming credits, such as a resource left running after a lesson.
+:::
+
+## Exercise
+
+In the console's IAM **policy editor** (IAM, Policies, Create policy, JSON), write a policy that allows reading and writing objects in one bucket, `atlas-snapshots-123456789012`, and nothing else. Which actions does Atlas's worker actually use (lesson 5.4's `snapshots.py`)?
+
+::: {.callout-tip collapse="true" title="Solution"}
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListSnapshots",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::atlas-snapshots-123456789012"
+    },
+    {
+      "Sid": "ReadWriteSnapshots",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::atlas-snapshots-123456789012/*"
+    }
+  ]
+}
+```
+
+The worker's snapshot code (lesson 5.4) calls `head_object`, `upload_file`, `list_objects_v2` and `delete_object`, and the API signs download links with `generate_presigned_url`. Those need `s3:GetObject` (reading an object, and `head_object`), `s3:PutObject` (uploading, including the multipart uploads `upload_file` uses for large files), `s3:DeleteObject` (pruning) and `s3:ListBucket` (listing). Two details that trip people up:
+
+- **Two resources.** `s3:ListBucket` acts on the *bucket* (`arn:aws:s3:::atlas-snapshots-123456789012`), the object actions on its *objects* (`.../*`). Putting all four on one ARN makes some of them match nothing.
+- **Why `s3:ListBucket` matters for more than listing.** S3's documentation for `HeadObject`: if the object doesn't exist and you lack `s3:ListBucket`, S3 answers **403 Forbidden** instead of 404. Atlas's `exists()` treats only `404` or `NoSuchKey` as "missing" and raises on anything else, so without `s3:ListBucket` every snapshot of a new commit would fail. (Read from S3's documentation and Atlas's code, not run on AWS.)
+
+The policy is checked as valid JSON; IAM's policy editor also checks its grammar when you save it. Lesson 7.6 attaches the equivalent policy, written in Terraform, to the worker's role.
+:::
+
+## Stretch
+
+Turn on secret scanning for your own `my-atlas` repository before you create any key: run gitleaks over its whole history, then add it to your CI (lesson 7.2) so a pull request with a key fails. Check it with a randomly generated fake key, not AWS's example key.
+
+## What changed in the project
+
+No code: an AWS account on the Free plan, a root user with MFA and no keys, an everyday IAM user with MFA, the AWS CLI signed in with `aws login`, `us-east-1` as the default region, and a USD 5 monthly cost budget. Decision D33 records how this lesson's AWS output was written.
