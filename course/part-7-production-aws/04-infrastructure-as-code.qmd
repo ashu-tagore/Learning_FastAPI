@@ -1,0 +1,585 @@
+---
+title: "7.4 Infrastructure as code with Terraform"
+description: "Describe Atlas's AWS resources in code instead of clicking: Terraform's providers, resources, variables, plans and state; state stored safely in S3 with locking; the provider lock file; tests that run against a mocked AWS; and a security scan of the configuration, all checked in CI."
+---
+
+::: {.lesson-meta}
+Part 7 · Lesson 4 · About 3 hours
+:::
+
+::: {.callout-warning title="About the AWS output in this lesson"}
+This lesson was written without an AWS account (decision D33). Terraform itself runs offline, so its formatting, validation, tests, plans against a mocked AWS, and the security scan below are real output. Output that only AWS can produce (creating real resources, drift in a real account) is written from documentation and labelled **Expected output, not run on AWS**.
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project". The trade-offs section *(deep dive)* covers Terraform's alternatives, mocks against real tests, and environments.
+:::
+
+::: {.callout-note title="Analogy: the recipe, not the meal"}
+A chef who cooks from memory makes a slightly different dish every night, and nobody else can make it at all. A written recipe can be read before cooking, followed by anyone, improved in one place, and used again tomorrow. If a cook changes the dish on the plate, the recipe shows what it should have been.
+
+**Infrastructure as code** is the recipe for your AWS account. **Terraform** reads it, compares it with what exists, and tells you exactly what it will change before it changes anything.
+:::
+
+## The problem
+
+In lesson 7.3 you created a budget by clicking through the console. Now imagine all of Atlas made that way: a network, a database, containers, a load balancer, permissions, a CDN, each with dozens of settings. Then:
+
+- **A second copy.** You want a staging environment identical to production. You click through it all again, from memory, and get one setting different that nobody notices for a month.
+- **Drift.** Someone changes the database's backup window in the console to fix something urgent at 2 a.m. Nobody writes it down. Three weeks later, nobody knows why the two environments behave differently.
+- **Review.** A pull request can't show "I clicked Save on this page". There is no diff, no reviewer, no history.
+- **Teardown.** Part 7 tears everything down after each lesson to save credits. By hand, you'll forget something, and it will keep running.
+
+Clicking is how you learn what exists; it's not how you run it.
+
+## Theory
+
+### Infrastructure as code
+
+**Infrastructure as code** (IaC) means describing infrastructure in text files kept in git, and letting a tool make reality match them. The description is **declarative**: you write *what should exist* ("a budget of USD 5 with three alerts"), not the steps to create it. The tool works out the steps, including the difference between what exists and what should.
+
+### Terraform's pieces
+
+**Terraform** reads `.tf` files written in HCL (HashiCorp Configuration Language) in one folder, a **module**.
+
+- A **provider** is a plugin that knows one platform's API: `hashicorp/aws` turns Terraform's requests into AWS API calls.
+- A **resource** is one thing to manage: `resource "aws_budgets_budget" "monthly" { ... }` has a type (`aws_budgets_budget`), a local name (`monthly`), and arguments.
+- A **variable** is an input (`var.alert_email`), with a type, a default and validation rules.
+- A **data source** reads something that already exists without managing it: `data "aws_caller_identity" "current"` asks who you're signed in as.
+
+The workflow is four commands:
+
+1. `terraform init` downloads providers and connects to where state is stored.
+2. `terraform plan` compares the files with reality and prints what it *would* change: `+` create, `~` update, `-` destroy.
+3. `terraform apply` makes those changes, after showing the plan again and asking you to confirm.
+4. `terraform destroy` removes everything this module created.
+
+### State, and why it lives in S3
+
+Terraform remembers which real resource belongs to which block in a **state** file: the budget block corresponds to the budget with that id. Without state, it couldn't tell "create a new one" from "update the existing one".
+
+State on a laptop is lost with the laptop, and can't be shared with CI or a colleague. So Atlas keeps it in an S3 bucket, with **state locking**: while one person applies, a lock file stops anyone else from applying at the same time, which would corrupt the state. Since Terraform 1.10, the S3 backend can lock with a file in the bucket itself (`use_lockfile`), with no extra database.
+
+That bucket has to exist before Terraform can store anything in it, so a tiny separate module creates it first: the **bootstrap** module, which keeps its own state on your computer.
+
+### The lock file
+
+`.terraform.lock.hcl` records the exact provider version and its checksums, so every machine uses exactly the same plugin, and a tampered download is refused. It's committed to git, like `uv.lock`.
+
+### Testing without AWS
+
+`terraform test` runs `.tftest.hcl` files. Each `run` block plans or applies the module and checks `assert` conditions. With a `mock_provider`, no AWS call is made: Terraform invents values for whatever AWS would have returned. Mocked tests can't tell you whether AWS will *accept* the configuration, but they do check everything that's Atlas's own: names, thresholds, which settings are on. That's the kind of mistake that otherwise reaches production unnoticed.
+
+```{mermaid}
+flowchart LR
+    Code[".tf files in git<br/>(what should exist)"] --> Plan["terraform plan<br/>compare with state<br/>and reality"]
+    State[("State in S3<br/>with a lock file")] <--> Plan
+    Plan -->|"+ create  ~ update  - destroy"| Review[You, or a reviewer<br/>in a pull request]
+    Review --> Apply["terraform apply"]
+    Apply --> AWS[(AWS account)]
+    Apply --> State
+    Code --> Tests["terraform test<br/>mocked AWS, in CI"]
+```
+
+## In the project
+
+### The bootstrap module: `infra/bootstrap/main.tf`
+
+```hcl
+data "aws_caller_identity" "current" {}
+
+resource "aws_s3_bucket" "state" {
+  # Bucket names are global across all of AWS: the account id makes this one unique.
+  bucket = "atlas-terraform-state-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" { ... }
+
+resource "aws_s3_bucket_public_access_block" "state" {
+  bucket                  = aws_s3_bucket.state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+`${...}` inserts a value into a string; `aws_s3_bucket.state.id` refers to another resource's attribute, which also tells Terraform to create the bucket first. Versioning keeps every previous state, so a broken one can be rolled back. State lists every resource's details, sometimes including secrets, so the bucket blocks all public access.
+
+### The main module: `infra/`
+
+`versions.tf` pins Terraform and the provider, and points state at the bucket:
+
+```hcl
+terraform {
+  required_version = ">= 1.10"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.74.0"
+    }
+  }
+
+  backend "s3" {
+    key          = "atlas/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+`~> 6.74.0` allows patch releases (6.74.1) but not 6.75: a new minor version becomes a reviewed change. The bucket's name isn't here because it contains your account id; it's given at `init` time with `-backend-config`.
+
+`providers.tf` tags everything Terraform creates, so anyone looking in the console sees it's managed by code and shouldn't be edited there:
+
+```hcl
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Project   = "atlas"
+      ManagedBy = "terraform"
+    }
+  }
+}
+```
+
+`variables.tf` declares the inputs; validation turns a typo into an error before anything is sent to AWS:
+
+```hcl
+variable "alert_email" {
+  description = "Where budget alerts go. No default: an alert nobody receives is no alert."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "alert_email must be an email address."
+  }
+}
+```
+
+`can(...)` is true when the expression inside succeeds, so this checks the value looks like an email address. Values come from `terraform.tfvars`, which git ignores because it holds your email address; `terraform.tfvars.example` shows its shape.
+
+And `budget.tf`, lesson 7.3's budget as code:
+
+```hcl
+resource "aws_budgets_budget" "monthly" {
+  name         = "atlas-monthly"
+  budget_type  = "COST"
+  limit_amount = format("%.2f", var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  cost_types {
+    include_credit = false
+  }
+
+  dynamic "notification" {
+    for_each = toset([50, 80, 100])
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "ACTUAL"
+      subscriber_email_addresses = [var.alert_email]
+    }
+  }
+}
+```
+
+- `include_credit = false` is the important line for the Free plan. With credits included, the cost would read 0 until the credits ran out, and the alert would arrive exactly when it's too late. Without them, the budget shows how fast credits are being spent.
+- A `dynamic` block repeats a nested block once per item: three `notification` blocks, at 50, 80 and 100%.
+- `format("%.2f", 5)` gives `"5.00"`, the text AWS stores.
+
+Which arguments exist, and which names they take, came from the provider itself, not from memory: `terraform providers schema -json` prints every resource's exact arguments for the installed version. That's how `include_credit` was found.
+
+### Checks that run anywhere
+
+```text
+$ terraform fmt -check -diff
+example.tf
+--- old/example.tf
++++ new/example.tf
+ variable "region" {
+-type=string
+-  default = "us-east-1"
+-    description="Where Atlas runs."
++  type        = string
++  default     = "us-east-1"
++  description = "Where Atlas runs."
+ }
+$ echo $?
+3
+```
+
+`fmt` lays out every file the same way; `-check` fails (exit code 3) instead of rewriting. `validate` checks the configuration is internally consistent. A typo in an argument name is caught without AWS. Here, a misspelled backend setting:
+
+```text
+$ terraform init
+Error: Unsupported argument
+An argument named "use_lock_file" is not expected here. Did you mean
+```
+
+### Red, then green: tests against a mocked AWS
+
+`infra/tests/budget.tftest.hcl`:
+
+```hcl
+mock_provider "aws" {}
+
+variables {
+  alert_email = "alerts@example.com"
+}
+
+run "budget_alerts_at_50_80_and_100_percent_before_credits" {
+  command = plan
+
+  assert {
+    condition     = toset([for n in aws_budgets_budget.monthly.notification : n.threshold]) == toset([50, 80, 100])
+    error_message = "The budget must alert at 50%, 80% and 100%."
+  }
+
+  assert {
+    condition     = aws_budgets_budget.monthly.cost_types[0].include_credit == false
+    error_message = "Credits must be excluded, or the budget reads 0 until they run out."
+  }
+  ...
+}
+
+run "an_alert_address_must_be_an_email" {
+  command = plan
+
+  variables {
+    alert_email = "not-an-email"
+  }
+
+  expect_failures = [var.alert_email]
+}
+```
+
+`[for n in ... : n.threshold]` builds a list from another (like a Python list comprehension); `expect_failures` says this run *should* fail on that variable's validation. With `include_credit = true`, the mistake this test exists for:
+
+```text
+  run "budget_alerts_at_50_80_and_100_percent_before_credits"... fail
+Error: Test assertion failed
+  on tests/budget.tftest.hcl line 18, in run "budget_alerts_at_50_80_and_100_percent_before_credits":
+Credits must be excluded, or the budget reads 0 until they run out.
+  run "an_alert_address_must_be_an_email"... pass
+Failure! 1 passed, 1 failed.
+```
+
+And with the code as above:
+
+```text
+tests/budget.tftest.hcl... in progress
+  run "budget_alerts_at_50_80_and_100_percent_before_credits"... pass
+  run "an_alert_address_must_be_an_email"... pass
+tests/budget.tftest.hcl... pass
+
+Success! 2 passed, 0 failed.
+```
+
+`terraform test -verbose` also prints each run's plan. This is a real plan, computed with the mocked AWS:
+
+```text
+Terraform will perform the following actions:
+
+  # aws_budgets_budget.monthly will be created
+  + resource "aws_budgets_budget" "monthly" {
+      + account_id        = (known after apply)
+      + arn               = (known after apply)
+      + budget_type       = "COST"
+      + limit_amount      = "5.00"
+      + limit_unit        = "USD"
+      + name              = "atlas-monthly"
+      + time_unit         = "MONTHLY"
+
+      + cost_types {
+          + include_credit = false
+        }
+
+      + notification {
+          + comparison_operator        = "GREATER_THAN"
+          + notification_type          = "ACTUAL"
+          + subscriber_email_addresses = [
+              + "alerts@example.com",
+            ]
+          + threshold                  = 100
+          + threshold_type             = "PERCENTAGE"
+        }
+      ...
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+`(known after apply)` marks values only AWS can assign, such as the ARN. A second test that first applies (to the mock), then plans with `monthly_budget_usd = 8`, shows what a change looks like:
+
+```text
+  # aws_budgets_budget.monthly will be updated in-place
+  ~ resource "aws_budgets_budget" "monthly" {
+        id                = "wr16bcsl"
+      ~ limit_amount      = "5.00" -> "8.00"
+        name              = "atlas-monthly"
+        # (8 unchanged attributes hidden)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+Updated in place, not destroyed and recreated. (The id is the mock's invention.) Reading plans like this one before every apply is the habit that prevents most Terraform accidents: a `-/+` (destroy, then create) on a database means its data goes with it.
+
+### A security scan of the configuration
+
+Trivy, lesson 7.1's image scanner, also reads Terraform:
+
+```text
+bootstrap/main.tf (terraform)
+Tests: 1 (SUCCESSES: 0, FAILURES: 1)
+Failures: 1 (HIGH: 1, CRITICAL: 0)
+AWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key.
+```
+
+The rule wants the state bucket encrypted with a **customer managed key** in AWS KMS (Key Management Service), which gives control over rotation and who can use the key. AWS's KMS documentation lists the price: a "monthly fee for existence of keys (pro-rated hourly)" plus usage, while keys S3 manages have "no charges to customer". For a learning account's private, versioned state bucket, that control isn't worth spending credits on. So the rule is suppressed *on that one resource*, with the reason written next to it:
+
+```hcl
+# Encrypted with keys S3 manages, at no charge. The scanner (AWS-0132) prefers a customer
+# managed KMS key, which gives control over rotation and access, for a monthly fee per key
+# (AWS KMS documentation). For a learning account's state bucket, that control isn't worth
+# spending credits on; the bucket is private and versioned either way (lesson 7.4).
+#trivy:ignore:AWS-0132
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
+```
+
+Rescanned: 0 findings. A suppression is a decision, so it carries its reason; a rule switched off globally would hide the next bucket's problem too.
+
+### In CI
+
+A new `infra` job in `ci.yml` runs the same checks on every pull request, with no AWS account:
+
+```yaml
+  infra:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+      - name: Format
+        run: terraform fmt -check -recursive
+      - name: Validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+          terraform -chdir=bootstrap init -backend=false -input=false
+          terraform -chdir=bootstrap validate
+      - name: Tests against a mocked AWS
+        run: terraform test
+      - name: Configuration scan
+        run: |
+          docker run --rm -v "$PWD:/infra:ro" aquasec/trivy:0.69.3 \
+            config --quiet --exit-code 1 --severity HIGH,CRITICAL /infra
+```
+
+`-backend=false` initialises without connecting to the S3 state, which only exists in a real account.
+
+A problem found while building it: the first lock file listed checksums for Linux only, because only the Linux provider had been downloaded. On a Mac, `terraform init` would have refused the provider as not matching any checksum. `terraform providers lock` with `-platform=linux_amd64`, `darwin_arm64`, `darwin_amd64` and `windows_amd64` records all four.
+
+### Running it for real
+
+With an account (lesson 7.3), the order is:
+
+```bash
+cd infra/bootstrap && terraform init && terraform apply
+cd infra && terraform init -backend-config="bucket=atlas-terraform-state-123456789012"
+cp terraform.tfvars.example terraform.tfvars   # then put your email address in it
+terraform plan
+terraform apply
+```
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ terraform init -backend-config="bucket=atlas-terraform-state-123456789012"
+Initializing the backend...
+
+Successfully configured the backend "s3"! Terraform will automatically
+use this backend unless the backend configuration changes.
+...
+Terraform has been successfully initialized!
+
+$ terraform apply
+...
+Plan: 1 to add, 0 to change, 0 to destroy.
+
+Do you want to perform these actions?
+  Terraform will perform the actions described above.
+  Only 'yes' will be accepted to approve.
+
+  Enter a value: yes
+
+aws_budgets_budget.monthly: Creating...
+aws_budgets_budget.monthly: Creation complete after 1s [id=123456789012:atlas-monthly]
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+```
+:::
+
+Since lesson 7.3 already created a budget by hand, delete that one in the console first: two budgets would send two sets of emails.
+
+Drift, as it would look: someone changes the budget to USD 20 in the console, and the next plan shows Terraform putting it back.
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ terraform plan
+aws_budgets_budget.monthly: Refreshing state... [id=123456789012:atlas-monthly]
+
+Note: Objects have changed outside of Terraform
+...
+  ~ limit_amount      = "5.00" -> "20.00"
+...
+Terraform will perform the following actions:
+
+  # aws_budgets_budget.monthly will be updated in-place
+  ~ resource "aws_budgets_budget" "monthly" {
+      ~ limit_amount      = "20.00" -> "5.00"
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+:::
+
+Either the console change was a mistake and `apply` reverts it, or it was right and belongs in the code. The plan forces the question.
+
+## Trade-offs *(deep dive)*
+
+**Terraform or its alternatives.** **OpenTofu** is a community fork of Terraform, compatible with it and under an open-source licence (Terraform's licence since 2023 restricts competing commercial use, which doesn't affect learners). **CloudFormation** and the **CDK** are AWS's own tools: AWS-only, and the CDK uses ordinary programming languages. Terraform is used across clouds and by most job descriptions that ask for IaC.
+
+**Mocked tests or real ones.** Mocks check Atlas's own decisions, fast and free, with no account. They can't check that AWS accepts a combination of settings, or that a security group really blocks traffic. Real tests create real resources, cost credits and take minutes. Atlas runs mocked tests in CI, and the verification pass (D33) is the real test.
+
+**Modules.** Terraform modules can be nested and published. Atlas keeps one root module plus the bootstrap, split into files by topic (`budget.tf`, and later `network.tf`, `database.tf`). Deep module trees are hard to read, for the same reasons as deep class hierarchies.
+
+**Environments.** A real team would have staging and production: two state files, often two accounts, from the same code with different variables. Atlas has one environment; lesson 7.17 asks how you'd add a second.
+
+## Common mistakes
+
+- **Editing in the console what Terraform manages**: the next plan undoes it.
+- **Applying without reading the plan**, especially a `-/+` on a database.
+- **State on a laptop, or in git**: lost, or leaked (state contains resource details and sometimes secrets).
+- **No lock file in git**, or one for a single platform.
+- **Switching a scanner rule off globally** instead of suppressing one resource with a reason.
+- **`terraform.tfvars` in git** with personal details.
+
+## Check yourself
+
+**1.** Why does the bootstrap module keep its own state locally, while the main module keeps it in S3?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The bootstrap module creates the S3 bucket; it can't store its state in a bucket that doesn't exist yet. It manages one bucket that rarely changes, so a local state file is acceptable. Everything else lives in that bucket, where CI and other people can reach it, with locking.
+:::
+
+**2.** A plan shows `-/+ resource "aws_db_instance" "atlas"`. What does that mean, and what should you do?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Terraform will destroy the database and create a new one, because some argument changed that can't be updated in place. The data goes with the old instance. Stop, find which argument forces replacement (the plan marks it), and either avoid the change or plan a migration (a snapshot and restore, lesson 7.9).
+:::
+
+**3.** What can a test with `mock_provider` catch, and what can't it?
+
+::: {.callout-tip collapse="true" title="Answer"}
+It catches mistakes in Atlas's own configuration: a wrong threshold, a setting left off, a name built incorrectly, a validation rule that doesn't fire. It can't catch anything that depends on AWS: whether AWS accepts the settings, permissions, quotas, or real network behaviour. Those need a real account.
+:::
+
+## Exercise
+
+Add a **forecast** alert: AWS projects the month's cost from spending so far, and this alert fires when the forecast passes 100% of the budget, before the money is actually spent. Write the test first, watch it fail, then add the notification.
+
+::: {.callout-tip collapse="true" title="Solution"}
+The test, `infra/tests/forecast.tftest.hcl`:
+
+```hcl
+mock_provider "aws" {}
+
+variables {
+  alert_email = "alerts@example.com"
+}
+
+run "warns_when_the_forecast_passes_the_budget" {
+  command = plan
+
+  assert {
+    condition     = length([for n in aws_budgets_budget.monthly.notification : n if n.notification_type == "FORECASTED" && n.threshold == 100]) == 1
+    error_message = "One forecast alert at 100% is expected."
+  }
+}
+```
+
+`[for n in ... : n if ...]` keeps only the matching items. Before the change:
+
+```text
+  run "warns_when_the_forecast_passes_the_budget"... fail
+  on tests/forecast.tftest.hcl line 11, in run "warns_when_the_forecast_passes_the_budget":
+One forecast alert at 100% is expected.
+Failure! 0 passed, 1 failed.
+```
+
+Then, in `budget.tf`, after the `dynamic` block:
+
+```hcl
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = [var.alert_email]
+  }
+```
+
+```text
+Success! 3 passed, 0 failed.
+```
+
+The original test still passes: its set of thresholds is still `{50, 80, 100}`. Not in the reference code. Forecasts need some spending history to be meaningful, and Part 7's resources live for hours at a time.
+:::
+
+## Stretch
+
+Test the bootstrap module too. A `mock_data` block makes the mocked `aws_caller_identity` return a known account id, so the bucket's name can be checked:
+
+```hcl
+mock_provider "aws" {
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "123456789012"
+    }
+  }
+}
+
+run "the_state_bucket_is_private_versioned_and_named_after_the_account" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket.state.bucket == "atlas-terraform-state-123456789012"
+    error_message = "The bucket name must include the account id."
+  }
+  ...
+}
+```
+
+Add assertions that versioning is `Enabled` and that all four public access settings are `true`; run it from `infra/bootstrap` (`Success! 1 passed, 0 failed.` with all three). Which of these would you most regret losing?
+
+## What changed in the project
+
+`infra/`: `bootstrap/main.tf` (the state bucket: versioned, encrypted, private), `versions.tf` (Terraform 1.10+, AWS provider 6.74, S3 state with a lock file), `providers.tf` (default tags), `variables.tf` (with validation), `budget.tf` (the monthly budget, credits excluded, alerts at 50, 80 and 100%), `tests/budget.tftest.hcl`, `terraform.tfvars.example`, lock files for four platforms. `.gitignore` gains Terraform's working files. CI gains an `infra` job: format, validate, mocked tests and a configuration scan. Commit: `feat: Added Terraform for Atlas's AWS budget and state bucket, checked offline in CI`.
