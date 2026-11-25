@@ -45,7 +45,7 @@ from atlas.api.schemas import ErrorResponse
 from atlas.config import ApiSettings
 from atlas.llm.calls import make_chat, make_embeddings
 from atlas.logs import configure_logging, current_request_id
-from atlas.queue import RedisQueue
+from atlas.queue import make_queue
 from atlas.snapshots import SnapshotStore, make_s3_client
 
 logger = logging.getLogger("atlas.api")
@@ -87,7 +87,7 @@ def create_app(
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
         # Connects lazily, on the first send: the API starts even while Redis is down.
         redis_client = redis.Redis.from_url(settings.redis_url)
-        app.state.queue = RedisQueue(redis_client)
+        app.state.queue = make_queue(settings, redis_client)
         # Creating the client makes no network call; nor does signing a download link.
         app.state.snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
         # The asyncio flavour of the same client library: rate limits and the cache are

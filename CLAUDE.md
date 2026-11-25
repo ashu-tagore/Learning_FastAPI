@@ -30,7 +30,8 @@ cd atlas && docker build -t atlas .                        # the production imag
 export TEST_DATABASE_URL=postgresql+psycopg://atlas:atlas-dev-password@localhost:5432/atlas_test
 export TEST_REDIS_URL=redis://localhost:6379/15             # queue, cache, stream tests (Part 5 onward)
 export TEST_S3_URL=http://localhost:8333                   # object storage tests (lesson 5.4; SeaweedFS from compose)
-cd atlas && uv sync && uv run pytest                       # reference tests (DB, Redis and S3 tests skip without their URLs)
+export TEST_SQS_URL=http://localhost:9324                  # SQS queue tests (lesson 7.5; ElasticMQ from compose)
+cd atlas && uv sync && uv run pytest                       # reference tests (DB, Redis, S3 and SQS tests skip without their URLs)
 cd atlas && uv run atlas init-db                           # run migrations (needs DATABASE_URL)
 cd atlas && uv run alembic revision --autogenerate -m "..."  # new migration; review it, rename the revision to the next number
 cd atlas && SECRET_KEY=dev-only-key-at-least-32-characters-long WEB_DIR=../web uv run uvicorn atlas.api.app:create_app --factory --reload --no-access-log  # API + web UI at /app; JSON request logs (lesson 4.15)

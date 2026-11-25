@@ -26,7 +26,7 @@ atlas = "atlas.cli:main"
 
 [dependency-groups]
 dev = [
-    "boto3-stubs[s3]>=1.44.6",
+    "boto3-stubs[s3,sqs]>=1.44.6",
     "mypy>=2.4.1",
     "pre-commit>=4.7.0",
     "pytest>=9.2.0",

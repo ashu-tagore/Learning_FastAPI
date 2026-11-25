@@ -50,7 +50,7 @@ from atlas.llm.calls import cost_usd, make_chat, make_embeddings, record
 from atlas.logs import configure_logging
 from atlas.models import Issue, IssueFit, Job, LlmCall, Repo, User
 from atlas.notifier import run_notifier as run_notifier_loop
-from atlas.queue import RedisQueue
+from atlas.queue import make_queue
 from atlas.search import DEFAULT_EXTENSIONS, search
 from atlas.snapshots import SnapshotStore, make_s3_client
 from atlas.stats import collect_stats
@@ -416,7 +416,8 @@ def worker_context() -> WorkerContext | None:
     snapshots = SnapshotStore(make_s3_client(settings), settings.snapshot_bucket)
     events = EventStream(redis_client)
     embedder = make_embeddings(settings)
-    return WorkerContext(factory, RedisQueue(redis_client), settings, snapshots, events, embedder)
+    queue = make_queue(settings, redis_client)
+    return WorkerContext(factory, queue, settings, snapshots, events, embedder)
 
 
 def run_worker() -> int:

@@ -33,6 +33,17 @@ services:
       interval: 2s
       retries: 15
 
+  # A local stand-in for Amazon SQS, which is Atlas's job queue on AWS (lesson 7.5). Atlas
+  # uses Redis for jobs unless SQS_QUEUE_URL is set, so only the SQS tests need this.
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports:
+      - "127.0.0.1:9324:9324"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9324/health"]
+      interval: 2s
+      retries: 15
+
   # S3-compatible object storage for repository snapshots (lesson 5.4). On AWS: real S3.
   # `weed mini` runs every SeaweedFS part in one process, which is plenty for development.
   seaweedfs:

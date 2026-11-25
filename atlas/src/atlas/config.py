@@ -21,8 +21,14 @@ class Settings(BaseSettings):
     database_url: str | None = None
     # Optional: without a token GitHub allows 60 requests an hour, with one 5,000.
     github_token: SecretStr | None = None
-    # The job queue (lesson 5.1).
+    # The job queue (lesson 5.1), the cache, rate limits and the event stream (Part 5). On
+    # AWS, ElastiCache Valkey, which speaks the same protocol (lesson 7.5).
     redis_url: str = "redis://localhost:6379/0"
+    # On AWS the job queue is SQS instead of Redis (lesson 7.5). Unset URL means Redis; the
+    # endpoint is set only for a local SQS (ElasticMQ in compose), unset means real AWS.
+    sqs_queue_url: str | None = None
+    sqs_endpoint_url: str | None = None
+    sqs_region: str = "us-east-1"
     # Where the worker keeps its clones of tracked repositories (lesson 5.1).
     repos_dir: Path = Path.home() / ".cache" / "atlas" / "repos"
     # Clones come from here; tests point it at local repositories instead of GitHub.
