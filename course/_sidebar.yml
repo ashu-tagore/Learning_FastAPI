@@ -104,6 +104,7 @@ website:
           - part-7-production-aws/02-continuous-integration.qmd
           - part-7-production-aws/03-aws-from-zero.qmd
           - part-7-production-aws/04-infrastructure-as-code.qmd
+          - part-7-production-aws/05-network-and-data.qmd
       - section: "Part 8: AI engineering: Atlas Agents"
         href: part-8-atlas-agents/index.qmd
         contents:

@@ -1,0 +1,856 @@
+---
+title: "7.5 The network and the data: VPC, subnets, RDS, S3, SQS"
+description: "Give Atlas a private network on AWS and put its data inside: a VPC with public and private subnets, security groups that admit only Atlas, Postgres on RDS, Valkey on ElastiCache, the job queue on SQS and snapshots on S3. Compares the low-cost Postgres options, prices the whole design, and adds an SQS queue to Atlas behind the interface it already has."
+---
+
+::: {.lesson-meta}
+Part 7 · Lesson 5 · About 4 hours
+:::
+
+::: {.callout-warning title="About the AWS output in this lesson"}
+This lesson was written without an AWS account (decision D33). The Python tests run against a local SQS, and the Terraform tests, plan and security scan run offline; their output below is real. Output that only AWS can produce (creating the database, tearing it down) is written from documentation and labelled **Expected output, not run on AWS**. Prices were read from AWS's Price List API on 2026-11-24, for us-east-1; check them again before you build.
+:::
+
+::: {.callout-tip title="Minimum path"}
+Read "The problem", "Theory" and "In the project", and run the tests. The trade-offs section *(deep dive)* covers NAT gateways, VPC endpoints, standby databases and serverless options.
+:::
+
+::: {.callout-note title="Analogy: the bank branch"}
+A bank branch has a public hall with a street door, and a vault at the back with no door to the street at all. Staff move between the two through an inside corridor. A guard at the vault checks one thing: is this person on the staff list? Not their name or their face, just whether they belong to the staff.
+
+A **VPC** is the building. **Public subnets** are the hall, **private subnets** are the vault rooms, and **security groups** are the guards, checking membership of a group rather than individual addresses. Atlas's database and cache go in the vault.
+:::
+
+## The problem
+
+Locally, every Atlas service runs on your laptop, and Docker's network keeps them away from everyone else (lesson 2.2). On AWS, a database you create is a machine in a data centre, and the default question is: who can reach it?
+
+- **A database with a public address** is found by scanners within hours. Every password guess is now somebody else's choice.
+- **Opening a port "temporarily"** to debug from a laptop is how most leaked databases start.
+- **Four places to keep data** (Postgres, Redis, the job queue, the snapshot bucket), each with its own way to be exposed.
+- **Cost.** Each managed service is billed by the hour. A design that's right for a company can use a learner's free credits in weeks.
+
+This lesson builds the network first, then puts each store inside it, and prices every choice.
+
+## Theory
+
+### A VPC, and addresses written as CIDR blocks
+
+A **VPC** (virtual private cloud) is your own private network inside an AWS region. Nothing outside can reach anything inside unless you add a way in.
+
+Its addresses are given as a **CIDR block**: `10.0.0.0/16` means "every address whose first 16 bits match 10.0", which is 10.0.0.0 to 10.0.255.255, about 65,000 addresses. `/24` fixes 24 bits, leaving 256 addresses (AWS keeps five of them in each subnet). Addresses starting with `10.` are private by definition: the internet never routes them.
+
+### Availability zones and subnets
+
+A region is several **availability zones** (AZs): separate data centres a few kilometres apart, with their own power. `us-east-1a` and `us-east-1b` are two of them.
+
+A **subnet** is a slice of the VPC's addresses in one AZ. What makes a subnet public or private is its **route table**, the list of where traffic for each destination goes:
+
+| Subnet | Route for `0.0.0.0/0` (everywhere else) | Meaning |
+|---|---|---|
+| Public | the **internet gateway** | Things here can reach the internet, and be reached, if they have a public IP and their security group allows it |
+| Private | none | Only addresses inside the VPC can reach things here, and they can't reach out |
+
+Every route table also has one route nobody can remove: traffic for the VPC's own addresses stays inside the VPC. That's how a task in a public subnet talks to a database in a private one.
+
+An **internet gateway** is free. A **NAT gateway** lets a private subnet reach *out* without being reachable, but it's billed by the hour (see the costs below).
+
+### Security groups
+
+A **security group** is a firewall attached to a resource. It starts by admitting nothing. Each **rule** admits one kind of traffic, for example "TCP port 5432 from members of the group `atlas-app`". Two properties matter:
+
+- **Stateful**: when a connection is allowed in, its replies are allowed out automatically, with no second rule.
+- **Rules can name another group** instead of addresses. "From `atlas-app`" stays correct however many tasks run and whatever addresses they get, which matters because Fargate tasks get new addresses every time they start (lesson 7.6).
+
+### The managed services
+
+| Data | Locally | On AWS | What AWS runs for you |
+|---|---|---|---|
+| Users, repositories, chunks, jobs | Postgres in Docker | **RDS for PostgreSQL** | the server, patches, backups, encryption |
+| Cache, rate limits, event stream | Redis in Docker | **ElastiCache for Valkey** | the same, for Valkey: an open-source fork of Redis that speaks the same protocol |
+| Job queue | Redis lists | **SQS** (Simple Queue Service) | a queue with visibility timeouts and delays, no server at all |
+| Repository snapshots | SeaweedFS | **S3** | object storage |
+
+Atlas's code was built for this. The queue has been behind the `JobQueue` interface since lesson 5.1, with SQS's delivery rules. The S3 client has always accepted "no endpoint" to mean real AWS (lesson 5.4). This lesson adds the one missing piece: an SQS implementation of `JobQueue`.
+
+### Choosing Postgres on AWS, and pricing it
+
+Prices for us-east-1 from the AWS Price List API, 2026-11-24, on-demand, before credits. A month is 730 hours.
+
+| Option | Price | One month, always on | Notes |
+|---|---|---|---|
+| **RDS `db.t4g.micro`, Single-AZ** | $0.016 an hour, plus gp3 storage at $0.115 per GB-month | $11.68 + $2.30 for 20 GB = **$13.98** | One server in one AZ. 2 vCPUs (burstable), 1 GB of memory. |
+| RDS `db.t4g.micro`, Multi-AZ | $0.032 an hour, plus $0.23 per GB-month | $23.36 + $4.60 = $27.96 | A standby copy in a second AZ takes over if the first fails. |
+| Aurora Serverless v2 | $0.12 per capacity unit (ACU) an hour, plus $0.10 per GB-month | at its smallest active size, 0.5 ACU: $43.80 + storage | Can pause at zero capacity, but only after a period with **no connections**. Atlas's worker and scheduler connect all the time, so it would never pause. |
+
+The first row is the one to choose: it's the cheapest, and it's real Postgres 17 with pgvector 0.8.2 (AWS's extension list for RDS, checked 2026-11-24), so migration 0010's `CREATE EXTENSION vector` works unchanged.
+
+The rest of this lesson's resources:
+
+| Resource | Price | One month, always on |
+|---|---|---|
+| ElastiCache `cache.t4g.micro`, Valkey | $0.0128 an hour (Redis OSS: $0.016) | $9.34 |
+| The database password's secret (Secrets Manager) | $0.40 a month | $0.40 |
+| SQS | $0.40 per million requests | one worker asking every 2 seconds: about 1.3 million, $0.53 |
+| VPC, subnets, route tables, internet gateway, security groups | no charge | $0 |
+| S3 | per GB stored and per request | negligible for a few MB of snapshots |
+
+Lesson 7.6 adds the load balancer and the containers. All of Atlas, running all the time, comes to about $98 a month, which would use the Free plan's $200 of credits in about two months. So decision D34 runs Atlas **only while you study it**:
+
+- Each AWS lesson ends with `terraform destroy`.
+- The database leaves a **final snapshot** (a saved copy of its disk) when destroyed, and the next session restores it.
+- This lesson's resources cost about $0.03 an hour while they exist, so a three-hour session costs about 10 cents.
+
+```{mermaid}
+flowchart TB
+  subgraph VPC["VPC 10.0.0.0/16"]
+    subgraph PUB["Public subnets 10.0.0.0/24, 10.0.1.0/24"]
+      APP["Atlas tasks (7.6)<br/>security group atlas-app"]
+    end
+    subgraph PRIV["Private subnets 10.0.10.0/24, 10.0.11.0/24<br/>no route to the internet"]
+      DB[("RDS Postgres<br/>atlas-database: 5432 from atlas-app")]
+      VK[("ElastiCache Valkey<br/>atlas-cache: 6379 from atlas-app")]
+    end
+  end
+  IGW[Internet gateway] --- PUB
+  APP -->|5432| DB
+  APP -->|6379, TLS| VK
+  APP -->|HTTPS| GH[GitHub]
+  APP -->|HTTPS| SQS[[SQS atlas-jobs]]
+  APP -->|HTTPS| S3[(S3 atlas-snapshots)]
+```
+
+SQS and S3 aren't in the VPC: they're regional AWS services reached over HTTPS, and permission to use them comes from IAM (lesson 7.3), not from the network.
+
+## In the project
+
+### The network: `infra/network.tf`
+
+Two availability zones, because RDS and load balancers refuse a single one:
+
+```hcl
+locals {
+  availability_zones = ["${var.region}a", "${var.region}b"]
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+  # Names like the database's endpoint only resolve inside the VPC with both of these on.
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = { Name = "atlas" }
+}
+```
+
+`count` makes one subnet per zone; `count.index` is 0, then 1, so the public subnets get `10.0.0.0/24` and `10.0.1.0/24`, and the private ones `10.0.10.0/24` and `10.0.11.0/24`:
+
+```hcl
+resource "aws_subnet" "public" {
+  count = length(local.availability_zones)
+
+  vpc_id            = aws_vpc.main.id
+  availability_zone = local.availability_zones[count.index]
+  cidr_block        = "10.0.${count.index}.0/24"
+  # Off: a public IP costs money and exposes whatever gets it. Atlas's tasks ask for one
+  # explicitly (7.6); nothing else launched here should get one by accident.
+  map_public_ip_on_launch = false
+
+  tags = { Name = "atlas-public-${local.availability_zones[count.index]}" }
+}
+```
+
+The two route tables are the whole difference between public and private:
+
+```hcl
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = { Name = "atlas-public" }
+}
+
+# No routes besides the one every route table has: traffic within the VPC. That's what
+# makes these subnets private, so it's written out instead of left to the VPC's default.
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  tags = { Name = "atlas-private" }
+}
+```
+
+Each subnet is attached to its table by an `aws_route_table_association`. Then three security groups: `atlas-app` for Atlas's tasks, and one each for the database and the cache, which admit only `atlas-app`:
+
+```hcl
+resource "aws_security_group" "database" {
+  name        = "atlas-database"
+  description = "Postgres: only Atlas's tasks"
+  vpc_id      = aws_vpc.main.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "database_from_app" {
+  security_group_id            = aws_security_group.database.id
+  description                  = "Postgres from Atlas's tasks"
+  referenced_security_group_id = aws_security_group.app.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+}
+```
+
+Each rule is its own resource (`aws_vpc_security_group_ingress_rule`), not a block inside the group. Changing one rule then changes only that rule, and a reviewer sees exactly which one. The database and cache groups have no outbound rules: Terraform removes AWS's default "allow all outbound" rule from the groups it creates, and replies to allowed connections don't need one.
+
+`atlas-app` may send anything anywhere. The worker clones from GitHub and every process calls AWS's APIs. The scan below has something to say about that.
+
+### The data: `infra/data.tf`
+
+The database, with each setting that matters explained where it is set:
+
+```hcl
+resource "aws_db_instance" "main" {
+  identifier = "atlas"
+  # 17, as locally (pgvector/pgvector:pg17); RDS picks the newest 17.x and applies newer
+  # minor versions in the maintenance window. RDS ships pgvector, so migration 0010's
+  # CREATE EXTENSION works unchanged.
+  engine                     = "postgres"
+  engine_version             = "17"
+  auto_minor_version_upgrade = true
+  instance_class             = "db.t4g.micro"
+  allocated_storage          = 20
+  storage_type               = "gp3"
+  storage_encrypted          = true
+
+  db_name  = "atlas"
+  username = "atlas"
+  # RDS generates the password and keeps it in Secrets Manager. It never appears in this
+  # code or in Terraform's state; Atlas's tasks read it from the secret (lesson 7.6).
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.database.id]
+  publicly_accessible    = false
+  # One copy in one zone: a standby in a second zone doubles the price, and an outage of
+  # a study project costs nothing (D34).
+  multi_az = false
+
+  backup_retention_period = 1
+  copy_tags_to_snapshot   = true
+  # Atlas is destroyed after every study session (D34); the data survives as a final
+  # snapshot, and the next session restores it with `-var database_snapshot=<its name>`.
+  # The name has the creation time in it, because two snapshots can't share a name.
+  skip_final_snapshot       = false
+  final_snapshot_identifier = "atlas-final-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  snapshot_identifier       = var.database_snapshot
+
+  lifecycle {
+    # timestamp() changes on every plan: without this, every plan would show a change.
+    # snapshot_identifier matters only when the database is created.
+    ignore_changes = [final_snapshot_identifier, snapshot_identifier]
+  }
+}
+```
+
+New pieces of Terraform here:
+
+- `timestamp()` is the current time and `formatdate` writes it as `20261125190000`.
+- A **`lifecycle`** block changes how Terraform treats a resource. `ignore_changes` says: use these arguments when creating it, then never compare them again. Without it, every plan would want to "update" the snapshot name, because the time has moved.
+- `var.database_snapshot` is a new variable, `null` by default. Null means "argument not set": a new, empty database.
+
+A **DB subnet group** tells RDS which subnets it may use: `aws_subnet.private[*].id`, where `[*]` collects the `id` of every subnet that `count` made.
+
+Valkey is one node, with traffic and storage encrypted:
+
+```hcl
+resource "aws_elasticache_replication_group" "main" {
+  replication_group_id = "atlas"
+  description          = "Atlas's cache, rate limits and event stream"
+  engine               = "valkey"
+  engine_version       = "8.2"
+  node_type            = "cache.t4g.micro"
+  num_cache_clusters   = 1
+
+  subnet_group_name  = aws_elasticache_subnet_group.main.name
+  security_group_ids = [aws_security_group.cache.id]
+
+  transit_encryption_enabled = true
+  at_rest_encryption_enabled = true
+  # Everything here can be rebuilt (cached responses, rate-limit windows, notifications
+  # already sent), so it isn't backed up.
+  snapshot_retention_limit = 0
+  apply_immediately        = true
+}
+```
+
+With traffic encrypted, Atlas connects with `rediss://` (two s's: Redis over TLS). Atlas reads it from `REDIS_URL` like any other Redis address, so no code changes; `outputs.tf` builds the URL for lesson 7.6.
+
+The queue matches `RedisQueue`'s five-minute visibility timeout, so a job behaves the same on both:
+
+```hcl
+resource "aws_sqs_queue" "jobs" {
+  name = "atlas-jobs"
+  # Five minutes, as RedisQueue's default: a received job that isn't acknowledged within it
+  # is delivered again, to another worker if need be (lesson 5.1).
+  visibility_timeout_seconds = 300
+  sqs_managed_sse_enabled    = true
+  # No dead-letter queue: attempts and the last error of each job are in Postgres's jobs
+  # table, which stops retrying a job that keeps failing (lesson 5.1). Not covered: a job
+  # that kills the worker itself never reaches that code; lesson 7.5's stretch adds one.
+}
+```
+
+The snapshot bucket is private and encrypted like the state bucket (lesson 7.4). One difference: `force_destroy = true`, so `terraform destroy` can delete it with snapshots inside. They're rebuilt from the repositories at the next sync.
+
+`outputs.tf` exposes what lesson 7.6 needs: the database's address and the **ARN** (Amazon Resource Name, the unique id of any AWS resource) of its password's secret, the Valkey URL, the queue's URL and the bucket's name. It never exposes the password itself.
+
+### SQS in Atlas: `SqsQueue`
+
+SQS has the same rules as `RedisQueue`: a received message is hidden until it's deleted or its visibility timeout ends. Two differences shape the code.
+
+**Deleting needs a receipt.** SQS deletes "this particular delivery", identified by a **receipt handle** it returns with each message, not by the message's content. `ack(job_id)` only has the job's id, so the queue remembers the handle for each job it hands out:
+
+```python
+    def ack(self, job_id: int) -> None:
+        """The job is finished (or handed back to the queue as a new message): forget it."""
+        receipt = self.receipts.pop(job_id, None)
+        if receipt is None:
+            return
+        self._delete(receipt)
+```
+
+**Delays stop at 15 minutes.** `SendMessage` accepts at most 900 seconds of delay. Atlas's retries back off for up to an hour (lesson 5.1), and a GitHub rate limit can defer a job until its reset. So each message carries the time it's due, and one that arrives early goes round again:
+
+```python
+# The longest delay SQS accepts on a message: 15 minutes. Atlas's retries can wait an hour.
+SQS_MAX_DELAY_SECONDS = 900
+```
+
+```python
+    def send(self, job_id: int, delay_seconds: float = 0) -> None:
+        due_at = self.clock() + delay_seconds
+        # Rounded up: a delay rounded down would deliver early and cost an extra hop.
+        delay = min(math.ceil(delay_seconds), SQS_MAX_DELAY_SECONDS)
+        body = json.dumps({"job_id": job_id, "due_at": due_at})
+        self.client.send_message(QueueUrl=self.queue_url, MessageBody=body, DelaySeconds=delay)
+
+    def receive(self, wait_seconds: int = WAIT_SECONDS) -> int | None:
+        """The next job id, hidden from other workers until ack() or its timeout."""
+        response = self.client.receive_message(
+            QueueUrl=self.queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=wait_seconds
+        )
+        messages = response.get("Messages", [])
+        if not messages:
+            return None
+        message = messages[0]
+        body = json.loads(message["Body"])
+        job_id = int(body["job_id"])
+        seconds_left = body["due_at"] - self.clock()
+        if seconds_left > 0:
+            # Sent again before deleting: a crash between the two leaves a duplicate, which
+            # jobs already cope with, instead of a lost job.
+            self.client.send_message(
+                QueueUrl=self.queue_url,
+                MessageBody=message["Body"],
+                DelaySeconds=min(math.ceil(seconds_left), SQS_MAX_DELAY_SECONDS),
+            )
+            self._delete(message["ReceiptHandle"])
+            return None
+        self.receipts[job_id] = message["ReceiptHandle"]
+        return job_id
+```
+
+An hour-long retry takes four hops of 15 minutes: four extra requests, a fraction of a cent.
+
+Atlas picks the queue from its settings, in one place used by both the API and the worker:
+
+```python
+def make_queue(settings: Settings, redis_client: redis.Redis) -> JobQueue:
+    """SQS when a queue URL is configured (on AWS), otherwise Redis."""
+    if settings.sqs_queue_url is None:
+        return RedisQueue(redis_client)
+    # Credentials are not passed, as for S3: boto3 finds them, on AWS in the task's role.
+    client = boto3.client(
+        "sqs", endpoint_url=settings.sqs_endpoint_url, region_name=settings.sqs_region
+    )
+    return SqsQueue(client, settings.sqs_queue_url)
+```
+
+`config.py` gains `sqs_queue_url`, `sqs_endpoint_url` and `sqs_region`. Without a queue URL nothing changes: Redis, as before.
+
+### Testing against a local SQS
+
+**ElasticMQ** is an open-source server that speaks SQS's API, as SeaweedFS speaks S3's. It's a new service in `compose.yml` and in CI:
+
+```yaml
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports:
+      - "127.0.0.1:9324:9324"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9324/health"]
+      interval: 2s
+      retries: 15
+```
+
+`tests/test_sqs_queue.py` repeats `test_queue.py`'s delivery rules against it, with a queue of its own per test and a visibility timeout of one second. SQS keeps its own clock for timeouts and delays, so these tests wait real seconds. The fake clock still controls when Atlas thinks a job is due, which is how the early-arrival test works:
+
+```python
+def test_a_message_that_arrives_before_it_is_due_is_sent_again(
+    sqs_queue: SqsQueue, clock: FakeClock
+) -> None:
+    # SQS delivers this after one real second, but Atlas's clock hasn't moved, so it isn't
+    # due yet: what happens to an hour-long retry after SQS's 15-minute maximum delay.
+    sqs_queue.send(7, delay_seconds=1)
+    time.sleep(1.5)
+
+    early = sqs_queue.receive(wait_seconds=1)
+    clock.advance(1)
+    time.sleep(1.5)
+    on_time = sqs_queue.receive(wait_seconds=1)
+
+    assert early is None
+    assert on_time == 7
+```
+
+```bash
+cd atlas && docker compose up -d elasticmq
+export TEST_SQS_URL=http://localhost:9324
+uv run pytest tests/test_sqs_queue.py -v
+```
+
+```text
+tests/test_sqs_queue.py::test_a_message_is_received_once_and_then_acknowledged PASSED [ 16%]
+tests/test_sqs_queue.py::test_an_unacknowledged_message_comes_back_after_its_visibility_timeout PASSED [ 33%]
+tests/test_sqs_queue.py::test_a_delayed_message_waits_until_it_is_due PASSED [ 50%]
+tests/test_sqs_queue.py::test_a_message_that_arrives_before_it_is_due_is_sent_again PASSED [ 66%]
+tests/test_sqs_queue.py::test_acknowledging_a_job_it_never_handed_out_does_nothing PASSED [ 83%]
+tests/test_sqs_queue.py::test_atlas_uses_sqs_only_when_a_queue_url_is_configured PASSED [100%]
+============================== 6 passed in 7.75s ===============================
+```
+
+Does the early-arrival test test anything? Replace `if seconds_left > 0:` with `if False:`, so early messages are handed out as if they were due:
+
+```text
+FAILED tests/test_sqs_queue.py::test_a_message_that_arrives_before_it_is_due_is_sent_again
+1 failed, 4 passed in 7.81s
+```
+
+(Five tests at the time; the sixth, for `make_queue`, came after.) With every service running, the whole suite passed: `267 passed in 48.23s`.
+
+### Tests for the network, against a mocked AWS
+
+`infra/tests/network_and_data.tftest.hcl` checks the rules this lesson is about. One run, for example:
+
+```hcl
+run "the_data_lives_in_private_subnets_with_no_route_to_the_internet" {
+  command = apply
+
+  assert {
+    condition     = aws_db_instance.main.publicly_accessible == false
+    error_message = "The database must not get a public address."
+  }
+
+  assert {
+    condition     = toset(aws_db_subnet_group.main.subnet_ids) == toset(aws_subnet.private[*].id)
+    error_message = "The database must be in the private subnets only."
+  }
+
+  assert {
+    condition     = length([for route in aws_route_table.private.route : route if route.cidr_block == "0.0.0.0/0"]) == 0
+    error_message = "A private subnet with a route to the internet isn't private."
+  }
+  ...
+}
+```
+
+`command = apply` this time, not `plan`, against the mocked provider. Ids such as a subnet's are only known after apply; the mock invents them, so comparisons between ids work. `toset` compares the lists without caring about their order.
+
+The first run failed. The outputs were wrong, not the rules:
+
+```text
+  run "the_data_lives_in_private_subnets_with_no_route_to_the_internet"... fail
+
+Error: Invalid index
+
+  on outputs.tf line 10, in output "database_secret_arn":
+  10:   value       = aws_db_instance.main.master_user_secret[0].secret_arn
+    ├────────────────
+    │ aws_db_instance.main.master_user_secret is empty list of object
+
+The given key does not identify an element in this collection value: the
+collection has no elements.
+```
+
+A mock invents a value for everything AWS would fill in, and for a list it invents an empty one. Real RDS always returns the secret it created for the password. So the mock is told the same, in a file every test file shares, `infra/tests/mocks/aws.tfmock.hcl`:
+
+```hcl
+mock_resource "aws_db_instance" {
+  defaults = {
+    master_user_secret = [{
+      secret_arn    = "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!db-example"
+      secret_status = "active"
+      kms_key_id    = "arn:aws:kms:us-east-1:123456789012:key/example"
+    }]
+  }
+}
+```
+
+Each test file points at it with `mock_provider "aws" { source = "./tests/mocks" }`.
+
+The second run failed in a way worth understanding. Two runs checked the snapshot settings: one that `snapshot_identifier` is null by default, and one, with `database_snapshot` set, that it's restored from:
+
+```text
+  run "tearing_down_keeps_the_data_as_a_snapshot"... fail
+ 103:     condition     = aws_db_instance.main.snapshot_identifier == null
+    │ - "epl4ow78"
+    │ + null
+  run "the_next_session_restores_the_snapshot"... fail
+    │ - "epl4ow78"
+    │ + "atlas-final-20261125190000"
+```
+
+Two separate facts, both true on real AWS as well:
+
+1. `snapshot_identifier` is an argument AWS can fill in, so when it's unset, the mock invents a value. Asserting `null` tests the mock, not Atlas; that assertion went.
+2. The second run got the *same* invented value. Runs in one test file share one state, so the database already existed, and `ignore_changes` kept it as it was. That's exactly what `ignore_changes` is for: the restore happens only when the database is created, after the last session's `terraform destroy` emptied the state. So that run now gets a state of its own:
+
+```hcl
+run "the_next_session_restores_the_snapshot" {
+  # A state of its own: the restore happens when the database is created, after the last
+  # session's `terraform destroy` emptied the state. In the state the runs above share, the
+  # database already exists, and ignore_changes keeps it as it is.
+  state_key = "next_session"
+  command   = plan
+
+  variables {
+    database_snapshot = "atlas-final-20261125190000"
+  }
+  ...
+}
+```
+
+```text
+tests/network_and_data.tftest.hcl... in progress
+  run "the_data_lives_in_private_subnets_with_no_route_to_the_internet"... pass
+  run "only_atlas_tasks_can_reach_postgres_and_valkey"... pass
+  run "data_is_encrypted_and_the_password_never_enters_terraform"... pass
+  run "tearing_down_keeps_the_data_as_a_snapshot"... pass
+  run "the_next_session_restores_the_snapshot"... pass
+  run "the_queue_hides_a_job_as_long_as_redis_queue_does"... pass
+tests/network_and_data.tftest.hcl... tearing down
+tests/network_and_data.tftest.hcl... pass
+
+Success! 8 passed, 0 failed.
+```
+
+And the check that matters most catches its mistake. With `publicly_accessible = true`:
+
+```text
+  run "the_data_lives_in_private_subnets_with_no_route_to_the_internet"... fail
+
+Error: Test assertion failed
+
+  on tests/network_and_data.tftest.hcl line 26, in run "the_data_lives_in_private_subnets_with_no_route_to_the_internet":
+  26:     condition     = aws_db_instance.main.publicly_accessible == false
+    ├────────────────
+    │ Diff:
+    │ --- actual
+    │ +++ expected
+    │ - true
+    │ + false
+
+
+The database must not get a public address.
+```
+
+The plan for the whole module, from `terraform test -verbose`, ends with `Plan: 27 to add, 0 to change, 0 to destroy.` The database's part (values AWS fills in left out):
+
+```text
+  # aws_db_instance.main will be created
+  + resource "aws_db_instance" "main" {
+      + allocated_storage                     = 20
+      + auto_minor_version_upgrade            = true
+      + backup_retention_period               = 1
+      + copy_tags_to_snapshot                 = true
+      + db_name                               = "atlas"
+      + db_subnet_group_name                  = "atlas"
+      + engine                                = "postgres"
+      + engine_version                        = "17"
+      + identifier                            = "atlas"
+      + instance_class                        = "db.t4g.micro"
+      + manage_master_user_password           = true
+      + multi_az                              = false
+      + password_wo                           = (write-only attribute)
+      + publicly_accessible                   = false
+      + skip_final_snapshot                   = false
+      + snapshot_identifier                   = "atlas-final-20261125190000"
+      + storage_encrypted                     = true
+      + storage_type                          = "gp3"
+      + username                              = "atlas"
+      ...
+```
+
+### What the scanner says
+
+CI scans for HIGH and CRITICAL findings (lesson 7.4), and the scan is clean. Two findings are suppressed, each on one resource with its reason in a comment. Removing both comments and asking for every severity shows all of it:
+
+```text
+CRITICAL AWS-0104 network.tf 103 | A security group rule should not allow unrestricted egress to any IP address.
+HIGH AWS-0132 data.tf 117 | S3 encryption should use Customer Managed Keys
+LOW AWS-0089 data.tf 98 | S3 Bucket Logging
+LOW AWS-0133 data.tf 13 | Enable Performance Insights to detect potential problems
+MEDIUM AWS-0077 data.tf 39 | RDS Cluster and RDS instance should have backup retention longer than default 1
+MEDIUM AWS-0090 data.tf 98 | S3 Data should be versioned
+MEDIUM AWS-0176 data.tf 13 | RDS IAM Database Authentication Disabled
+MEDIUM AWS-0177 data.tf 13 | RDS Deletion Protection Disabled
+MEDIUM AWS-0178 network.tf 13 | VPC Flow Logs is a feature that enables you to capture information about the IP
+```
+
+A scanner lists what *could* be stricter. Deciding is your job:
+
+| Finding | Decision | Why |
+|---|---|---|
+| AWS-0104, egress anywhere | suppressed | The tasks must reach GitHub and AWS's APIs. Allowing only named destinations needs VPC endpoints and a proxy, which would cost more than everything else here (deep dive). The exercise narrows the ports. |
+| AWS-0132, AWS-managed keys | suppressed | A customer-managed key costs $1 a month and adds key policies to learn; same trade-off as lesson 7.4. |
+| AWS-0177, deletion protection | not adopted | It would stop the `terraform destroy` that D34 relies on. The final snapshot protects the data instead. |
+| AWS-0077, backups for 1 day | not adopted | The database lives for hours at a time; the final snapshot is the backup that matters. |
+| AWS-0090, AWS-0089, AWS-0133, AWS-0176, AWS-0178 | not adopted yet | Versioning and access logs for rebuildable snapshots; Performance Insights and flow logs are part of observability (lessons 7.12 to 7.14); IAM database sign-in needs code that fetches tokens. |
+
+### Running it for real
+
+With the account and the state bucket from lesson 7.4:
+
+```bash
+cd infra && terraform plan
+terraform apply
+```
+
+RDS takes several minutes to create a database; ElastiCache is similar.
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ terraform apply
+...
+Plan: 27 to add, 0 to change, 0 to destroy.
+...
+  Enter a value: yes
+
+aws_vpc.main: Creating...
+aws_sqs_queue.jobs: Creating...
+...
+aws_db_instance.main: Still creating... [5m0s elapsed]
+aws_elasticache_replication_group.main: Still creating... [5m0s elapsed]
+...
+aws_db_instance.main: Creation complete after 6m12s [id=db-ABCDEFGHIJKLMNOPQRSTUVWXYZ]
+aws_elasticache_replication_group.main: Creation complete after 7m3s [id=atlas]
+
+Apply complete! Resources: 27 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+cache_url = "rediss://master.atlas.abc123.use1.cache.amazonaws.com:6379/0"
+database_address = "atlas.abc123xyz.us-east-1.rds.amazonaws.com"
+database_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!db-..."
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/atlas-jobs"
+snapshot_bucket = "atlas-snapshots-123456789012"
+```
+:::
+
+You can't connect to that database from your laptop, and that's the design working: it has no public address and admits only `atlas-app`. Lesson 7.6 runs the migrations as a task inside the VPC.
+
+At the end of the session:
+
+```bash
+terraform destroy
+aws rds describe-db-snapshots --snapshot-type manual --query 'DBSnapshots[].DBSnapshotIdentifier'
+```
+
+::: {.callout-warning title="Expected output, not run on AWS"}
+```text
+$ terraform destroy
+...
+Plan: 0 to add, 0 to change, 27 to destroy.
+...
+aws_db_instance.main: Destroying... [id=db-ABCDEFGHIJKLMNOPQRSTUVWXYZ]
+aws_db_instance.main: Still destroying... [5m0s elapsed]
+aws_db_instance.main: Destruction complete after 6m40s
+...
+Destroy complete! Resources: 27 destroyed.
+
+$ aws rds describe-db-snapshots --snapshot-type manual --query 'DBSnapshots[].DBSnapshotIdentifier'
+[
+    "atlas-final-20261125190000"
+]
+```
+:::
+
+Next session, restore it:
+
+```bash
+terraform apply -var database_snapshot=atlas-final-20261125190000
+```
+
+Snapshot storage is billed per GB-month (see the RDS pricing page), so delete older snapshots once a newer one exists: `aws rds delete-db-snapshot --db-snapshot-identifier <name>`.
+
+## Trade-offs *(deep dive)*
+
+**Public subnets or a NAT gateway.** The textbook layout puts tasks in private subnets and lets them out through a NAT gateway, so nothing of yours has a public address. That's what a company should do, and it costs $0.045 an hour plus $0.045 per GB it carries (AWS's VPC pricing page): about $33 a month for one gateway, twice that for one per AZ. Atlas puts its tasks in public subnets instead, with public addresses ($0.005 an hour each) and a security group that admits nothing from the internet. The protection is the same rule, written in one place instead of two; the cost is that one wrong rule exposes a task directly. The tests above guard that rule.
+
+**VPC endpoints.** An interface endpoint lets resources reach one AWS service without the internet, at $0.01 an hour per AZ (about $7.30 a month each, per AZ). Atlas would need several (SQS, Secrets Manager, ECR's two, CloudWatch Logs), and GitHub still needs the internet. The agent's sandbox in Part 8, which must have no internet at all, is where endpoints earn their price. S3 has a free **gateway endpoint**, worth adding when traffic grows.
+
+**A standby database.** Multi-AZ doubles the price to survive the loss of an availability zone. For a service with users, yes; for a study project destroyed after each session, no.
+
+**Serverless options.** Aurora Serverless v2 and ElastiCache Serverless scale on their own. Neither suits Atlas today: Aurora would never pause, because Atlas's processes always hold connections. ElastiCache Serverless runs in cluster mode, where commands that touch several keys at once, which Atlas's queue and rate limiter use, must keep all those keys on one shard.
+
+**SQS or keep Redis for jobs.** Valkey could carry the jobs too: `RedisQueue` would work unchanged. SQS was chosen in D7 because it's the service built for this: nothing to size, messages stored redundantly, and no lost jobs if the cache node is replaced.
+
+## Common mistakes
+
+- **`publicly_accessible = true` "just to try something"**, and forgetting it.
+- **Allowing `0.0.0.0/0` on port 5432** instead of naming the app's security group.
+- **One availability zone**: RDS refuses the subnet group, and so will the load balancer.
+- **Passwords in Terraform** (`password = "..."`): the value lands in state. Let RDS manage it.
+- **`skip_final_snapshot = true` on data you need**: destroy deletes it, without asking.
+- **A delay longer than 15 minutes sent straight to SQS**: rejected by `SendMessage`.
+- **Leaving it running**: about $24 a month for this lesson's resources alone.
+
+## Check yourself
+
+**1.** Both subnet types are in the same VPC. What makes one public and the other private?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The route table. A public subnet's table sends `0.0.0.0/0` (everything outside the VPC) to the internet gateway; a private subnet's has no such route. Both have the built-in route for the VPC's own addresses, which is why a task in a public subnet can reach the database in a private one.
+:::
+
+**2.** Why does the database's rule admit "the security group `atlas-app`" instead of the tasks' IP addresses?
+
+::: {.callout-tip collapse="true" title="Answer"}
+Fargate tasks get new addresses every time they start, and their number changes. A rule naming the group admits whichever tasks belong to it now, and nothing else. A rule with addresses would be wrong after the next deploy, or too wide if written as a range.
+:::
+
+**3.** Atlas retries a job in 40 minutes. How does `SqsQueue` deliver it on time, given SQS's 15-minute limit?
+
+::: {.callout-tip collapse="true" title="Answer"}
+The message carries `due_at`, 40 minutes from now, and is sent with the maximum delay of 900 seconds. When it arrives, 25 minutes are left: it's sent again with 900 seconds, then deleted. On the next arrival 10 minutes are left: sent again with 600. On the third arrival it's due and handed to the worker. Sending before deleting means a crash leaves a duplicate (which jobs handle), never a lost job.
+:::
+
+## Exercise
+
+`atlas-app` may send anything, anywhere. Narrow it to what Atlas uses: HTTPS (port 443) to anywhere, Postgres only to the database's security group and Valkey only to the cache's. Write the test first, `infra/tests/egress.tftest.hcl`, then replace `app_to_anywhere` with three rules.
+
+::: {.callout-tip collapse="true" title="Solution"}
+The test:
+
+```hcl
+mock_provider "aws" {
+  source = "./tests/mocks"
+}
+
+variables {
+  alert_email = "alerts@example.com"
+}
+
+run "tasks_reach_the_internet_on_https_only" {
+  command = apply
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.app_to_https.from_port == 443 && aws_vpc_security_group_egress_rule.app_to_https.to_port == 443
+    error_message = "Out to the internet: HTTPS only."
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.app_to_database.referenced_security_group_id == aws_security_group.database.id
+    error_message = "Out to Postgres: its security group only."
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.app_to_cache.referenced_security_group_id == aws_security_group.cache.id
+    error_message = "Out to Valkey: its security group only."
+  }
+}
+```
+
+Red first:
+
+```text
+  run "tasks_reach_the_internet_on_https_only"... fail
+
+Error: Reference to undeclared resource
+
+  on tests/egress.tftest.hcl line 11, in run "tasks_reach_the_internet_on_https_only":
+A managed resource "aws_vpc_security_group_egress_rule" "app_to_https" has
+not been declared in the root module.
+```
+
+The rules, in `network.tf`, in place of `app_to_anywhere`:
+
+```hcl
+#trivy:ignore:AWS-0104
+resource "aws_vpc_security_group_egress_rule" "app_to_https" {
+  security_group_id = aws_security_group.app.id
+  description       = "HTTPS to GitHub and AWS APIs"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "app_to_database" {
+  security_group_id            = aws_security_group.app.id
+  description                  = "Postgres"
+  referenced_security_group_id = aws_security_group.database.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+}
+
+resource "aws_vpc_security_group_egress_rule" "app_to_cache" {
+  security_group_id            = aws_security_group.app.id
+  description                  = "Valkey"
+  referenced_security_group_id = aws_security_group.cache.id
+  ip_protocol                  = "tcp"
+  from_port                    = 6379
+  to_port                      = 6379
+}
+```
+
+If you write the test with `command = plan`, it fails differently: ids aren't known before apply, so the comparison can't be made.
+
+```text
+Error: Unknown condition value
+...
+Condition expression could not be evaluated at this time. This means you have
+executed a `run` block with `command = plan` and one of the values your
+condition depended on is not known until after the plan has been applied.
+```
+
+With `command = apply`: `Success! 9 passed, 0 failed.` The scanner still reports AWS-0104 as CRITICAL for port 443 to anywhere (it checks addresses, not ports), so the suppression stays.
+
+Not in the reference code yet: whether Fargate and its agents need anything besides HTTPS from inside the task's security group is a question for the real-AWS verification pass (D33). It's worth adopting once that's confirmed.
+:::
+
+## Stretch
+
+A job that kills the worker itself (it runs out of memory, say) never reaches the code that counts failures: `_claim` counts the attempt, then the process dies, and SQS delivers the job again, forever. SQS's answer is a **dead-letter queue**: after a set number of deliveries, a message moves there instead.
+
+Add `aws_sqs_queue.jobs_dead_letter` and an `aws_sqs_queue_redrive_policy` on `jobs` with `maxReceiveCount = 20`, and a test that the policy points at the dead-letter queue with more deliveries than Atlas's own `MAX_ATTEMPTS` (5):
+
+```hcl
+  assert {
+    condition     = jsondecode(aws_sqs_queue_redrive_policy.jobs.redrive_policy).maxReceiveCount > 5
+    error_message = "More deliveries than Atlas's own five attempts, so Atlas's retries finish first."
+  }
+```
+
+`jsondecode` reads the policy, which SQS takes as JSON, back into values. Run against the reference code plus these: `Success! 10 passed, 0 failed.`
+
+Then think it through. Which deliveries count towards SQS's 20 without being attempts? (Hint: what does `run_job` return for a job another worker is running?) And when a job lands in the dead-letter queue, what does its row in the `jobs` table say, and who would notice?
+
+## What changed in the project
+
+`infra/`: `network.tf` (a VPC in two availability zones, public and private subnets, route tables, an internet gateway, security groups for the tasks, the database and the cache), `data.tf` (RDS PostgreSQL 17 on `db.t4g.micro` with its password in Secrets Manager and a final snapshot on destroy, ElastiCache Valkey 8.2 with TLS, the SQS job queue, the snapshot bucket), `outputs.tf`, a `database_snapshot` variable, `tests/network_and_data.tftest.hcl`, and mocked AWS responses shared by every test file in `tests/mocks/aws.tfmock.hcl` (the budget test now uses them too).
+
+`atlas/`: `SqsQueue` and `make_queue` in `queue.py`, three SQS settings in `config.py`, the API and worker choosing their queue through `make_queue`, `tests/test_sqs_queue.py`, and an `elasticmq` service in `compose.yml` and in CI. Decision D34 records the cost choices. Commits: `feat: Added an SQS job queue behind the existing queue interface`; `feat: Added Atlas's AWS network, Postgres, Valkey, SQS queue and snapshot bucket in Terraform`; `test: Shared the mocked AWS responses between Terraform test files`.
