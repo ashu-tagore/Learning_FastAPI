@@ -189,7 +189,8 @@ flowchart LR
 ```
 
 - Everything is Terraform in `infra/`. Nothing is clicked by hand except account creation and the budget alarm.
-- Cost guardrails: an AWS Budgets alarm from day one, no NAT gateway (VPC endpoints instead), smallest instance sizes, and a documented `terraform destroy` for when the learner is not using it. Check current prices with the AWS pricing calculator before each deploy.
+- Cost guardrails (D34): an AWS Budgets alarm from day one; Atlas is up only while being studied (each lesson ends with `terraform destroy`, keeping a final database snapshot); no NAT gateway; smallest sizes (RDS `db.t4g.micro`, ElastiCache Valkey `cache.t4g.micro`, 0.25 vCPU Fargate tasks). Check current prices before each deploy.
+- Network (D34): one VPC across two availability zones. Public subnets hold the load balancer and the Fargate tasks, which have public IPs to reach GitHub; their security group admits only the load balancer. Private subnets hold RDS Postgres and ElastiCache Valkey, with no route to the internet; each admits only Atlas's tasks on its own port. Jobs go through SQS; the cache, rate limits and event stream stay on Valkey (Redis-compatible). The agent's sandbox (Part 8) gets isolated subnets with VPC endpoints.
 - Secrets (LLM API key, GitHub token, JWT secret) live in Secrets Manager, never in images or Terraform state outputs.
 
 ## Security summary
