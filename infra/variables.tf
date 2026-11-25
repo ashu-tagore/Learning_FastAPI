@@ -24,3 +24,9 @@ variable "monthly_budget_usd" {
     error_message = "monthly_budget_usd must be positive."
   }
 }
+
+variable "database_snapshot" {
+  description = "A final snapshot to restore the database from (D34), or null for an empty database. List them with: aws rds describe-db-snapshots --query 'DBSnapshots[].DBSnapshotIdentifier'"
+  type        = string
+  default     = null
+}
