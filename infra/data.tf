@@ -90,7 +90,8 @@ resource "aws_sqs_queue" "jobs" {
   visibility_timeout_seconds = 300
   sqs_managed_sse_enabled    = true
   # No dead-letter queue: attempts and the last error of each job are in Postgres's jobs
-  # table, which already stops retrying after the last attempt (lesson 5.1).
+  # table, which stops retrying a job that keeps failing (lesson 5.1). Not covered: a job
+  # that kills the worker itself never reaches that code; lesson 7.5's stretch adds one.
 }
 
 # ---------- Repository snapshots: S3 ----------

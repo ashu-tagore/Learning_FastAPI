@@ -1,6 +1,8 @@
 # Runs without an AWS account: mock_provider answers every AWS call with made-up values,
 # so these tests check Atlas's own configuration, not AWS's behaviour (lesson 7.4).
-mock_provider "aws" {}
+mock_provider "aws" {
+  source = "./tests/mocks"
+}
 
 variables {
   alert_email = "alerts@example.com"
